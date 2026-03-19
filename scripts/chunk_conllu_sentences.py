@@ -51,7 +51,7 @@ def main(cmd_args):
             book_id = f.replace('.conllu', '')
             sentences = extract_sentences_from_file(TCBC_path+f)
         
-            chunks, chunk_lens = sentence_chunking_main(512, 65, True, sentences, model)
+            chunks, chunk_lens = sentence_chunking_main(512, 75, True, sentences, model)
 
             for i,c in enumerate(chunks):
                 ds_items.append({"book_id":book_id, "chunk_id":i, "chunk_len":chunk_lens[i], "text":c})

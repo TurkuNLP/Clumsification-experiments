@@ -8,6 +8,8 @@ st-deps
 triton_cache
 vllm_cache
 *.out
+quick*
+TQ_ranker*
 # C extensions
 *.so
 

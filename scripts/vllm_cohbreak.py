@@ -21,7 +21,7 @@ def apply_chat_template(base_prompt, ex_user, ex_assistant, text):
         },
         {
             "role": "user",
-            "content": "Muokkaa myös seuraavasta tekstistä kömpelömpi. Älä muuta mitään erisnimiä tai kommentoi tehtyjä muokkauksia. Jos annetussa tekstissä on kielioppivirheitä, älä korjaa niitä. Varmista, että tehdyt muokkaukset tekevät tekstistä vaikeammin luettavan, mutta ovat kielioppisääntöjen mukaisia. \n\nAnnettu teksti:\n'''\n"+text+"\n'''\n"
+            "content": "Muokkaa myös seuraavaa tekstiä siten, että sen koherenssi rikkoutuu. Älä muuta mitään erisnimiä tai kommentoi tehtyjä muokkauksia. Jos annetussa tekstissä on kielioppivirheitä, älä korjaa niitä. Varmista, että tehdyt muokkaukset ovat kielioppisääntöjen mukaisia. Muokatun tekstin tulee olla pituudeltaan lähes sama kuin annetun tekstin. \n\nAnnettu teksti:\n'''\n"+text+"\n'''\n"
         },
     ]
 
@@ -45,15 +45,15 @@ def main(cmd_args):
     #pars.top_k=20
     #pars.min_p=0
 
-    base_prompt = "Muokkaa annetusta tektistä kömpelömpi ja vaikeaselkoisempi. Muokatun tekstin tulee olla lähes sama kuin annetun tekstin ja asioiden täytyy esiintyä molemmissa teksteissä samassa järjestyksessä. Muokatun tekstin tulee myös olla melkein yhtä pitkä, kuin annetun tekstin."
+    base_prompt = "Muokkaa annettua tekstiä siten, että sen koherenssi rikkoutuu. Muokatun tekstin tulee olla lähes sama kuin annetun tekstin. Muokatun tekstin tulee myös olla melkein yhtä pitkä, kuin annetun tekstin."
     esimerkki_1_user = "\n\nAnnettu teksti:\n'''\nMenimme eilen luokan kanssa retkelle. Ensimmäinen kohteemme oli metsä, jossa linnut lauloivat. Opettaja antoi meille pitkän ja kevyen laudan, jota jokainen kantoi vuorollaan. Rakensimme sen avulla pienen sillan puron yli. Jätimme laudan metsään sellaiseen paikkaan, jonka varmasti muistamme seuraavalla retkellä.\n'''\n"
-    esimerkki_1_assistant = "Muokattu teksti:\n'''\nEilen menimme luokan kanssa retkelle, ja ensimmäinen paikka oli metsä, jossa linnut lauloivat. Opettaja antoi meille pitkän esineen nimeltä lauta, joka oli niin kevyt, että jokainen jaksoi kantaa sitä vuorollaan. Rakensimme laudan avulla pienen sillan puron yli, ja se jäi metsään paikalle, jonka muistamme varmasti seuraavalla retkellä.\n'''\n"
+    esimerkki_1_assistant = "Muokattu teksti:\n'''\nMenimme eilen luokan kanssa retkelle. Ensimmäinen kohteemme oli metsä, jossa linnut lauloivat. Opettaja antoi meille pitkän ja kevyen laudan, jota jokainen kantoi vuorollaan. Lautaan oli kirjoitettu polttomerkinnällä koulun osoite. Koulussa oli kuuma.\n'''\n"
     prompts = [apply_chat_template(base_prompt, esimerkki_1_user, esimerkki_1_assistant, x['text'].replace('\n', ' ')) for x in ds_items]
 
     outputs = llm.chat(prompts, pars)
     res_d = []
     for i,o in enumerate(outputs):
-        res_d.append({'perturbation_type':'clumsification' ,'model':MODEL_PATH, 'text':o.outputs[0].text, 'og_text':ds_items[i]['text']})
+        res_d.append({'perturbation_type':'cohbreak' ,'model':MODEL_PATH, 'text':o.outputs[0].text, 'og_text':ds_items[i]['text']})
 
     print("Parsed outputs!")
 
