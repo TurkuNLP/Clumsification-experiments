@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 data/*
+scripts/others*
 *.sh
 st-deps
 triton_cache

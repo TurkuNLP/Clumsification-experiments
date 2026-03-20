@@ -21,7 +21,7 @@ def apply_chat_template(base_prompt, ex_user, ex_assistant, text):
         },
         {
             "role": "user",
-            "content": "Muokkaa myös seuraavaa tekstiä siten, että sen koherenssi rikkoutuu. Älä muuta mitään erisnimiä tai kommentoi tehtyjä muokkauksia. Jos annetussa tekstissä on kielioppivirheitä, älä korjaa niitä. Varmista, että tehdyt muokkaukset ovat kielioppisääntöjen mukaisia. Muokatun tekstin tulee olla pituudeltaan lähes sama kuin annetun tekstin. \n\nAnnettu teksti:\n'''\n"+text+"\n'''\n"
+            "content": "Muokkaa myös seuraavaa tekstiä siten, että sen sisäinen koherenssi rikkoutuu. Älä muuta mitään erisnimiä. Jos annetussa tekstissä on kielioppivirheitä, älä korjaa niitä. Varmista, että tehdyt muokkaukset ovat kielioppisääntöjen mukaisia. Muokatun tekstin tulee olla pituudeltaan lähes sama kuin annetun tekstin. Tee mahdollisimman vähän muutoksia ja vain siten, että sisäinen koherenssi rikkoutuu. Muokkaa korkeintaan muutamaa lausetta. Faktojen täytyy olla molemmissa teksteissä samat. Palauta ainoastaan muokattu teksti ilman kommentteja tehdyistä muokkauksista. \n\nAnnettu teksti:\n'''\n"+text+"\n'''\n"
         },
     ]
 
