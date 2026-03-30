@@ -11,6 +11,8 @@ vllm_cache
 *.out
 quick*
 TQ_ranker*
+*.ipynb
+*model_classification_ft*
 # C extensions
 *.so
 

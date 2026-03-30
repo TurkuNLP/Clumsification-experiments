@@ -35,7 +35,7 @@ def init_og_dataset(source_txt_path: str, new_ds_name: str, overwrite: bool = Fa
         with open("data/custom_datasets/"+new_ds_name+"/original.jsonl", 'w', encoding='utf-8') as writer:
             with open(source_txt_path, 'r', encoding='utf-8') as reader:
                 for line in reader:
-                    writer.write(json.dumps({'text':line})+'\n')
+                    writer.write(json.dumps({'text':line.replace('\n', '')})+'\n')
     return "data/custom_datasets/"+new_ds_name+"/original.jsonl"
 
 
@@ -70,11 +70,14 @@ def format_custom_dataset(custom_dataset_name: str):
     return list(id_dict.values())
 
 
-def shuffle_and_transform_formatted_dataset(formatted_dataset:list[dict]):
+def shuffle_and_transform_formatted_dataset(formatted_dataset:list[dict], seed: int=None):
     #First apply shuffling to each internal 'text_label_pairs' list
     for x in formatted_dataset:
         tl_list = x.pop('text_label_pairs', None)
-        random.shuffle(tl_list)
+        if seed:
+            random.Random(seed).shuffle(tl_list)
+        else:
+            random.shuffle(tl_list)
         #After shuffling, separate texts and labels to their own lists
         x['texts'] = [y[0] for y in tl_list]
         x['labels'] = [y[1] for y in tl_list]

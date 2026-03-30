@@ -2,6 +2,8 @@
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.distributed import destroy_process_group
 from datasets import Dataset
 from sentence_transformers import (
     SentenceTransformer,
@@ -23,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 import dataset_functions as d_f
+
+os.environ["WANDB_MODE"] = "disabled"
 
 
 # ──────────────────────────────────────────────
@@ -61,7 +65,6 @@ class PairwiseRankingLoss(nn.Module):
         l_12 = 0  ⟹  x1 ranks higher  ⟹  max(0, f(x2) − f(x1) + ε)
         l_12 = 1  ⟹  x2 ranks higher  ⟹  max(0, f(x1) − f(x2) + ε)
     """
-
     def __init__(
         self,
         model: SentenceTransformer,
@@ -86,7 +89,6 @@ class PairwiseRankingLoss(nn.Module):
         device = next(model.parameters()).device
         self.scoring_head.to(device)
 
-    # ---- required by SentenceTransformerTrainer ----
     @property
     def citation(self) -> str:
         return ""
@@ -115,19 +117,18 @@ class PairwiseRankingLoss(nn.Module):
         loss : scalar Tensor
             Mean over all valid (unequal-label) pairs across the batch.
         """
+        n = len(sentence_features)
 
-        n = len(sentence_features)  # number of samples per instance
-
+        scores = []
+        for sf in sentence_features:
+            emb = self.model(sf)["sentence_embedding"]
+            score = self.scoring_head(emb).squeeze(-1)
+            scores.append(score)
         # ==================================================================
         # Each text passes through the shared BERT encoder exactly once;
         # the resulting embeddings stay in the computation graph so that
         # every pairwise loss term can back-propagate through the encoder.
         # ==================================================================
-        scores = []  # will hold n tensors, each (batch_size,)
-        for sf in sentence_features:
-            emb = self.model(sf)["sentence_embedding"]  # (batch_size, emb_dim)
-            score = self.scoring_head(emb).squeeze(-1)  # (batch_size,)
-            scores.append(score)
 
         # Stack into a single tensor for convenient indexing.
         # Shape: (batch_size, n)
@@ -139,22 +140,23 @@ class PairwiseRankingLoss(nn.Module):
         # same margin-loss kernel that the original two-sample version
         # used.  Pairs with equal labels are masked out.
         # ==================================================================
-        labels = labels.float()  # (batch_size, n)
+
+        labels = labels.float()
 
         total_loss = torch.tensor(0.0, device=scores.device)
         valid_pairs = torch.tensor(0.0, device=scores.device)
 
         for i in range(n):
             for j in range(i + 1, n):
-                label_i = labels[:, i]  # (batch_size,)
-                label_j = labels[:, j]  # (batch_size,)
+                label_i = labels[:, i]
+                label_j = labels[:, j]
 
-                sign = torch.sign(label_j - label_i)  # (batch_size,)
-                diff = scores[:, j] - scores[:, i]  # (batch_size,)
+                sign = torch.sign(label_j - label_i)
+                diff = scores[:, j] - scores[:, i]
 
                 pair_loss = torch.relu(sign * diff + self.epsilon)
 
-                mask = (label_i != label_j).float()  # (batch_size,)
+                mask = (label_i != label_j).float()
                 pair_loss = pair_loss * mask
 
                 total_loss = total_loss + pair_loss.sum()
@@ -218,11 +220,9 @@ class PairwiseWinRateEvaluator(SentenceEvaluator):
         epoch: int = -1,
         steps: int = -1,
     ) -> dict[str, float]:
-        """Return a dict whose keys start with ``self.name + '_'``."""
 
         self.scoring_head.eval()
 
-        # Flatten every text for one big encode call, then un-flatten.
         flat_texts: list[str] = []
         boundaries: list[int] = [0]
         for texts in self.texts_list:
@@ -242,8 +242,8 @@ class PairwiseWinRateEvaluator(SentenceEvaluator):
         with torch.no_grad():
             for idx, labels in enumerate(self.labels_list):
                 start, end = boundaries[idx], boundaries[idx + 1]
-                embs = embeddings[start:end]  # (n, emb_dim)
-                scores = self.scoring_head(embs).squeeze(-1)  # (n,)
+                embs = embeddings[start:end]
+                scores = self.scoring_head(embs).squeeze(-1)
 
                 n = len(labels)
                 for i in range(n):
@@ -252,13 +252,10 @@ class PairwiseWinRateEvaluator(SentenceEvaluator):
                         if li == lj:
                             continue
                         total += 1
-                        # The text with the *lower* label should have a
-                        # *higher* score.
                         if li < lj and scores[i] > scores[j]:
                             correct += 1
                         elif lj < li and scores[j] > scores[i]:
                             correct += 1
-                        # Ties in score count as incorrect.
 
         win_rate = correct / total if total > 0 else 0.0
 
@@ -304,7 +301,6 @@ def expand_dataset_for_trainer(ds: Dataset) -> Dataset:
     the data collator will stack these into a (batch_size, n) tensor.
     """
     n_per_row = len(ds[0]["texts"])
-    # Sanity check: all rows must have the same width.
     for row_idx in range(len(ds)):
         if len(ds[row_idx]["texts"]) != n_per_row:
             raise ValueError(
@@ -317,7 +313,6 @@ def expand_dataset_for_trainer(ds: Dataset) -> Dataset:
                 f"expected {n_per_row}."
             )
 
-    # Build new column-oriented data.
     new_data: dict[str, list] = {
         f"sentence_{k}": [] for k in range(n_per_row)
     }
@@ -337,14 +332,31 @@ def expand_dataset_for_trainer(ds: Dataset) -> Dataset:
 def main(cmd_args):
 
     # ──────────────────────────────────────────────
-    # Build the SentenceTransformer model
+    # FIX #7: use a single local `rank` variable
     # ──────────────────────────────────────────────
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
     MODEL_NAME = cmd_args[0]
     MAX_SEQ_LEN = int(cmd_args[1])
+    OUTPUT_DIR = cmd_args[2]
 
+    # ──────────────────────────────────────────────
+    # FIX #1: Fixed seed for ALL random data operations
+    #         so that every rank produces identical splits
+    # ──────────────────────────────────────────────
+    SPLIT_SEED = 42
+
+    # ──────────────────────────────────────────────
+    # Build the SentenceTransformer model
+    # ──────────────────────────────────────────────
+    # FIX #3: removed tp_plan="auto" — incompatible with DDP
     word_embedding_model = models.Transformer(
         MODEL_NAME,
         max_seq_length=MAX_SEQ_LEN,
+        model_args={
+            "dtype": torch.bfloat16,
+        },
     )
 
     pooling_model = models.Pooling(
@@ -357,48 +369,115 @@ def main(cmd_args):
     model = SentenceTransformer(
         modules=[word_embedding_model, pooling_model],
     )
-
-    logger.info(
-        "Embedding dimension: %d", model.get_sentence_embedding_dimension()
-    )
+    if rank == 0:
+        logger.info(
+            "Embedding dimension: %d",
+            model.get_sentence_embedding_dimension(),
+        )
 
     # ──────────────────────────────────────────────
     # Prepare datasets
+    # FIX #1: deterministic, identical splits on every rank
     # ──────────────────────────────────────────────
-    ### NEW ADDED CODE ###
     t = d_f.format_custom_dataset("yle_2019")
+    if rank == 0:
+        print(t[0])
+
+    # Pass a fixed seed so the shuffle is identical on every rank.
+    # If shuffle_and_transform_formatted_dataset accepts a seed
+    # parameter, pass it here. Otherwise ensure it is deterministic
+    # or do the shuffle only on rank 0 and broadcast the indices.
+    ds = d_f.shuffle_and_transform_formatted_dataset(
+        t, seed=SPLIT_SEED          # ← you may need to add this
+    ).select(range(1000))                                #   parameter in dataset_functions
+
+    # FIX #1 (continued): explicit seed ensures identical splits
     # ds is a HuggingFace Dataset, with the rows "id", "texts", and "labels"
     # id is an integer and purely informational
     # texts contains lists of texts of different quality levels
     # labels contains lists of the quality levels of the texts as integers
     # labels and texts are always in corresponding order
-    ds = d_f.shuffle_and_transform_formatted_dataset(t).train_test_split(0.7)
-    train_dataset = ds["train"]
-    dev_test = ds["test"].train_test_split(0.5)
-    dev_dataset = dev_test["train"]
-    test_dataset = dev_test["test"]
+    ds = ds.train_test_split(0.3, seed=SPLIT_SEED)
+    train_dataset = ds["train"].shuffle(seed=SPLIT_SEED)
 
-    logger.info("Training dataset:\n%s", train_dataset)
-    logger.info("Dev dataset:\n%s", dev_dataset)
-    logger.info("Test dataset:\n%s", test_dataset)
+    dev_test = ds["test"].train_test_split(0.5, seed=SPLIT_SEED)
+    dev_dataset = dev_test["train"].shuffle(seed=SPLIT_SEED)
+    test_dataset = dev_test["test"].shuffle(seed=SPLIT_SEED)
 
-    ### ADJUSTED CODE BELOW ###
+    if rank == 0:
+        logger.info("Training dataset:\n%s", train_dataset)
+        logger.info("Dev dataset:\n%s", dev_dataset)
+        logger.info("Test dataset:\n%s", test_dataset)
 
-    # Convert list-of-texts format → sentence_0 … sentence_{n-1} + label
+    # ──────────────────────────────────────────────
+    # FIX #1 verification: sanity-check that all ranks
+    # agree on the exact same split (cheap fingerprint)
+    # ──────────────────────────────────────────────
+    if dist.is_initialized():
+        local_len = torch.tensor(
+            [len(train_dataset), len(dev_dataset), len(test_dataset)],
+            device=local_rank,
+        )
+        gathered = [torch.zeros_like(local_len) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local_len)
+        if rank == 0:
+            for r, g in enumerate(gathered):
+                assert torch.equal(g, local_len), (
+                    f"Rank {r} has different split sizes {g.tolist()} "
+                    f"vs rank 0 {local_len.tolist()} — data leak!"
+                )
+            logger.info(
+                "✓ All ranks have identical split sizes: "
+                "train=%d, dev=%d, test=%d",
+                local_len[0].item(),
+                local_len[1].item(),
+                local_len[2].item(),
+            )
+
     train_dataset_flat = expand_dataset_for_trainer(train_dataset)
     eval_dataset_flat = expand_dataset_for_trainer(dev_dataset)
-
-    logger.info("Flattened training dataset:\n%s", train_dataset_flat)
-    logger.info("Flattened eval dataset:\n%s", eval_dataset_flat)
+    if rank == 0:
+        logger.info("Flattened training dataset:\n%s", train_dataset_flat)
+        logger.info("Flattened eval dataset:\n%s", eval_dataset_flat)
 
     # ──────────────────────────────────────────────
     # Instantiate loss
     # ──────────────────────────────────────────────
     train_loss = PairwiseRankingLoss(
         model=model,
-        epsilon=1.0,
+        epsilon=0.1,
         scoring_hidden=None,
     )
+
+    # ──────────────────────────────────────────────
+    # FIX #2 (corrected): Synchronise scoring_head gradients
+    # across ranks WITHOUT registering it on the
+    # SentenceTransformer (which would break its
+    # sequential forward pass).
+    #
+    # We attach a backward hook to every parameter in
+    # the scoring_head that all-reduces its gradient,
+    # exactly mirroring what DDP does for the wrapped
+    # model's parameters.
+    # ──────────────────────────────────────────────
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        def _make_sync_hook():
+            """Factory avoids closure pitfalls in a loop."""
+            world_size = dist.get_world_size()
+            def hook(grad: torch.Tensor) -> torch.Tensor:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                return grad / world_size
+            return hook
+
+        for param in train_loss.scoring_head.parameters():
+            if param.requires_grad:
+                param.register_hook(_make_sync_hook())
+
+        if rank == 0:
+            logger.info(
+                "Registered gradient-sync hooks on %d scoring_head parameters.",
+                sum(1 for p in train_loss.scoring_head.parameters() if p.requires_grad),
+            )
 
     # ──────────────────────────────────────────────
     # Build the win-rate evaluator on dev data
@@ -415,28 +494,20 @@ def main(cmd_args):
     # Training arguments
     # ──────────────────────────────────────────────
     training_args = SentenceTransformerTrainingArguments(
-        # --- output ---
-        output_dir="output/finnish-pairwise-ranker",
-        # --- epochs & batching ---
+        output_dir=OUTPUT_DIR,
         num_train_epochs=3,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        # --- optimizer / scheduler ---
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
         learning_rate=2e-5,
         warmup_steps=10,
-        # --- logging ---
         logging_strategy="steps",
-        logging_steps=1,
-        # --- saving ---
+        logging_steps=100,
         save_strategy="epoch",
         save_total_limit=2,
-        # --- reproducibility ---
         seed=42,
-        # --- evaluation (win-rate on dev) ---
         eval_strategy="epoch",
-        # --- performance ---
         fp16=False,
-        bf16=False,
+        bf16=True,
         dataloader_drop_last=False,
     )
 
@@ -454,65 +525,44 @@ def main(cmd_args):
 
     trainer.train()
 
-    # Save final model (encoder only)
-    model.save_pretrained("output/finnish-pairwise-ranker/final")
-
-    # Save scoring head separately
-    torch.save(
-        train_loss.scoring_head.state_dict(),
-        "output/finnish-pairwise-ranker/final/scoring_head.pt",
-    )
-    logger.info("Model and scoring head saved.")
-
     # ──────────────────────────────────────────────
-    # Final evaluation on test set
+    # FIX #4 & #5: Only rank 0 saves and evaluates;
+    # other ranks wait at a barrier, then all exit
+    # together.
     # ──────────────────────────────────────────────
-    test_evaluator = PairwiseWinRateEvaluator(
-        texts_list=test_dataset["texts"],
-        labels_list=test_dataset["labels"],
-        scoring_head=train_loss.scoring_head,
-        name="test",
-        batch_size=32,
-    )
-    test_metrics = test_evaluator(
-        model, output_path="output/finnish-pairwise-ranker/final"
-    )
-    logger.info("=== Final test metrics ===")
-    for k, v in test_metrics.items():
-        logger.info("  %s = %s", k, v)
-
-
-    """
-
-    # ──────────────────────────────────────────────
-    # Inference helper
-    # ──────────────────────────────────────────────
-    def predict_scores(
-        sentences: list[str],
-        st_model: SentenceTransformer,
-        scoring_head: nn.Module,
-    ) -> torch.Tensor:
-        ""Return scalar relevance scores for a list of sentences.""
-        embeddings = st_model.encode(
-            sentences,
-            convert_to_tensor=True,
-            show_progress_bar=False,
+    if rank == 0:
+        save_dir = os.path.join(OUTPUT_DIR, "final")
+        model.save_pretrained(save_dir)
+        torch.save(
+            train_loss.scoring_head.state_dict(),
+            os.path.join(save_dir, "scoring_head.pt"),
         )
-        with torch.no_grad():
-            scores = scoring_head(embeddings).squeeze(-1)
-        return scores
+        logger.info("Model and scoring head saved to %s.", save_dir)
 
-    test_sentences = [
-        "Helsinki on Suomen pääkaupunki.",
-        "Epärelevantti dokumentti.",
-        "Turku on vanha kaupunki Suomessa.",
-    ]
+        # Final evaluation on test set
+        test_evaluator = PairwiseWinRateEvaluator(
+            texts_list=test_dataset["texts"],
+            labels_list=test_dataset["labels"],
+            scoring_head=train_loss.scoring_head,
+            name="test",
+            batch_size=32,
+        )
+        test_metrics = test_evaluator(
+            model, output_path=save_dir,
+        )
+        logger.info("=== Final test metrics ===")
+        for k, v in test_metrics.items():
+            logger.info("  %s = %s", k, v)
 
-    scores = predict_scores(test_sentences, model, train_loss.scoring_head)
-
-    logger.info("=== Inference scores ===")
-    for sent, score in zip(test_sentences, scores):
-        logger.info("  %.4f  │  %s", score.item(), sent)
+        # Sanity check
+        h = 0
+        for test_ls in test_dataset['labels']:
+            if test_ls[0] == 0:
+                h += 1
+        logger.info(
+            "Win-rate if always predicting the first text to be better: %f",
+            h / len(test_dataset["labels"]),
+        )
 
     # ──────────────────────────────────────────────
     # Loading saved model for later use
@@ -522,7 +572,7 @@ def main(cmd_args):
         head_path: str,
         emb_dim: int = 768,
     ):
-        ""Reload the encoder + scoring head from disk.""
+        """Reload the encoder + scoring head from disk.""
         loaded_model = SentenceTransformer(model_path)
 
         loaded_head = nn.Linear(emb_dim, 1)
@@ -539,6 +589,12 @@ def main(cmd_args):
     # scores = predict_scores(test_sentences, reloaded_model, reloaded_head)
 
     """
+
+    # FIX #5: barrier so non-zero ranks don't tear down
+    # the process group while rank 0 is still evaluating
+    if dist.is_initialized():
+        dist.barrier()
+        destroy_process_group()
 
 
 if __name__ == "__main__":
