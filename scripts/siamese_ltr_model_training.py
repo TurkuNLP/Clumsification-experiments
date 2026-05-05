@@ -28,7 +28,6 @@ import dataset_functions as d_f
 
 os.environ["WANDB_MODE"] = "disabled"
 
-
 # ──────────────────────────────────────────────
 # 1.  Custom Pairwise Ranking Loss
 # ──────────────────────────────────────────────
@@ -65,12 +64,7 @@ class PairwiseRankingLoss(nn.Module):
         l_12 = 0  ⟹  x1 ranks higher  ⟹  max(0, f(x2) − f(x1) + ε)
         l_12 = 1  ⟹  x2 ranks higher  ⟹  max(0, f(x1) − f(x2) + ε)
     """
-    def __init__(
-        self,
-        model: SentenceTransformer,
-        epsilon: float = 1.0,
-        scoring_hidden: int | None = None,
-    ):
+    def __init__(self, model, epsilon=1.0, scoring_hidden=None):
         super().__init__()
         self.model = model
         self.epsilon = epsilon
@@ -85,9 +79,7 @@ class PairwiseRankingLoss(nn.Module):
             )
         else:
             self.scoring_head = nn.Linear(emb_dim, 1)
-
-        device = next(model.parameters()).device
-        self.scoring_head.to(device)
+        self._head_moved = False
 
     @property
     def citation(self) -> str:
@@ -117,7 +109,24 @@ class PairwiseRankingLoss(nn.Module):
         loss : scalar Tensor
             Mean over all valid (unequal-label) pairs across the batch.
         """
+        # Ensure scoring_head is on the same device as the model
+        if not self._head_moved:
+            device = next(self.model.parameters()).device
+            self.scoring_head.to(device)
+            self._head_moved = True
+
         n = len(sentence_features)
+
+        # Defensive check: labels must be (batch_size, n)
+        if labels.dim() == 1:
+            raise ValueError(
+                f"Expected labels of shape (batch_size, {n}), "
+                f"but got 1-D tensor of shape {labels.shape}. "
+                f"The data collator may be squeezing list labels."
+            )
+        assert labels.shape[1] == n, (
+            f"Label width {labels.shape[1]} != number of sentence columns {n}"
+        )
 
         scores = []
         for sf in sentence_features:
@@ -132,40 +141,34 @@ class PairwiseRankingLoss(nn.Module):
 
         # Stack into a single tensor for convenient indexing.
         # Shape: (batch_size, n)
-        scores = torch.stack(scores, dim=1)
-
-        # ==================================================================
-        # For every pair (i, j) with i < j we determine which sample
-        # should score higher from the ordinal labels, then apply the
-        # same margin-loss kernel that the original two-sample version
-        # used.  Pairs with equal labels are masked out.
-        # ==================================================================
+        scores = torch.stack(scores, dim=1)  # (batch_size, n)
 
         labels = labels.float()
 
-        total_loss = torch.tensor(0.0, device=scores.device)
-        valid_pairs = torch.tensor(0.0, device=scores.device)
+        # Build all (i, j) pair indices with i < j
+        idx_i, idx_j = torch.triu_indices(n, n, offset=1)  # each shape: (n_pairs,)
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                label_i = labels[:, i]
-                label_j = labels[:, j]
+        # Gather scores and labels for all pairs at once
+        # scores_i, scores_j: (batch_size, n_pairs)
+        scores_i = scores[:, idx_i]
+        scores_j = scores[:, idx_j]
+        labels_i = labels[:, idx_i]
+        labels_j = labels[:, idx_j]
 
-                sign = torch.sign(label_j - label_i)
-                diff = scores[:, j] - scores[:, i]
+        sign = torch.sign(labels_j - labels_i)      # (batch_size, n_pairs)
+        diff = scores_j - scores_i                    # (batch_size, n_pairs)
+        pair_loss = torch.relu(sign * diff + self.epsilon)
 
-                pair_loss = torch.relu(sign * diff + self.epsilon)
+        mask = (labels_i != labels_j).float()         # (batch_size, n_pairs)
+        pair_loss = pair_loss * mask
 
-                mask = (label_i != label_j).float()
-                pair_loss = pair_loss * mask
-
-                total_loss = total_loss + pair_loss.sum()
-                valid_pairs = valid_pairs + mask.sum()
-
+        valid_pairs = mask.sum()
         if valid_pairs > 0:
-            return total_loss / valid_pairs
+            return pair_loss.sum() / valid_pairs
         else:
-            return total_loss
+            # Return 0 that's connected to the graph (scores sum * 0)
+            return (scores * 0).sum()
+
 
 
 # ──────────────────────────────────────────────
@@ -236,26 +239,34 @@ class PairwiseWinRateEvaluator(SentenceEvaluator):
             show_progress_bar=False,
         )
 
+        # Ensure scoring head is on the same device as embeddings
+        self.scoring_head.to(embeddings.device)
+
         correct = 0
         total = 0
 
         with torch.no_grad():
-            for idx, labels in enumerate(self.labels_list):
-                start, end = boundaries[idx], boundaries[idx + 1]
-                embs = embeddings[start:end]
-                scores = self.scoring_head(embs).squeeze(-1)
+            with torch.no_grad():
+                for idx, labels in enumerate(self.labels_list):
+                    start, end = boundaries[idx], boundaries[idx + 1]
+                    embs = embeddings[start:end]
+                    scores = self.scoring_head(embs).squeeze(-1)
 
-                n = len(labels)
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        li, lj = labels[i], labels[j]
-                        if li == lj:
-                            continue
-                        total += 1
-                        if li < lj and scores[i] > scores[j]:
-                            correct += 1
-                        elif lj < li and scores[j] > scores[i]:
-                            correct += 1
+                    n = len(labels)
+                    labels_t = torch.tensor(labels, device=scores.device).float()
+
+                    idx_i, idx_j = torch.triu_indices(n, n, offset=1)
+                    li = labels_t[idx_i]
+                    lj = labels_t[idx_j]
+                    si = scores[idx_i]
+                    sj = scores[idx_j]
+
+                    valid = li != lj
+                    total += valid.sum().item()
+
+                    # "correct" when lower label has higher score
+                    correct_mask = ((li < lj) & (si > sj)) | ((lj < li) & (sj > si))
+                    correct += (correct_mask & valid).sum().item()
 
         win_rate = correct / total if total > 0 else 0.0
 
@@ -300,28 +311,26 @@ def expand_dataset_for_trainer(ds: Dataset) -> Dataset:
     The ``label`` column is kept as a list[int] (one int per sentence);
     the data collator will stack these into a (batch_size, n) tensor.
     """
-    n_per_row = len(ds[0]["texts"])
-    for row_idx in range(len(ds)):
-        if len(ds[row_idx]["texts"]) != n_per_row:
+    all_texts = ds["texts"]    # list of list[str]
+    all_labels = ds["labels"]  # list of list[int]
+
+    n_per_row = len(all_texts[0])
+
+    # Validate
+    for row_idx, (texts, labels) in enumerate(zip(all_texts, all_labels)):
+        if len(texts) != n_per_row:
             raise ValueError(
-                f"Row {row_idx} has {len(ds[row_idx]['texts'])} texts, "
-                f"expected {n_per_row}."
+                f"Row {row_idx} has {len(texts)} texts, expected {n_per_row}."
             )
-        if len(ds[row_idx]["labels"]) != n_per_row:
+        if len(labels) != n_per_row:
             raise ValueError(
-                f"Row {row_idx} has {len(ds[row_idx]['labels'])} labels, "
-                f"expected {n_per_row}."
+                f"Row {row_idx} has {len(labels)} labels, expected {n_per_row}."
             )
 
-    new_data: dict[str, list] = {
-        f"sentence_{k}": [] for k in range(n_per_row)
-    }
-    new_data["label"] = []
-
-    for row in ds:
-        for k in range(n_per_row):
-            new_data[f"sentence_{k}"].append(row["texts"][k])
-        new_data["label"].append(row["labels"])
+    new_data = {}
+    for k in range(n_per_row):
+        new_data[f"sentence_{k}"] = [row[k] for row in all_texts]
+    new_data["label"] = all_labels
 
     return Dataset.from_dict(new_data)
 
@@ -339,7 +348,16 @@ def main(cmd_args):
 
     MODEL_NAME = cmd_args[0]
     MAX_SEQ_LEN = int(cmd_args[1])
-    OUTPUT_DIR = cmd_args[2]
+    CUSTOM_DATASET = cmd_args[2]
+    OUTPUT_DIR = cmd_args[3]
+    #If note downsampling, then use a larger batch size
+    BS = 16
+    #Optional downsampling for testing purposes
+    DOWNSAMPLE_SIZE = None
+    if len(cmd_args) > 4:
+        DOWNSAMPLE_SIZE = int(cmd_args[4])
+        if DOWNSAMPLE_SIZE == 50:
+            BS = 2
 
     # ──────────────────────────────────────────────
     # FIX #1: Fixed seed for ALL random data operations
@@ -348,9 +366,43 @@ def main(cmd_args):
     SPLIT_SEED = 42
 
     # ──────────────────────────────────────────────
+    # Create training arguments EARLY — this triggers
+    # HuggingFace's internal dist.init_process_group()
+    # with the correct backend and configuration that
+    # the Trainer's dataloader setup depends on.
+    # ──────────────────────────────────────────────
+    training_args = SentenceTransformerTrainingArguments(
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=3,
+        per_device_train_batch_size=BS,
+        per_device_eval_batch_size=BS,
+        learning_rate=1e-5,
+        warmup_steps=10,
+        logging_strategy="steps",
+        logging_steps=100,
+        save_strategy="epoch",
+        save_total_limit=2,
+        seed=42,
+        eval_strategy="epoch",
+        fp16=False,
+        bf16=True,
+        dataloader_drop_last=False,
+    )
+
+    # Make sure this dist works...
+    assert dist.is_initialized()
+
+    if rank == 0:
+        logger.info(
+            "dist.is_initialized() = %s, world_size = %s",
+            dist.is_initialized(),
+            dist.get_world_size() if dist.is_initialized() else "N/A",
+        )
+
+    # ──────────────────────────────────────────────
     # Build the SentenceTransformer model
     # ──────────────────────────────────────────────
-    # FIX #3: removed tp_plan="auto" — incompatible with DDP
+
     word_embedding_model = models.Transformer(
         MODEL_NAME,
         max_seq_length=MAX_SEQ_LEN,
@@ -379,7 +431,7 @@ def main(cmd_args):
     # Prepare datasets
     # FIX #1: deterministic, identical splits on every rank
     # ──────────────────────────────────────────────
-    t = d_f.format_custom_dataset("yle_2019")
+    t = d_f.format_custom_dataset(CUSTOM_DATASET)
     if rank == 0:
         print(t[0])
 
@@ -389,8 +441,9 @@ def main(cmd_args):
     # or do the shuffle only on rank 0 and broadcast the indices.
     ds = d_f.shuffle_and_transform_formatted_dataset(
         t, seed=SPLIT_SEED          # ← you may need to add this
-    ).select(range(1000))                                #   parameter in dataset_functions
-
+    )
+    if DOWNSAMPLE_SIZE:
+        ds=ds.select(range(DOWNSAMPLE_SIZE))                                #   parameter in dataset_functions
     # FIX #1 (continued): explicit seed ensures identical splits
     # ds is a HuggingFace Dataset, with the rows "id", "texts", and "labels"
     # id is an integer and purely informational
@@ -445,24 +498,25 @@ def main(cmd_args):
     # ──────────────────────────────────────────────
     train_loss = PairwiseRankingLoss(
         model=model,
-        epsilon=0.1,
+        epsilon=0.2,
         scoring_hidden=None,
     )
-
     # ──────────────────────────────────────────────
-    # FIX #2 (corrected): Synchronise scoring_head gradients
-    # across ranks WITHOUT registering it on the
-    # SentenceTransformer (which would break its
-    # sequential forward pass).
-    #
-    # We attach a backward hook to every parameter in
-    # the scoring_head that all-reduces its gradient,
-    # exactly mirroring what DDP does for the wrapped
-    # model's parameters.
+    # Ensure scoring_head is on the correct GPU
+    # before any distributed operations
     # ──────────────────────────────────────────────
     if dist.is_initialized() and dist.get_world_size() > 1:
+        device = torch.device(f"cuda:{local_rank}")
+        train_loss.scoring_head.to(device)
+
+        # Now broadcast rank 0's weights to all other ranks
+        for param in train_loss.scoring_head.parameters():
+            dist.broadcast(param.data, src=0)
+        if rank == 0:
+            logger.info("Broadcast scoring_head weights from rank 0 to all ranks.")
+
+        # Register gradient-sync hooks
         def _make_sync_hook():
-            """Factory avoids closure pitfalls in a loop."""
             world_size = dist.get_world_size()
             def hook(grad: torch.Tensor) -> torch.Tensor:
                 dist.all_reduce(grad, op=dist.ReduceOp.SUM)
@@ -476,7 +530,8 @@ def main(cmd_args):
         if rank == 0:
             logger.info(
                 "Registered gradient-sync hooks on %d scoring_head parameters.",
-                sum(1 for p in train_loss.scoring_head.parameters() if p.requires_grad),
+                sum(1 for p in train_loss.scoring_head.parameters()
+                    if p.requires_grad),
             )
 
     # ──────────────────────────────────────────────
@@ -491,27 +546,6 @@ def main(cmd_args):
     )
 
     # ──────────────────────────────────────────────
-    # Training arguments
-    # ──────────────────────────────────────────────
-    training_args = SentenceTransformerTrainingArguments(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        learning_rate=2e-5,
-        warmup_steps=10,
-        logging_strategy="steps",
-        logging_steps=100,
-        save_strategy="epoch",
-        save_total_limit=2,
-        seed=42,
-        eval_strategy="epoch",
-        fp16=False,
-        bf16=True,
-        dataloader_drop_last=False,
-    )
-
-    # ──────────────────────────────────────────────
     # Create trainer & train
     # ──────────────────────────────────────────────
     trainer = SentenceTransformerTrainer(
@@ -522,6 +556,19 @@ def main(cmd_args):
         loss=train_loss,
         evaluator=dev_evaluator,
     )
+
+    # ── Diagnostic: what did the trainer do to our dataset? ──
+    if rank == 0:
+        logger.info(f"trainer.train_dataset type: {type(trainer.train_dataset)}")
+        logger.info(f"trainer.train_dataset length: {getattr(trainer.train_dataset, '__len__', 'NO __len__')}")
+        try:
+            dl = trainer.get_train_dataloader()
+            logger.info(f"Dataloader type: {type(dl)}")
+            logger.info(f"Dataloader length: {len(dl)}")
+        except TypeError as e:
+            logger.error(f"Dataloader has no __len__: {e}")
+        except Exception as e:
+            logger.error(f"Dataloader error: {e}")
 
     trainer.train()
 
@@ -555,41 +602,28 @@ def main(cmd_args):
             logger.info("  %s = %s", k, v)
 
         # Sanity check
-        h = 0
+        # Baseline: how often does positional order match label order?
+        baseline_correct = 0
+        baseline_total = 0
         for test_ls in test_dataset['labels']:
-            if test_ls[0] == 0:
-                h += 1
-        logger.info(
-            "Win-rate if always predicting the first text to be better: %f",
-            h / len(test_dataset["labels"]),
-        )
-
-    # ──────────────────────────────────────────────
-    # Loading saved model for later use
-    # ──────────────────────────────────────────────
-    def load_model_and_head(
-        model_path: str,
-        head_path: str,
-        emb_dim: int = 768,
-    ):
-        """Reload the encoder + scoring head from disk.""
-        loaded_model = SentenceTransformer(model_path)
-
-        loaded_head = nn.Linear(emb_dim, 1)
-        loaded_head.load_state_dict(torch.load(head_path))
-        loaded_head.eval()
-
-        return loaded_model, loaded_head
-
-    # Example reload:
-    # reloaded_model, reloaded_head = load_model_and_head(
-    #     "output/finnish-pairwise-ranker/final",
-    #     "output/finnish-pairwise-ranker/final/scoring_head.pt",
-    # )
-    # scores = predict_scores(test_sentences, reloaded_model, reloaded_head)
-
-    """
-
+            n = len(test_ls)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if test_ls[i] == test_ls[j]:
+                        continue
+                    baseline_total += 1
+                    # "Always predict earlier position has higher score"
+                    # i.e., score(i) > score(j) for all i < j
+                    if test_ls[i] < test_ls[j]:  # lower label = better
+                        baseline_correct += 1
+        if baseline_total > 0:
+            logger.info(
+                "Pairwise win-rate if always predicting positional order: %.4f  (%d / %d)",
+                baseline_correct / baseline_total, baseline_correct, baseline_total,
+            )
+        # Also log random baseline
+        logger.info("Random baseline: 0.5000")
+        
     # FIX #5: barrier so non-zero ranks don't tear down
     # the process group while rank 0 is still evaluating
     if dist.is_initialized():

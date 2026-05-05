@@ -72,12 +72,11 @@ def format_custom_dataset(custom_dataset_name: str):
 
 def shuffle_and_transform_formatted_dataset(formatted_dataset:list[dict], seed: int=None):
     #First apply shuffling to each internal 'text_label_pairs' list
+    if seed:
+        random.seed(seed)
     for x in formatted_dataset:
         tl_list = x.pop('text_label_pairs', None)
-        if seed:
-            random.Random(seed).shuffle(tl_list)
-        else:
-            random.shuffle(tl_list)
+        random.shuffle(tl_list)
         #After shuffling, separate texts and labels to their own lists
         x['texts'] = [y[0] for y in tl_list]
         x['labels'] = [y[1] for y in tl_list]

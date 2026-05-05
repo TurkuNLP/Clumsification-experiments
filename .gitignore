@@ -13,6 +13,11 @@ quick*
 TQ_ranker*
 *.ipynb
 *model_classification_ft*
+
+edu_filtering.py
+extract_jsons_P.py
+mans_roc.json
+
 # C extensions
 *.so
 

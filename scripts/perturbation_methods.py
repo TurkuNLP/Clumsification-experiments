@@ -6,6 +6,7 @@ from vllm import LLM, SamplingParams
 import json
 import sys
 import torch
+import re
 
 def apply_chat_template(base_prompt, system_prompt, ex_user, ex_assistant, context_prompt_user, text):
     return [
@@ -53,11 +54,11 @@ def select_correct_params(MODEL_PATH, ds_items, language: str, perturbation_type
         pass
 
 def vllm_perturbation(MODEL_PATH, prompts, ):
-    llm = LLM(model=MODEL_PATH, max_model_len=4096, max_num_seqs=4, gpu_memory_utilization=0.9, tensor_parallel_size=torch.cuda.device_count(),)
+    llm = LLM(model=MODEL_PATH, max_model_len=8192, max_num_seqs=4, gpu_memory_utilization=0.9, tensor_parallel_size=torch.cuda.device_count(), reasoning_parser='qwen3')
 
     #Hyperparams
     pars = llm.get_default_sampling_params()
-    pars.max_tokens=2048
+    pars.max_tokens=4096
     #pars.min_tokens=1024
     pars.temperature=0.7
     #pars.top_p=0.95
@@ -77,30 +78,37 @@ def main(cmd_args):
     START_LAYER = int(cmd_args[2])
     LANGUAGE = cmd_args[3]
     PERTURBATION_TYPE = cmd_args[4]    
+    DOWNSAMPLE = None
+    if len(cmd_args) > 5:
+        DOWNSAMPLE=int(cmd_args[5])
 
     ds_items = []
     ds_folder = "data/custom_datasets/"+DS_NAME+"/"
     if START_LAYER == 0:
         ds_path = ds_folder+"original.jsonl"
     else:
-        ds_path = ds_folder+"perturbed-layers/"+str(START_LAYER)+".jsonl"
+        ds_path = ds_folder+"perturbed_layers/"+str(START_LAYER)+".jsonl"
     
     with open(ds_path, 'r', encoding="UTF-8") as reader:
         for l in reader:
             if len(l) > 1:
                 ds_items.append(json.loads(l.strip()))
-    #Downsampling for testing
-    ds_items = ds_items[:5]
+    #Optional downsampling for testing
+    if DOWNSAMPLE:
+        ds_items = ds_items[:DOWNSAMPLE]
     #Function call to have the wanted model go through the input items
     outputs = select_correct_params(MODEL_PATH, ds_items, LANGUAGE, PERTURBATION_TYPE)
     
     res_d = []
     for i,o in enumerate(outputs):
-        res_d.append({'perturbation_type':PERTURBATION_TYPE ,'model':MODEL_PATH, 'head_id':i, 'text':o.outputs[0].text})
+        temp_text = o.outputs[0].text
+        temp_text = re.sub(r'<think>.*?</think>', '', temp_text, flags=re.DOTALL)
+        temp_text = re.sub(r"\A[\n']+|[\n']+\Z", '', temp_text)
+        res_d.append({'perturbation_type':PERTURBATION_TYPE ,'model':MODEL_PATH, 'head_id':i, 'text':temp_text})
 
     print("Parsed outputs!")
 
-    with open(ds_path+"perturbed_layers/"+str(START_LAYER+1)+".jsonl", "w") as writer:
+    with open(ds_folder+"perturbed_layers/"+str(START_LAYER+1)+".jsonl", "w") as writer:
         for d in res_d:
             writer.write(json.dumps(d)+'\n')
     
