@@ -13,10 +13,13 @@ quick*
 TQ_ranker*
 *.ipynb
 *model_classification_ft*
+*.txt
+*.db
 
 edu_filtering.py
 extract_jsons_P.py
 mans_roc.json
+OpenAI_lib.py
 
 # C extensions
 *.so

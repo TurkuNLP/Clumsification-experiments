@@ -34,8 +34,10 @@ def init_og_dataset(source_txt_path: str, new_ds_name: str, overwrite: bool = Fa
     if not os.path.exists("data/custom_datasets/"+new_ds_name+"/original.jsonl") or overwrite:
         with open("data/custom_datasets/"+new_ds_name+"/original.jsonl", 'w', encoding='utf-8') as writer:
             with open(source_txt_path, 'r', encoding='utf-8') as reader:
+                i = 0
                 for line in reader:
-                    writer.write(json.dumps({'text':line.replace('\n', '')})+'\n')
+                    writer.write(json.dumps({'custom_id':str(i),'text':line.replace('\n', '')})+'\n')
+                    i+=1
     return "data/custom_datasets/"+new_ds_name+"/original.jsonl"
 
 
@@ -63,9 +65,12 @@ def format_custom_dataset(custom_dataset_name: str):
         layer = int(file_name.replace('.jsonl', ''))
         #Go through each row in the perturbed layer-file, and add to the same object with its original version
         for x in contents:
-            temp = id_dict[x['head_id']]
+            head_id = x['head_id']
+            if isinstance(head_id, str):
+                head_id = int(head_id)
+            temp = id_dict[head_id]
             temp['text_label_pairs'] += [(x['text'],layer)]
-            id_dict[x['head_id']] = temp
+            id_dict[head_id] = temp
     #The extra id from the dict sturcture has served its purpose, so return only the contents (a list of dicts)
     return list(id_dict.values())
 
