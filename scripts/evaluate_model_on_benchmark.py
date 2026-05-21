@@ -62,7 +62,7 @@ class LTRInferenceModel(nn.Module):
 
         self.encoder = AutoModel.from_pretrained(
             model_dir,
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=True,
             attn_implementation=attn_implementation,
         )
@@ -232,6 +232,47 @@ def collect_webnlg_texts(
     return texts
 
 # Helpers for loading a specific benchmark / dataset
+
+#E2E generations
+
+def load_e2e_data(folder_path: str):
+    import os
+    import pandas as pd
+    from datasets import Dataset
+
+    nat_df = pd.read_csv(os.path.join(folder_path, "naturalness.csv"))
+    qual_df = pd.read_csv(os.path.join(folder_path, "quality.csv"))
+
+    # Identify and sort columns to ensure ref1↔natur1↔quality1, etc.
+    ref_cols = ['ref1', 'ref2', 'ref3', 'ref4', 'ref5']
+    nat_cols = ['natur1', 'natur2', 'natur3', 'natur4', 'natur5']
+    qual_cols = ['quality1', 'quality2', 'quality3', 'quality4', 'quality5']
+
+    texts = []
+    naturalness_scores = []
+    quality_scores = []
+
+    num_groups = len(nat_df) // 3
+
+    for g in range(num_groups):
+        start = g * 3
+        end = start + 3
+
+        nat_group = nat_df.iloc[start:end]
+        qual_group = qual_df.iloc[start:end]
+
+        for ref_col, nat_col, qual_col in zip(ref_cols, nat_cols, qual_cols):
+            # Text is the same across the 3 annotator rows — take the first
+            texts.append(nat_group[ref_col].iloc[0])
+            # Mean of the 3 annotator scores
+            naturalness_scores.append(nat_group[nat_col].astype(float).mean())
+            quality_scores.append(qual_group[qual_col].astype(float).mean())
+
+    return Dataset.from_dict({
+        "text": texts,
+        "naturalness": naturalness_scores,
+        "quality": quality_scores,
+    })
 
 # FED benchmark
 def load_fed_data(file_path: str):
@@ -403,12 +444,13 @@ def load_test_data_cohesentia(file_paths: Union[str, List[str]]) -> Tuple[List[s
 
     return test_texts, test_labels
 
-def getModelPreds(device, model, score_head, test_texts):
-    # Inference
-    with torch.no_grad():
-        embeddings = model.encode(test_texts, convert_to_tensor=True, device=device)
-        raw_preds = score_head(embeddings).cpu().float().numpy()  
-    return raw_preds
+# Deprecated
+#def getModelPreds(device, model, score_head, test_texts):
+#    # Inference
+#    with torch.no_grad():
+#        embeddings = model.encode(test_texts, convert_to_tensor=True, device=device)
+#        raw_preds = score_head(embeddings).cpu().float().numpy()  
+#    return raw_preds
 
 
 def main(cmd_args):
@@ -643,8 +685,28 @@ def main(cmd_args):
     spearman, _ = spearmanr(turn_ds['overall'], raw_preds_turn)
     print(f"Spearman ρ (FED_turn_overall): {spearman:.4f}")
     #Whole, overall
-    spearman, _ = spearmanr(whole_ds['overall'], raw_preds_turn)
+    print(f"Total number of whole dialogues in FED: {len(whole_ds):.4f}")
+    spearman, _ = spearmanr(whole_ds['overall'], raw_preds_whole)
     print(f"Spearman ρ (FED_whole_overall): {spearman:.4f}")
+    del raw_preds_turn
+    del raw_preds_whole
+
+    #E2E_text_generations
+    e2e_ds = load_e2e_data("data/benchmarks/E2E_data")
+    print(f"Total number of texts in E2E: {len(e2e_ds):.4f}")
+    raw_preds = getModelPreds(
+        device,
+        model,
+        e2e_ds['text'],
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH,
+    )
+    #Naturalness
+    spearman, _ = spearmanr(e2e_ds['naturalness'], raw_preds)
+    print(f"Spearman ρ (E2E_naturalness): {spearman:.4f}")
+    #Quality
+    spearman, _ = spearmanr(e2e_ds['quality'], raw_preds)
+    print(f"Spearman ρ (E2E_quality): {spearman:.4f}")
 
 
 
