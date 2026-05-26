@@ -42,18 +42,14 @@ class LTRInferenceModel(nn.Module):
         model_dir: str,
         head_path: str,
         device: torch.device,
-        attn_implementation: str = "sdpa",
+        attn_implementation: str = "flash_attention_2",
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
 
+        # Use fp32 by default for stable benchmark correlations
         if dtype is None:
-            if device.type == "cuda" and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            elif device.type == "cuda":
-                dtype = torch.float16
-            else:
-                dtype = torch.float32
+            dtype = torch.float32
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
@@ -62,35 +58,37 @@ class LTRInferenceModel(nn.Module):
 
         self.encoder = AutoModel.from_pretrained(
             model_dir,
-            dtype=dtype,
+            torch_dtype=dtype,  # <-- FIXED
             trust_remote_code=True,
             attn_implementation=attn_implementation,
         )
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
         if self.encoder.config.pad_token_id is None:
             self.encoder.config.pad_token_id = self.tokenizer.pad_token_id
 
         head_state = torch.load(head_path, map_location="cpu")
-
         hidden_dim = head_state["hidden_dim"]
         dropout = head_state["dropout"]
         scorer_state = head_state["scorer"]
 
-        emb_dim = self.encoder.config.hidden_size
+        # Make compatible with possible saved key prefixes
+        scorer_state = {
+            (k[len("scorer."):] if k.startswith("scorer.") else k): v
+            for k, v in scorer_state.items()
+        }
 
+        emb_dim = self.encoder.config.hidden_size
         self.scorer = ScoringHead(
             input_dim=emb_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
         )
+        self.scorer.load_state_dict(scorer_state, strict=True)
 
-        self.scorer.load_state_dict(scorer_state)
-
-        self.encoder.to(device=device, dtype=dtype)
-        self.scorer.to(device=device, dtype=dtype)
+        self.encoder.to(device=device)
+        self.scorer.to(device=device, dtype=torch.float32)  # stable head dtype
 
         self.encoder.eval()
         self.scorer.eval()
@@ -115,6 +113,8 @@ class LTRInferenceModel(nn.Module):
     ):
         all_scores = []
 
+        scorer_dtype = next(self.scorer.parameters()).dtype
+
         for start in tqdm(range(0, len(texts), batch_size), desc="Scoring"):
             batch_texts = texts[start:start + batch_size]
 
@@ -133,18 +133,57 @@ class LTRInferenceModel(nn.Module):
                 use_cache=False,
             )
 
+            if not torch.isfinite(out.last_hidden_state).all():
+                raise RuntimeError(
+                    f"Non-finite encoder hidden states detected in batch starting at {start}."
+                )
+
             emb = self.mean_pool(out.last_hidden_state, tok["attention_mask"])
+
+            if not torch.isfinite(emb).all():
+                raise RuntimeError(
+                    f"Non-finite pooled embeddings detected in batch starting at {start}."
+                )
+
+            emb = emb.to(dtype=scorer_dtype)
+
             scores = self.scorer(emb)
+
+            if not torch.isfinite(scores).all():
+                raise RuntimeError(
+                    f"Non-finite scores detected in batch starting at {start}. "
+                    f"Texts: {batch_texts[:3]}"
+                )
 
             all_scores.append(scores.detach().cpu().float())
 
         return torch.cat(all_scores, dim=0).numpy()
+    
+def safe_spearman(labels, preds, name="metric"):
+    labels = np.asarray(labels, dtype=np.float64)
+    preds = np.asarray(preds, dtype=np.float64)
+
+    mask = np.isfinite(labels) & np.isfinite(preds)
+    labels = labels[mask]
+    preds = preds[mask]
+
+    if len(labels) < 2:
+        print(f"{name}: not enough valid points for Spearman.")
+        return float("nan"), float("nan")
+
+    if np.all(preds == preds[0]):
+        print(f"{name}: predictions are constant; Spearman undefined.")
+        return float("nan"), float("nan")
+
+    rho, p = spearmanr(labels, preds)
+    return float(rho), float(p)
 
 
 def load_model_for_benchmark(
     model_dir: str,
     device: torch.device,
-    attn_implementation: str = "sdpa",
+    attn_implementation: str = "flash_attention_2",
+    dtype: Optional[torch.dtype] = None,
 ):
     head_path = os.path.join(model_dir, "ltr_head.pt")
 
@@ -159,6 +198,7 @@ def load_model_for_benchmark(
         head_path=head_path,
         device=device,
         attn_implementation=attn_implementation,
+        dtype=dtype
     )
 
     return model
@@ -391,6 +431,7 @@ def load_data_ellipse(file_path: str):
     data_set = []
     with open(file_path, newline='\n') as csvfile:
         spamreader = csv.reader(csvfile, delimiter=',', quotechar = '"')
+        next(spamreader, None) #Skip header
         for row in spamreader:
             text = row[1]
             oa = row[18]
@@ -444,14 +485,6 @@ def load_test_data_cohesentia(file_paths: Union[str, List[str]]) -> Tuple[List[s
 
     return test_texts, test_labels
 
-# Deprecated
-#def getModelPreds(device, model, score_head, test_texts):
-#    # Inference
-#    with torch.no_grad():
-#        embeddings = model.encode(test_texts, convert_to_tensor=True, device=device)
-#        raw_preds = score_head(embeddings).cpu().float().numpy()  
-#    return raw_preds
-
 
 def main(cmd_args):
 
@@ -467,8 +500,13 @@ def main(cmd_args):
     model = load_model_for_benchmark(
         model_dir=MODEL_PATH,
         device=device,
-        attn_implementation="sdpa",
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
+
+    probe = ["short text", "a much much longer text with different content"]
+    probe_scores = model.score_texts(probe, device=device, batch_size=2, max_length=64)
+    print("Sanity probe scores:", probe_scores)
 
     MAX_LENGTH = int(cmd_args[1]) if len(cmd_args) > 1 else 512
     BATCH_SIZE = int(cmd_args[2]) if len(cmd_args) > 2 else 32
@@ -479,17 +517,13 @@ def main(cmd_args):
         "data/benchmarks/CohesentiaTrainData.json"
     ]
     cohesentia_texts, cohesentia_labels = load_test_data_cohesentia(cohesentia)
-    print(f"Total number of test texts in cohesentia: {len(cohesentia_texts):.4f}")   
-
+    print(f"Total number of test texts in cohesentia: {len(cohesentia_texts)}")
     raw_preds = getModelPreds(
-        device,
-        model,
-        cohesentia_texts,
-        batch_size=BATCH_SIZE,
-        max_length=MAX_LENGTH,
+        device, model, cohesentia_texts,
+        batch_size=BATCH_SIZE, max_length=MAX_LENGTH
     )
     # Spearman works directly — no rescaling required
-    spearman, _ = spearmanr(cohesentia_labels, raw_preds)
+    spearman, _ = safe_spearman(cohesentia_labels, raw_preds)
     print(f"Spearman ρ (cohesentia): {spearman:.4f}")
 
     #SummEval
@@ -505,15 +539,15 @@ def main(cmd_args):
     )
     #fluency
     summeval_fluency_labels = [x for y in ds['fluency'] for x in y]
-    spearman, _ = spearmanr(summeval_fluency_labels, raw_preds)
+    spearman, _ = safe_spearman(summeval_fluency_labels, raw_preds)
     print(f"Spearman ρ (summeval_fluency): {spearman:.4f}")
     #coherence
     summeval_fluency_labels = [x for y in ds['coherence'] for x in y]
-    spearman, _ = spearmanr(summeval_fluency_labels, raw_preds)
+    spearman, _ = safe_spearman(summeval_fluency_labels, raw_preds)
     print(f"Spearman ρ (summeval_coherence): {spearman:.4f}")
     #consistency
     summeval_fluency_labels = [x for y in ds['consistency'] for x in y]
-    spearman, _ = spearmanr(summeval_fluency_labels, raw_preds)
+    spearman, _ = safe_spearman(summeval_fluency_labels, raw_preds)
     print(f"Spearman ρ (summeval_consistency): {spearman:.4f}")
 
     #ELLIPSE
@@ -529,11 +563,11 @@ def main(cmd_args):
     )
     #overall
     ellipse_labels = ds['overall']
-    spearman, _ = spearmanr(ellipse_labels, raw_preds)
+    spearman, _ = safe_spearman(ellipse_labels, raw_preds)
     print(f"Spearman ρ (ellipse_overall): {spearman:.4f}")
     #cohesion
     ellipse_labels = ds['cohesion']
-    spearman, _ = spearmanr(ellipse_labels, raw_preds)
+    spearman, _ = safe_spearman(ellipse_labels, raw_preds)
     print(f"Spearman ρ (ellipse_cohesion): {spearman:.4f}")
 
     #USR
@@ -548,11 +582,11 @@ def main(cmd_args):
         batch_size=BATCH_SIZE,
         max_length=MAX_LENGTH,
     )
-    spearman, _ = spearmanr(tc_labels, raw_preds)
+    spearman, _ = safe_spearman(tc_labels, raw_preds)
     print(f"Spearman ρ (tc_overall): {spearman:.4f}")
     #Natural
     _, tc_labels = load_data_usr("data/benchmarks/tc_usr_data.json", 'Natural')
-    spearman, _ = spearmanr(tc_labels, raw_preds)
+    spearman, _ = safe_spearman(tc_labels, raw_preds)
     print(f"Spearman ρ (tc_natural): {spearman:.4f}")
     #Persona chat
     #Overall
@@ -565,11 +599,11 @@ def main(cmd_args):
         batch_size=BATCH_SIZE,
         max_length=MAX_LENGTH,
     )
-    spearman, _ = spearmanr(pc_labels, raw_preds)
+    spearman, _ = safe_spearman(pc_labels, raw_preds)
     print(f"Spearman ρ (pc_overall): {spearman:.4f}")
     #Natural
     _, pc_labels = load_data_usr("data/benchmarks/pc_usr_data.json", 'Natural')
-    spearman, _ = spearmanr(pc_labels, raw_preds)
+    spearman, _ = safe_spearman(pc_labels, raw_preds)
     print(f"Spearman ρ (pc_natural): {spearman:.4f}")
 
     #OpenMEVA
@@ -587,7 +621,7 @@ def main(cmd_args):
         batch_size=BATCH_SIZE,
         max_length=MAX_LENGTH,
     )
-    spearman, _ = spearmanr(meva_labels, raw_preds)
+    spearman, _ = safe_spearman(meva_labels, raw_preds)
     print(f"Spearman ρ (OpenMEVA_overall): {spearman:.4f}")
 
     #WebNLG
@@ -601,7 +635,7 @@ def main(cmd_args):
         batch_size=BATCH_SIZE,
         max_length=MAX_LENGTH,
     )
-    spearman, _ = spearmanr(webnlg_labels, raw_preds)
+    spearman, _ = safe_spearman(webnlg_labels, raw_preds)
     print(f"Spearman ρ (WebNLG_overall): {spearman:.4f}")
 
     #HANNA
@@ -615,10 +649,10 @@ def main(cmd_args):
         max_length=MAX_LENGTH,
     )
     #Coherency
-    spearman, _ = spearmanr(hanna_ds['coherence'], raw_preds)
+    spearman, _ = safe_spearman(hanna_ds['coherence'], raw_preds)
     print(f"Spearman ρ (HANNA_coherence): {spearman:.4f}")
     #Complexity
-    spearman, _ = spearmanr(hanna_ds['complexity'], raw_preds)
+    spearman, _ = safe_spearman(hanna_ds['complexity'], raw_preds)
     print(f"Spearman ρ (HANNA_complexity): {spearman:.4f}")
 
     #ARG-ESSAY
@@ -632,16 +666,16 @@ def main(cmd_args):
         max_length=MAX_LENGTH,
     )
     #Language mastery
-    spearman, _ = spearmanr(arge_ds['language_mastery'], raw_preds)
+    spearman, _ = safe_spearman(arge_ds['language_mastery'], raw_preds)
     print(f"Spearman ρ (ARG-ESSAY_language_mastery): {spearman:.4f}")
     #Complexity
-    spearman, _ = spearmanr(arge_ds['complexity'], raw_preds)
+    spearman, _ = safe_spearman(arge_ds['complexity'], raw_preds)
     print(f"Spearman ρ (ARG-ESSAY_complexity): {spearman:.4f}")
     #Vocabulary
-    spearman, _ = spearmanr(arge_ds['vocabulary'], raw_preds)
+    spearman, _ = safe_spearman(arge_ds['vocabulary'], raw_preds)
     print(f"Spearman ρ (ARG-ESSAY_vocabulary): {spearman:.4f}")
     #Language constructs
-    spearman, _ = spearmanr(arge_ds['language_constructs'], raw_preds)
+    spearman, _ = safe_spearman(arge_ds['language_constructs'], raw_preds)
     print(f"Spearman ρ (ARG-ESSAY_language_constructs): {spearman:.4f}")
 
     #Human ratings of NLG (includes BAGEL etc.)
@@ -655,10 +689,10 @@ def main(cmd_args):
         max_length=MAX_LENGTH,
     )
     #Overall quality
-    spearman, _ = spearmanr(hr_ds['quality'], raw_preds)
+    spearman, _ = safe_spearman(hr_ds['quality'], raw_preds)
     print(f"Spearman ρ (HumanRatings_quality): {spearman:.4f}")
     #Naturalness
-    spearman, _ = spearmanr(hr_ds['naturalness'], raw_preds)
+    spearman, _ = safe_spearman(hr_ds['naturalness'], raw_preds)
     print(f"Spearman ρ (HumanRatings_naturalness): {spearman:.4f}")
 
     #FED
@@ -679,14 +713,14 @@ def main(cmd_args):
         max_length=MAX_LENGTH,
     )
     #Turn, fluency
-    spearman, _ = spearmanr(turn_ds['fluent'], raw_preds_turn)
+    spearman, _ = safe_spearman(turn_ds['fluent'], raw_preds_turn)
     print(f"Spearman ρ (FED_turn_fluency): {spearman:.4f}")
     #Turn, overall
-    spearman, _ = spearmanr(turn_ds['overall'], raw_preds_turn)
+    spearman, _ = safe_spearman(turn_ds['overall'], raw_preds_turn)
     print(f"Spearman ρ (FED_turn_overall): {spearman:.4f}")
     #Whole, overall
     print(f"Total number of whole dialogues in FED: {len(whole_ds):.4f}")
-    spearman, _ = spearmanr(whole_ds['overall'], raw_preds_whole)
+    spearman, _ = safe_spearman(whole_ds['overall'], raw_preds_whole)
     print(f"Spearman ρ (FED_whole_overall): {spearman:.4f}")
     del raw_preds_turn
     del raw_preds_whole
@@ -702,10 +736,10 @@ def main(cmd_args):
         max_length=MAX_LENGTH,
     )
     #Naturalness
-    spearman, _ = spearmanr(e2e_ds['naturalness'], raw_preds)
+    spearman, _ = safe_spearman(e2e_ds['naturalness'], raw_preds)
     print(f"Spearman ρ (E2E_naturalness): {spearman:.4f}")
     #Quality
-    spearman, _ = spearmanr(e2e_ds['quality'], raw_preds)
+    spearman, _ = safe_spearman(e2e_ds['quality'], raw_preds)
     print(f"Spearman ρ (E2E_quality): {spearman:.4f}")
 
 
