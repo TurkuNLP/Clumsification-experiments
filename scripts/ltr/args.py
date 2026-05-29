@@ -7,6 +7,7 @@ def parse_args():
     parser.add_argument("model_name", type=str)
     parser.add_argument("max_seq_len", type=int)
     parser.add_argument("--custom-datasets", nargs='+', type=str)
+    parser.add_argument("--max_layers", type=int, default=None)
     parser.add_argument("--output-dir", type=str)
 
     parser.add_argument("--downsample_size", type=int, default=None)

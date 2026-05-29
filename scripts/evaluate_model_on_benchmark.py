@@ -179,6 +179,529 @@ def safe_spearman(labels, preds, name="metric"):
     return float(rho), float(p)
 
 
+    ### Functions for using HellaSwag, Multiblimp, JFLEG, and StoryCloze as evals
+
+def _clean_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def join_context_and_continuation(context: str, continuation: str) -> str:
+    """
+    Join context + continuation while preserving HellaSwag-style punctuation.
+    Many HellaSwag endings start with ',' or '.', so blindly adding a space can
+    produce unnatural text like 'then , the man...'.
+    """
+    context = _clean_text(context)
+    continuation = _clean_text(continuation)
+
+    if not context:
+        return continuation
+    if not continuation:
+        return context
+
+    # If the continuation starts with punctuation, attach directly.
+    if continuation[0] in {".", ",", "!", "?", ";", ":", "'", '"', ")", "]"}:
+        return context + continuation
+
+    return context + " " + continuation
+
+
+def preference_metrics(
+    preferred_scores,
+    dispreferred_scores,
+    name: str = "preference",
+):
+    """
+    Metrics for pairwise preference benchmarks.
+
+    preferred_scores[i] should be greater than dispreferred_scores[i].
+
+    Reports:
+      - tie_aware_acc: counts preferred > rejected as 1, tie as 0.5
+      - strict_acc: counts only preferred > rejected as correct
+      - tie_rate
+      - mean_delta: mean(preferred_score - dispreferred_score)
+      - median_delta
+    """
+    preferred_scores = np.asarray(preferred_scores, dtype=np.float64)
+    dispreferred_scores = np.asarray(dispreferred_scores, dtype=np.float64)
+
+    if preferred_scores.shape != dispreferred_scores.shape:
+        raise ValueError(
+            f"{name}: preferred/dispreferred score shape mismatch: "
+            f"{preferred_scores.shape} vs {dispreferred_scores.shape}"
+        )
+
+    mask = np.isfinite(preferred_scores) & np.isfinite(dispreferred_scores)
+    preferred_scores = preferred_scores[mask]
+    dispreferred_scores = dispreferred_scores[mask]
+
+    if len(preferred_scores) == 0:
+        return {
+            "n": 0,
+            "tie_aware_acc": float("nan"),
+            "strict_acc": float("nan"),
+            "tie_rate": float("nan"),
+            "mean_delta": float("nan"),
+            "median_delta": float("nan"),
+        }
+
+    deltas = preferred_scores - dispreferred_scores
+
+    wins = deltas > 0
+    ties = deltas == 0
+
+    return {
+        "n": int(len(deltas)),
+        "tie_aware_acc": float(np.mean(wins.astype(np.float64) + 0.5 * ties.astype(np.float64))),
+        "strict_acc": float(np.mean(wins)),
+        "tie_rate": float(np.mean(ties)),
+        "mean_delta": float(np.mean(deltas)),
+        "median_delta": float(np.median(deltas)),
+    }
+
+
+def multiple_choice_preference_metrics(
+    scores_by_item,
+    labels,
+    name: str = "multiple_choice_preference",
+):
+    """
+    Metrics for k-way preference benchmarks such as HellaSwag.
+
+    scores_by_item: shape [num_items, num_choices]
+    labels: integer index of preferred/correct choice for each item.
+
+    Reports:
+      - tie_aware_acc:
+          If the correct option is tied for best with m options, gets 1/m.
+          If it is not tied for best, gets 0.
+      - strict_acc:
+          Correct option must be strictly greater than every distractor.
+      - argmax_acc:
+          np.argmax accuracy, useful but biased toward lower-index choices on ties.
+      - pairwise_acc:
+          Average over all correct-vs-distractor comparisons, tie = 0.5.
+      - mean_margin_vs_best_wrong:
+          mean(correct_score - max_wrong_score)
+    """
+    scores_by_item = np.asarray(scores_by_item, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    if scores_by_item.ndim != 2:
+        raise ValueError(f"{name}: scores_by_item must be 2D, got shape {scores_by_item.shape}")
+
+    n, k = scores_by_item.shape
+
+    if labels.shape[0] != n:
+        raise ValueError(
+            f"{name}: labels length mismatch: {labels.shape[0]} labels for {n} score rows"
+        )
+
+    valid = (
+        np.all(np.isfinite(scores_by_item), axis=1)
+        & np.isfinite(labels)
+        & (labels >= 0)
+        & (labels < k)
+    )
+
+    scores_by_item = scores_by_item[valid]
+    labels = labels[valid]
+
+    if len(labels) == 0:
+        return {
+            "n": 0,
+            "num_choices": int(k),
+            "tie_aware_acc": float("nan"),
+            "strict_acc": float("nan"),
+            "argmax_acc": float("nan"),
+            "pairwise_acc": float("nan"),
+            "tie_for_best_rate": float("nan"),
+            "mean_margin_vs_best_wrong": float("nan"),
+            "median_margin_vs_best_wrong": float("nan"),
+        }
+
+    n = len(labels)
+    row_ids = np.arange(n)
+
+    correct_scores = scores_by_item[row_ids, labels]
+    best_scores = np.max(scores_by_item, axis=1)
+
+    correct_is_best = correct_scores == best_scores
+    num_tied_for_best = np.sum(scores_by_item == best_scores[:, None], axis=1)
+
+    tie_aware_credit = np.where(
+        correct_is_best,
+        1.0 / num_tied_for_best,
+        0.0,
+    )
+
+    # Strict accuracy: correct must be strictly greater than every wrong option.
+    wrong_scores = []
+    margins_vs_best_wrong = []
+    pairwise_credits = []
+
+    for i in range(n):
+        wrong = np.delete(scores_by_item[i], labels[i])
+        wrong_scores.append(wrong)
+
+        best_wrong = np.max(wrong)
+        margins_vs_best_wrong.append(correct_scores[i] - best_wrong)
+
+        deltas = correct_scores[i] - wrong
+        pairwise_credits.extend((deltas > 0).astype(np.float64) + 0.5 * (deltas == 0).astype(np.float64))
+
+    margins_vs_best_wrong = np.asarray(margins_vs_best_wrong, dtype=np.float64)
+    pairwise_credits = np.asarray(pairwise_credits, dtype=np.float64)
+
+    argmax_preds = np.argmax(scores_by_item, axis=1)
+
+    return {
+        "n": int(n),
+        "num_choices": int(k),
+        "tie_aware_acc": float(np.mean(tie_aware_credit)),
+        "strict_acc": float(np.mean(margins_vs_best_wrong > 0)),
+        "argmax_acc": float(np.mean(argmax_preds == labels)),
+        "pairwise_acc": float(np.mean(pairwise_credits)),
+        "tie_for_best_rate": float(np.mean(num_tied_for_best > 1)),
+        "mean_margin_vs_best_wrong": float(np.mean(margins_vs_best_wrong)),
+        "median_margin_vs_best_wrong": float(np.median(margins_vs_best_wrong)),
+    }
+
+
+def print_preference_metrics(name: str, metrics: dict):
+    print(
+        f"{name}: "
+        f"n={metrics['n']} | "
+        f"tie-aware acc={metrics['tie_aware_acc']:.4f} | "
+        f"strict acc={metrics['strict_acc']:.4f} | "
+        f"tie rate={metrics['tie_rate']:.4f} | "
+        f"mean Δ={metrics['mean_delta']:.4f} | "
+        f"median Δ={metrics['median_delta']:.4f}"
+    )
+
+
+def print_mc_preference_metrics(name: str, metrics: dict):
+    print(
+        f"{name}: "
+        f"n={metrics['n']} | "
+        f"k={metrics['num_choices']} | "
+        f"tie-aware acc={metrics['tie_aware_acc']:.4f} | "
+        f"strict acc={metrics['strict_acc']:.4f} | "
+        f"argmax acc={metrics['argmax_acc']:.4f} | "
+        f"pairwise acc={metrics['pairwise_acc']:.4f} | "
+        f"tie-for-best rate={metrics['tie_for_best_rate']:.4f} | "
+        f"mean margin-vs-best-wrong={metrics['mean_margin_vs_best_wrong']:.4f} | "
+        f"median margin-vs-best-wrong={metrics['median_margin_vs_best_wrong']:.4f}"
+    )
+
+
+def eval_pairwise_preference_dataset(
+    name: str,
+    preferred_texts: List[str],
+    dispreferred_texts: List[str],
+    device,
+    model,
+    batch_size: int = 32,
+    max_length: int = 512,
+):
+    """
+    Generic evaluator for datasets where each item is:
+      preferred_text > dispreferred_text
+    """
+    if len(preferred_texts) != len(dispreferred_texts):
+        raise ValueError(
+            f"{name}: preferred/dispreferred length mismatch: "
+            f"{len(preferred_texts)} vs {len(dispreferred_texts)}"
+        )
+
+    preferred_texts = [_clean_text(x) for x in preferred_texts]
+    dispreferred_texts = [_clean_text(x) for x in dispreferred_texts]
+
+    keep = [
+        i for i, (p, d) in enumerate(zip(preferred_texts, dispreferred_texts))
+        if p and d
+    ]
+
+    preferred_texts = [preferred_texts[i] for i in keep]
+    dispreferred_texts = [dispreferred_texts[i] for i in keep]
+
+    n = len(preferred_texts)
+    print(f"Total number of preference pairs in {name}: {n}")
+
+    if n == 0:
+        print(f"{name}: no valid preference pairs.")
+        return None
+
+    all_texts = preferred_texts + dispreferred_texts
+
+    raw_scores = getModelPreds(
+        device,
+        model,
+        all_texts,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+
+    preferred_scores = raw_scores[:n]
+    dispreferred_scores = raw_scores[n:]
+
+    metrics = preference_metrics(
+        preferred_scores=preferred_scores,
+        dispreferred_scores=dispreferred_scores,
+        name=name,
+    )
+    print_preference_metrics(name, metrics)
+    return metrics
+
+def load_jfleg_preference_pairs(split: str = "test"):
+    """
+    JFLEG:
+      preferred = each human correction
+      dispreferred = original learner sentence
+
+    This creates one pair per non-empty, non-identical correction.
+    """
+    ds = datasets.load_dataset("jhu-clsp/jfleg", split=split)
+
+    preferred = []
+    dispreferred = []
+
+    for ex in ds:
+        src = _clean_text(ex["sentence"])
+        corrections = ex["corrections"]
+
+        if not src or corrections is None:
+            continue
+
+        for corr in corrections:
+            corr = _clean_text(corr)
+
+            # Skip empty corrections and exact duplicates.
+            if not corr or corr == src:
+                continue
+
+            preferred.append(corr)
+            dispreferred.append(src)
+
+    return preferred, dispreferred
+
+
+def eval_jfleg_preference(
+    device,
+    model,
+    batch_size: int = 32,
+    max_length: int = 512,
+):
+    """
+    Evaluate both JFLEG validation and test splits.
+    """
+    results = {}
+
+    for split in ["validation", "test"]:
+        preferred, dispreferred = load_jfleg_preference_pairs(split=split)
+        name = f"JFLEG_{split}_correction_preference"
+        results[name] = eval_pairwise_preference_dataset(
+            name=name,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            device=device,
+            model=model,
+            batch_size=batch_size,
+            max_length=max_length,
+        )
+
+    return results
+
+
+def load_multiblimp_english_preference_pairs():
+    """
+    MultiBLiMP English:
+      preferred = grammatical sentence, field 'sen'
+      dispreferred = minimal-pair corrupted sentence, field 'wrong_sen'
+
+    English subset/config is 'eng'.
+    """
+    ds = datasets.load_dataset("jumelet/multiblimp", "eng", split="train")
+
+    preferred = []
+    dispreferred = []
+
+    for ex in ds:
+        good = _clean_text(ex["sen"])
+        bad = _clean_text(ex["wrong_sen"])
+
+        if not good or not bad:
+            continue
+
+        preferred.append(good)
+        dispreferred.append(bad)
+
+    return preferred, dispreferred
+
+
+def eval_multiblimp_english_preference(
+    device,
+    model,
+    batch_size: int = 32,
+    max_length: int = 512,
+):
+    preferred, dispreferred = load_multiblimp_english_preference_pairs()
+
+    return eval_pairwise_preference_dataset(
+        name="MultiBLiMP_eng_minimal_pair_preference",
+        preferred_texts=preferred,
+        dispreferred_texts=dispreferred,
+        device=device,
+        model=model,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+
+
+def load_story_cloze_preference_pairs(split: str = "eval"):
+    """
+    Story Cloze:
+      preferred = prompt + chosen ending
+      dispreferred = prompt + rejected ending
+    """
+    ds = datasets.load_dataset("lecslab/story_cloze", split=split)
+
+    preferred = []
+    dispreferred = []
+
+    for ex in ds:
+        prompt = _clean_text(ex["prompt"])
+        chosen = _clean_text(ex["chosen"])
+        rejected = _clean_text(ex["rejected"])
+
+        if not prompt or not chosen or not rejected:
+            continue
+
+        preferred.append(join_context_and_continuation(prompt, chosen))
+        dispreferred.append(join_context_and_continuation(prompt, rejected))
+
+    return preferred, dispreferred
+
+
+def eval_story_cloze_preference(
+    device,
+    model,
+    batch_size: int = 32,
+    max_length: int = 512,
+):
+    """
+    Evaluate both Story Cloze eval and test splits.
+    """
+    results = {}
+
+    for split in ["eval", "test"]:
+        preferred, dispreferred = load_story_cloze_preference_pairs(split=split)
+        name = f"StoryCloze_{split}_ending_preference"
+        results[name] = eval_pairwise_preference_dataset(
+            name=name,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            device=device,
+            model=model,
+            batch_size=batch_size,
+            max_length=max_length,
+        )
+
+    return results
+
+
+def load_hellaswag_multiple_choice(split: str = "validation"):
+    """
+    HellaSwag:
+      Each example has 4 endings.
+      Score ctx + each ending.
+      The correct label should receive the highest score.
+
+    We use validation by default because it is the standard labeled eval split.
+    """
+    ds = datasets.load_dataset("Rowan/hellaswag", split=split)
+
+    all_choice_texts = []
+    labels = []
+
+    for ex in ds:
+        raw_label = ex.get("label", None)
+
+        try:
+            label = int(raw_label)
+        except Exception:
+            # Some splits/configurations may not have usable labels.
+            continue
+
+        endings = ex["endings"]
+
+        if endings is None or len(endings) != 4:
+            continue
+
+        if label < 0 or label >= len(endings):
+            continue
+
+        ctx = _clean_text(ex.get("ctx", ""))
+
+        # Fallback if ctx is missing for some reason.
+        if not ctx:
+            ctx = join_context_and_continuation(
+                _clean_text(ex.get("ctx_a", "")),
+                _clean_text(ex.get("ctx_b", "")),
+            )
+
+        if not ctx:
+            continue
+
+        for ending in endings:
+            all_choice_texts.append(join_context_and_continuation(ctx, ending))
+
+        labels.append(label)
+
+    return all_choice_texts, labels, 4
+
+
+def eval_hellaswag_preference(
+    device,
+    model,
+    batch_size: int = 32,
+    max_length: int = 512,
+    split: str = "validation",
+):
+    all_choice_texts, labels, num_choices = load_hellaswag_multiple_choice(split=split)
+
+    n_items = len(labels)
+    print(f"Total number of HellaSwag {split} items: {n_items}")
+    print(f"Total number of HellaSwag {split} scored continuations: {len(all_choice_texts)}")
+
+    if n_items == 0:
+        print(f"HellaSwag_{split}: no valid labeled examples.")
+        return None
+
+    raw_scores = getModelPreds(
+        device,
+        model,
+        all_choice_texts,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+
+    scores_by_item = raw_scores.reshape(n_items, num_choices)
+
+    metrics = multiple_choice_preference_metrics(
+        scores_by_item=scores_by_item,
+        labels=labels,
+        name=f"HellaSwag_{split}",
+    )
+
+    print_mc_preference_metrics(f"HellaSwag_{split}_ending_preference", metrics)
+    return metrics
+
+# Loading of the model and doing predictions functions
+
 def load_model_for_benchmark(
     model_dir: str,
     device: torch.device,
@@ -510,6 +1033,54 @@ def main(cmd_args):
 
     MAX_LENGTH = int(cmd_args[1]) if len(cmd_args) > 1 else 512
     BATCH_SIZE = int(cmd_args[2]) if len(cmd_args) > 2 else 32
+
+        # ------------------------------------------------------------------
+    # Preference-style HF benchmarks
+    # These do NOT have scalar human scores, so we report ranking accuracy
+    # rather than Spearman correlation.
+    # ------------------------------------------------------------------
+
+    print("\n================ Preference-style HF benchmarks ================\n")
+
+    # JFLEG: corrected sentence should score higher than original sentence.
+    eval_jfleg_preference(
+        device=device,
+        model=model,
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH,
+    )
+
+    # MultiBLiMP English only: grammatical sentence should score higher than
+    # minimally corrupted sentence.
+    eval_multiblimp_english_preference(
+        device=device,
+        model=model,
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH,
+    )
+
+    # Story Cloze: prompt + chosen ending should score higher than
+    # prompt + rejected ending.
+    eval_story_cloze_preference(
+        device=device,
+        model=model,
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH,
+    )
+
+    # HellaSwag: correct continuation should be highest among 4 endings.
+    # Use validation because it is the standard labeled evaluation split.
+    eval_hellaswag_preference(
+        device=device,
+        model=model,
+        batch_size=BATCH_SIZE,
+        max_length=MAX_LENGTH,
+        split="validation",
+    )
+
+    print("\n================ Scalar human-score benchmarks ================\n")
+
+    ### From here we use benchmarks with human ratings or socre annotations for a relevant dimension
 
     # Eval for cohesentia
     cohesentia = [

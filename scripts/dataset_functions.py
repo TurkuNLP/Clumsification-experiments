@@ -26,19 +26,59 @@ def format_datasets(dss:list[dict[str]]):
     return ds_items
 
 def init_og_dataset(source_txt_path: str, new_ds_name: str, overwrite: bool = False):
-    #If a txt-file with one text per line, then create a jsonl-file so that it fits with the rest of the code
-    #Also creates the source folder for the specified dataset if necessary
-    if not os.path.exists("data/custom_datasets/"+new_ds_name):
-        os.mkdir("data/custom_datasets/"+new_ds_name)
-        os.mkdir("data/custom_datasets/"+new_ds_name+"/perturbed_layers")
-    if not os.path.exists("data/custom_datasets/"+new_ds_name+"/original.jsonl") or overwrite:
-        with open("data/custom_datasets/"+new_ds_name+"/original.jsonl", 'w', encoding='utf-8') as writer:
+    # If a txt-file with one text per line, then create a jsonl-file so that it fits with the rest of the code
+    # If the file already contains valid JSON objects, preserve them and just add custom_id
+    # Also creates the source folder for the specified dataset if necessary
+    if not os.path.exists("data/custom_datasets/" + new_ds_name):
+        os.mkdir("data/custom_datasets/" + new_ds_name)
+        os.mkdir("data/custom_datasets/" + new_ds_name + "/perturbed_layers")
+    if not os.path.exists("data/custom_datasets/" + new_ds_name + "/original.jsonl") or overwrite:
+
+        # Detection pass: check if every non-empty line is valid JSON
+        is_jsonl = True
+        has_content = False
+        with open(source_txt_path, 'r', encoding='utf-8') as reader:
+            for line in reader:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                has_content = True
+                try:
+                    obj = json.loads(stripped)
+                    if not isinstance(obj, dict):
+                        is_jsonl = False
+                        break
+                except (json.JSONDecodeError, ValueError):
+                    is_jsonl = False
+                    break
+
+        if not has_content:
+            is_jsonl = False
+
+        # Writing pass
+        with open("data/custom_datasets/" + new_ds_name + "/original.jsonl", 'w', encoding='utf-8') as writer:
             with open(source_txt_path, 'r', encoding='utf-8') as reader:
                 i = 0
                 for line in reader:
-                    writer.write(json.dumps({'custom_id':str(i),'text':line.replace('\n', '')})+'\n')
-                    i+=1
-    return "data/custom_datasets/"+new_ds_name+"/original.jsonl"
+                    stripped = line.strip()
+                    if is_jsonl:
+                        if not stripped:
+                            continue
+                        obj = json.loads(stripped)
+                        if obj.get('passes_filters', None):
+                            if obj['passes_filters'] == "Yes":
+                                obj['custom_id'] = str(i)
+                                writer.write(json.dumps(obj) + '\n')
+                            else:
+                                continue
+                        else:
+                            obj['custom_id'] = str(i)
+                            writer.write(json.dumps(obj) + '\n')
+                    else:
+                        writer.write(json.dumps({'custom_id': str(i), 'text': line.replace('\n', '')}) + '\n')
+                    i += 1
+
+    return "data/custom_datasets/" + new_ds_name + "/original.jsonl"
 
 
 def read_ds(ds_path: str):
@@ -50,7 +90,7 @@ def read_ds(ds_path: str):
                     returnable.append(json.loads(line.strip()))
     return returnable
 
-def format_custom_dataset(custom_dataset_name: str):
+def format_custom_dataset(custom_dataset_name: str, max_layers: int = None):
     """
     Function for getting the existing files inside custom dataset folders into usable form
     """
@@ -63,6 +103,11 @@ def format_custom_dataset(custom_dataset_name: str):
     for file_name in os.listdir(work_path+"/perturbed_layers"):
         contents = read_ds(work_path+"/perturbed_layers/"+file_name)
         layer = int(file_name.replace('.jsonl', ''))
+        # If max layers has been set
+        if max_layers:
+            # Only add layers below the max layer limit (so if max_layers==2, then only add the first perturbation layer with filename 1.jsonl)
+            if layer >= max_layers:
+                continue
         #Go through each row in the perturbed layer-file, and add to the same object with its original version
         for x in contents:
             head_id = x['head_id']
@@ -77,7 +122,7 @@ def format_custom_dataset(custom_dataset_name: str):
 
 def shuffle_and_transform_formatted_dataset(formatted_dataset:list[dict], seed: int=None):
     #First apply shuffling to each internal 'text_label_pairs' list
-    if seed:
+    if seed is not None:
         random.seed(seed)
     for x in formatted_dataset:
         tl_list = x.pop('text_label_pairs', None)

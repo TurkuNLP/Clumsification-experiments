@@ -87,15 +87,15 @@ def apply_chat_template(given_example: str):
     You are tasked with deciding whether a text sohuld get accepted to be studied by scientists working on evaluating text quality or filtered out
     .
     You should filter out texts using these criteria:
-    1. A text should be filtered if it mainly consists of spoken or informal language
-    2. A text should be filtered if it mostly consists of lists instead of proper sentences
+    1. A text should be filtered if it mainly consists of very spoken or informal language
+    2. A text should be filtered if it mostly consists of lists or listing properties akin to and advert instead of proper sentences
     3. A text should be filtered if it is not at least four sentences long
     4. A text should be filtered if it contains many headers, timestamps, links or other elements that are typical in online websites, but not in news articles or book chapters
     5. A text should be filtered if it contains a high ratio of non-alphabetical characters (>85%), such as numbers, dashes or colons
 
     Return your answer ONLY as Yes or No.
     Answer Yes only if a text does not meet any of the criteria for filtering.
-    In difficult or debatable cases, you should answer No.
+    In difficult or debatable cases, you should answer Yes.
 
     You may think internally. However, after your thinking is complete, your final answer must be exactly one word:
 
@@ -310,10 +310,10 @@ def main():
         to_write.append({
             'text':ds_loaded[i]['text'],
             'warc_id':ds_loaded[i]['warc_id'],
-            'filtered':temp_text
+            'passes_filters':temp_text
         })
 
-    with open(output_path, "w", encoding="utf-8") as writer:
+    with open(args.output_path, "w", encoding="utf-8") as writer:
         for x in to_write:
             writer.write(json.dumps(x, ensure_ascii=False) + "\n")
 

@@ -91,11 +91,12 @@ def log_dtype_counts(model) -> None:
 
 def prepare_datasets(args):
     dataset_names = args.custom_datasets
+    max_layers = args.max_layers
 
     all_datasets = []
     for ds_name in dataset_names:
         logger.info(f"Loading dataset: {ds_name}")
-        ds = d_f.format_custom_dataset(ds_name)
+        ds = d_f.format_custom_dataset(ds_name, max_layers)
         ds = d_f.shuffle_and_transform_formatted_dataset(ds, seed=args.seed)
         logger.info(f"  → {ds_name}: {len(ds)} examples")
         all_datasets.append(ds)
