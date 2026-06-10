@@ -95,8 +95,13 @@ def prepare_datasets(args):
 
     all_datasets = []
     for ds_name in dataset_names:
-        logger.info(f"Loading dataset: {ds_name}")
-        ds = d_f.format_custom_dataset(ds_name, max_layers)
+        logger.info(f"Loading dataset: {ds_name} (layer_type={args.layer_type})")
+        ds = d_f.format_custom_dataset(
+            ds_name,
+            max_layers,
+            layer_type=args.layer_type,
+            seed=args.seed,
+        )
         ds = d_f.shuffle_and_transform_formatted_dataset(ds, seed=args.seed)
         logger.info(f"  → {ds_name}: {len(ds)} examples")
         all_datasets.append(ds)
@@ -132,6 +137,8 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    eval_only = getattr(args, "eval_only", False)
+
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -146,6 +153,11 @@ def main():
     if rank == 0:
         logger.info(f"RANK={rank} LOCAL_RANK={local_rank} WORLD_SIZE={world_size}")
         logger.info(f"Datasets to load: {args.custom_datasets}")
+        if eval_only:
+            logger.info(
+                "Running in --eval_only mode: training will be skipped. "
+                f"Evaluating the model supplied via --model_name ({args.model_name})."
+            )
 
     train_dataset, dev_dataset, test_dataset = prepare_datasets(args)
 
@@ -224,16 +236,68 @@ def main():
     if rank == 0:
         log_dtype_counts(model)
 
-    trainer.train()
+    # -----------------------------------------------------------------
+    # Training (skipped entirely when --eval_only is set)
+    # -----------------------------------------------------------------
+    final_dir = args.output_dir          # default used in eval-only mode
+    hpo_dev_metrics = None
 
-    final_dir = save_final_model(
-        trainer=trainer,
-        tokenizer=tokenizer,
-        output_dir=args.output_dir,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        rank=rank,
-    )
+    if not eval_only:
+        trainer.train()
+
+        final_dir = save_final_model(
+            trainer=trainer,
+            tokenizer=tokenizer,
+            output_dir=args.output_dir,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            rank=rank,
+        )
+
+        # -----------------------------------------------------------------
+        # HPO-safe dev evaluation.
+        # This evaluates ONLY the internal dev split, not external benchmarks.
+        # Use these metrics for hyperparameter selection.
+        # -----------------------------------------------------------------
+        if getattr(args, "hpo_mode", False):
+            hpo_dev_metrics = trainer.evaluate(
+                eval_dataset=dev_dataset,
+                metric_key_prefix=getattr(args, "hpo_metric_prefix", "hpo_dev"),
+            )
+
+            trainer.accelerator.wait_for_everyone()
+
+            if rank == 0:
+                hpo_metrics_path = os.path.join(args.output_dir, "hpo_dev_metrics.json")
+                with open(hpo_metrics_path, "w", encoding="utf-8") as f:
+                    json.dump(hpo_dev_metrics, f, indent=2)
+
+                logger.info(f"HPO dev metrics: {hpo_dev_metrics}")
+                logger.info(f"Saved HPO dev metrics to {hpo_metrics_path}")
+
+    else:
+        if rank == 0:
+            logger.info("Skipping training and model saving (--eval_only mode).")
+            os.makedirs(final_dir, exist_ok=True)
+
+    trainer.accelerator.wait_for_everyone()
+
+    # ---------------------------------------------------------------------
+    # Optional final test evaluation.
+    # During HPO, skip this. After choosing the best HPs, run the best model
+    # once on your real benchmarks / final test sets.
+    # ---------------------------------------------------------------------
+    if getattr(args, "skip_final_test_eval", False):
+        if rank == 0:
+            logger.info("Skipping final test evaluation because --skip_final_test_eval was set.")
+
+        trainer.accelerator.wait_for_everyone()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+
+        return
 
     metrics_test = evaluate_win_rate_distributed(
         model=trainer.model,
@@ -261,6 +325,7 @@ def main():
                 {
                     "test": metrics_test,
                     "baselines": baselines,
+                    "hpo_dev": hpo_dev_metrics,
                 },
                 f,
                 indent=2,

@@ -30,8 +30,8 @@ def init_og_dataset(source_txt_path: str, new_ds_name: str, overwrite: bool = Fa
     # If the file already contains valid JSON objects, preserve them and just add custom_id
     # Also creates the source folder for the specified dataset if necessary
     if not os.path.exists("data/custom_datasets/" + new_ds_name):
-        os.mkdir("data/custom_datasets/" + new_ds_name)
-        os.mkdir("data/custom_datasets/" + new_ds_name + "/perturbed_layers")
+        os.makedirs("data/custom_datasets/" + new_ds_name + "/perturbed_layers", exist_ok=True)
+        os.makedirs("data/custom_datasets/" + new_ds_name + "/trad_perturbed_layers", exist_ok=True)
     if not os.path.exists("data/custom_datasets/" + new_ds_name + "/original.jsonl") or overwrite:
 
         # Detection pass: check if every non-empty line is valid JSON
@@ -90,34 +90,98 @@ def read_ds(ds_path: str):
                     returnable.append(json.loads(line.strip()))
     return returnable
 
-def format_custom_dataset(custom_dataset_name: str, max_layers: int = None):
+
+
+def format_custom_dataset(
+    custom_dataset_name: str,
+    max_layers: int = None,
+    layer_type: str = "clumsy",
+    seed: int = 42,
+):
     """
-    Function for getting the existing files inside custom dataset folders into usable form
+    Function for getting the existing files inside custom dataset folders into usable form.
+
+    layer_type controls which perturbation subfolder(s) to use:
+      - "clumsy": perturbed_layers only (default / original behaviour)
+      - "trad":   trad_perturbed_layers only
+      - "mix":    50/50 split by original-text ID (clumsy first, then trad for remaining IDs)
+      - "all":    all data from both folders (duplicate IDs allowed)
     """
-    work_path = "data/custom_datasets/"+custom_dataset_name
-    original_texts = read_ds(work_path+"/original.jsonl")
-    #Using a lsit of tuples to make shuffling easier
-    #After all, it's trivial to then later on get two lists
-    id_dict = {i:{'id':i, 'text_label_pairs':[(x['text'],0)]} for i,x in enumerate(original_texts)}
-    #Move onto adding perturbed layers one at a time
-    for file_name in os.listdir(work_path+"/perturbed_layers"):
-        contents = read_ds(work_path+"/perturbed_layers/"+file_name)
-        layer = int(file_name.replace('.jsonl', ''))
-        # If max layers has been set
-        if max_layers:
-            # Only add layers below the max layer limit (so if max_layers==2, then only add the first perturbation layer with filename 1.jsonl)
-            if layer >= max_layers:
+    work_path = "data/custom_datasets/" + custom_dataset_name
+    original_texts = read_ds(work_path + "/original.jsonl")
+
+    def _build_id_dict(layer_dir, id_filter=None):
+        """
+        Build {id: {id, text_label_pairs}} from the original texts and one
+        perturbed-layer folder.
+
+        If *id_filter* is not None it must be a set of IDs; only those IDs
+        will be included.
+        """
+        if id_filter is not None:
+            id_dict = {
+                i: {"id": i, "text_label_pairs": [(x["text"], 0)]}
+                for i, x in enumerate(original_texts)
+                if i in id_filter
+            }
+        else:
+            id_dict = {
+                i: {"id": i, "text_label_pairs": [(x["text"], 0)]}
+                for i, x in enumerate(original_texts)
+            }
+
+        layer_path = os.path.join(work_path, layer_dir)
+        for file_name in os.listdir(layer_path):
+            contents = read_ds(os.path.join(layer_path, file_name))
+            layer = int(file_name.replace(".jsonl", ""))
+            if max_layers and layer >= max_layers:
                 continue
-        #Go through each row in the perturbed layer-file, and add to the same object with its original version
-        for x in contents:
-            head_id = x['head_id']
-            if isinstance(head_id, str):
-                head_id = int(head_id)
-            temp = id_dict[head_id]
-            temp['text_label_pairs'] += [(x['text'],layer)]
-            id_dict[head_id] = temp
-    #The extra id from the dict sturcture has served its purpose, so return only the contents (a list of dicts)
-    return list(id_dict.values())
+            for x in contents:
+                head_id = x["head_id"]
+                if isinstance(head_id, str):
+                    head_id = int(head_id)
+                if head_id not in id_dict:
+                    continue
+                id_dict[head_id]["text_label_pairs"].append((x["text"], layer))
+        return id_dict
+
+    #Dispatch on layer_type
+    if layer_type == "clumsy":
+        id_dict = _build_id_dict("perturbed_layers")
+        return list(id_dict.values())
+
+    elif layer_type == "trad":
+        id_dict = _build_id_dict("trad_perturbed_layers")
+        return list(id_dict.values())
+
+    elif layer_type == "mix":
+        # 50/50 split by original-text ID, deterministic via seed
+        all_ids = list(range(len(original_texts)))
+        rng = random.Random(seed)
+        rng.shuffle(all_ids)
+        mid = len(all_ids) // 2
+        clumsy_ids = set(all_ids[:mid])
+        trad_ids = set(all_ids[mid:])
+
+        clumsy_dict = _build_id_dict("perturbed_layers", id_filter=clumsy_ids)
+        trad_dict = _build_id_dict("trad_perturbed_layers", id_filter=trad_ids)
+
+        return list(clumsy_dict.values()) + list(trad_dict.values())
+
+    elif layer_type == "all":
+        #Keep everything from both folders; duplicate IDs are allowed so we build two complete id_dicts and concatenate.
+        clumsy_dict = _build_id_dict("perturbed_layers")
+        trad_dict = _build_id_dict("trad_perturbed_layers")
+
+        #Offset the IDs coming from the trad copy so they don't collide in downstream code that might key on 'id'.
+        offset = len(clumsy_dict)
+        for entry in trad_dict.values():
+            entry["id"] = entry["id"] + offset
+
+        return list(clumsy_dict.values()) + list(trad_dict.values())
+
+    else:
+        raise ValueError(f"Unknown layer_type: {layer_type!r}")
 
 
 def shuffle_and_transform_formatted_dataset(formatted_dataset:list[dict], seed: int=None):

@@ -15,6 +15,13 @@ from vllm.config import ReasoningConfig
 from transformers import AutoTokenizer
 import numpy as np
 
+import os
+from rule_based_evaleval import (
+    RULE_BASED_MODEL_LABEL,
+    RULE_BASED_OUTPUT_DIR,
+    rule_based_perturbation,
+)
+
 VALID_PERTURBATION_TYPES = (
     "clumsification",
     "coherence_breaking",
@@ -175,7 +182,6 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=str,
-        required=True,
         help="Path to the model used for perturbation.",
     )
     parser.add_argument(
@@ -210,6 +216,15 @@ def parse_args():
         default=None,
         help="Optional: keep only the first N items (for testing).",
     )
+    parser.add_argument(
+        "--rule-task",
+        choices=["all", "MT", "IC", "AS", "D2T", "QG", "DG", "COMMON_FLUENCY"],
+        default="all",
+    )
+    parser.add_argument("--rule-criteria", default="all")
+    parser.add_argument("--rule-templates", nargs="+", default=None)
+    parser.add_argument("--rule-output-mode", choices=["all", "first_success", "random_success"], default="all")
+    parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
 
 
@@ -327,12 +342,6 @@ def vllm_perturbation(
 
     return outputs
 
-
-def rule_based_perturbation(ds_items):
-    raise NotImplementedError("rule_based perturbation is not yet implemented")
-
-
-
 # Output parsing helpers
 
 
@@ -348,19 +357,23 @@ def get_text_after_last_think(text: str) -> str:
 # Dataset loading
 
 
-def load_dataset_items(ds_name, start_layer):
+def load_dataset_items(ds_name, pert_type, start_layer):
     ds_folder = "data/custom_datasets/" + ds_name + "/"
     if start_layer == 0:
         ds_path = ds_folder + "original.jsonl"
     else:
-        ds_path = ds_folder + "perturbed_layers/" + str(start_layer) + ".jsonl"
+        if pert_type == "rule_based":
+            ds_path = ds_folder + "trad_perturbed_layers/" + str(start_layer) + ".jsonl"
+        else:
+            ds_path = ds_folder + "perturbed_layers/" + str(start_layer) + ".jsonl"
 
     items = []
     with open(ds_path, "r", encoding="UTF-8") as reader:
-        for line in reader:
+        for i,line in enumerate(reader):
             if len(line.strip()) > 0:
                 item = json.loads(line.strip())
                 item["_source_ds"] = ds_name
+                item["_source_index"] = i
                 items.append(item)
     return items, ds_folder
 
@@ -385,7 +398,7 @@ def main():
     ds_items = []
     ds_folders = {}
     for ds_name in DS_NAMES:
-        items, folder = load_dataset_items(ds_name, START_LAYER)
+        items, folder = load_dataset_items(ds_name, PERTURBATION_TYPE, START_LAYER)
         ds_folders[ds_name] = folder
         ds_items.extend(items)
 
@@ -402,18 +415,36 @@ def main():
 
     
     # Rule-based: no LLM needed — skip tokenisation & bucketing entirely
-    
-    if PERTURBATION_TYPE == "rule_based":
-        random.shuffle(ds_items)
-        outputs = rule_based_perturbation(ds_items)
-        # (rule_based_perturbation will raise NotImplementedError for now)
-        return
 
-    
-    # Stamp a stable original index so we can restore order later
-    
     for i, item in enumerate(ds_items):
         item["_original_index"] = i
+        if "max_length" not in item:
+            clean_text = item["text"].replace("\n", " ")
+            item["max_length"] = min(floor(len(clean_text) * 1.1), len(clean_text) + 500)
+    
+    if PERTURBATION_TYPE == "rule_based":
+        random.seed(args.seed)
+        res_d = rule_based_perturbation(
+            ds_items,
+            rule_task=args.rule_task,
+            rule_criteria=args.rule_criteria,
+            rule_template_names=args.rule_templates,
+            output_mode=args.rule_output_mode,
+            model_label=MODEL_PATH or RULE_BASED_MODEL_LABEL,
+        )
+        output_layer = str(START_LAYER + 1)
+        for ds_name in DS_NAMES:
+            out_dir = os.path.join(ds_folders[ds_name], RULE_BASED_OUTPUT_DIR)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, output_layer + ".jsonl")
+            subset = [d for d in res_d if d["_source_ds"] == ds_name]
+            with open(out_path, "w", encoding="UTF-8") as writer:
+                for d in subset:
+                    row = {k: v for k, v in d.items() if k != "_source_ds"}
+                    writer.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print(f"Wrote {len(subset)} items to {out_path}")
+        print("Done!")
+        return
 
     
     # Tokenize all items and collect token lengths
@@ -549,7 +580,7 @@ def main():
             {
                 "perturbation_type": PERTURBATION_TYPE,
                 "model": MODEL_PATH,
-                "head_id": item["_original_index"],
+                "head_id": item.get("_source_index", item["_original_index"]),
                 "text": temp_text,
                 "max_length": item["max_length"],
                 "_source_ds": item["_source_ds"],

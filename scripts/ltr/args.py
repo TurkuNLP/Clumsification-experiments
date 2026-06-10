@@ -7,6 +7,7 @@ def parse_args():
     parser.add_argument("model_name", type=str)
     parser.add_argument("max_seq_len", type=int)
     parser.add_argument("--custom-datasets", nargs='+', type=str)
+    parser.add_argument("--layer-type", type=str, default="clumsy", choices=["clumsy", "trad", "mix", "all"], help=("The perturbation type to use."))
     parser.add_argument("--max_layers", type=int, default=None)
     parser.add_argument("--output-dir", type=str)
 
@@ -41,7 +42,7 @@ def parse_args():
         ],
         help=(
             "Pairwise ranking loss to use. "
-            "Default is 'logistic', which preserves previous behavior."
+            "Default is 'logistic'."
         ),
     )
 
@@ -70,5 +71,31 @@ def parse_args():
     parser.add_argument("--dataloader_num_workers", type=int, default=2)
 
     parser.add_argument("--fsdp_layer_cls", type=str, default=None)
+    #Arguments for HPO
+    parser.add_argument(
+    "--hpo_mode",
+    action="store_true",
+    help="If set, save post-training dev metrics for HPO selection.",
+    )
+
+    parser.add_argument(
+        "--skip_final_test_eval",
+        action="store_true",
+        help="If set, do not evaluate the held-out test split after training. Useful for HPO.",
+    )
+
+    parser.add_argument(
+        "--hpo_metric_prefix",
+        type=str,
+        default="hpo_dev",
+        help="Metric prefix used when saving post-training dev metrics.",
+    )
+
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        default=False,
+        help="Skip training and only run final evaluation with the supplied model.",
+    )
 
     return parser.parse_args()
