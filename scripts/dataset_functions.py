@@ -11,9 +11,8 @@ from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 def default_formatted_dataset_path(dataset_name: str) -> str:
     return os.path.join(
         "data",
-        "custom_datasets",
+        "hf_datasets",
         dataset_name,
-        "formatted_datasets",
     )
 
 def read_ds(ds_path: str):
@@ -110,6 +109,7 @@ def format_custom_dataset(
     max_layers: Optional[int] = None,
     layer_type: str = "clumsy",
     seed: int = 42,
+    reuse_limit: int = 5,
 ):
     """
     Load one raw custom dataset and return a list of dictionaries:
@@ -203,15 +203,50 @@ def format_custom_dataset(
         return list(clumsy_dict.values()) + list(trad_dict.values())
 
     if layer_type == "all":
-        clumsy_dict = _build_id_dict("perturbed_layers")
-        trad_dict = _build_id_dict("trad_perturbed_layers")
+        def _prefix_ids(records: list[dict], prefix: str) -> list[dict]:
+            prefixed = []
 
-        offset = len(clumsy_dict)
+            for entry in records:
+                prefixed.append(
+                    {
+                        "id": f"{custom_dataset_name}__{prefix}__{entry['id']}",
+                        "text_label_pairs": list(entry["text_label_pairs"]),
+                    }
+                )
 
-        for entry in trad_dict.values():
-            entry["id"] = entry["id"] + offset
+            return prefixed
 
-        return list(clumsy_dict.values()) + list(trad_dict.values())
+        clumsy_chains = _prefix_ids(
+            list(_build_id_dict("perturbed_layers").values()),
+            "clumsy_chain",
+        )
+
+        trad_chains = _prefix_ids(
+            list(_build_id_dict("trad_perturbed_layers").values()),
+            "trad_chain",
+        )
+
+        clumsy_pairs = generate_training_pairs_random(
+            formatted_dataset=clumsy_chains,
+            seed=seed,
+            n=reuse_limit,
+        )
+
+        trad_pairs = generate_training_pairs_random(
+            formatted_dataset=trad_chains,
+            seed=seed + 1 if seed is not None else None,
+            n=reuse_limit,
+        )
+
+        clumsy_pairs = _prefix_ids(clumsy_pairs, "clumsy_pair")
+        trad_pairs = _prefix_ids(trad_pairs, "trad_pair")
+
+        return (
+            clumsy_chains
+            + trad_chains
+            + clumsy_pairs
+            + trad_pairs
+        )
 
     raise ValueError(f"Unknown layer_type: {layer_type!r}")
 
@@ -394,9 +429,10 @@ def create_formatted_dataset_dict(
             max_layers=max_layers,
             layer_type=layer_type,
             seed=seed,
+            reuse_limit=reuse_limit,
         )
 
-        if random_pairs:
+        if random_pairs and layer_type != "all":
             formatted = generate_training_pairs_random(
                 formatted_dataset=formatted,
                 seed=seed,

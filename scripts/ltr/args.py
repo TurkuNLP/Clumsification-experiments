@@ -29,8 +29,8 @@ def _add_dataset_creation_args(parser: argparse.ArgumentParser) -> None:
         help="The perturbation type to use.",
     )
 
-    parser.add_argument("--max_layers", type=int, default=None)
-    parser.add_argument("--downsample_size", type=int, default=None)
+    parser.add_argument("--max-layers", type=int, default=None)
+    parser.add_argument("--downsample-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument(
