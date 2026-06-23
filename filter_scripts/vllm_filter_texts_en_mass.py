@@ -257,7 +257,7 @@ def main():
 
     llm = LLM(
         model=args.model_path,
-        max_model_len=args.max_model_len,
+        #max_model_len=args.max_model_len,
         tensor_parallel_size=tensor_parallel_size,
         language_model_only=True,
     )
@@ -282,11 +282,9 @@ def main():
         temp_text = o.outputs[0].text
         temp_text = re.sub(r'Thinking Process:\n\n.*?</think>', '', temp_text, flags=re.DOTALL)
         temp_text = re.sub(r"\A[\n']+|[\n']+\Z", '', temp_text)
-        to_write.append({
-            'text':ds_loaded[i]['text'],
-            'warc_id':ds_loaded[i]['warc_id'],
-            'passes_filters':temp_text
-        })
+        tt = ds_loaded[i]
+        tt['passes_filters'] = temp_text
+        to_write.append(tt)
 
     with open(args.output_path, "w", encoding="utf-8") as writer:
         for x in to_write:

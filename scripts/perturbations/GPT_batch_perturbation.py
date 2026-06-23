@@ -10,7 +10,7 @@ import os
 from pprint import pprint
 import multiprocessing as mp
 from tqdm import tqdm
-import OpenAI_lib as ol
+import scripts.perturbations.OpenAI_lib as ol
 import time
 from openai.lib._parsing._responses import type_to_text_format_param
 from openai.types.responses import Response

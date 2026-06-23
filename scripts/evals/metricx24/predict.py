@@ -19,7 +19,7 @@ import json
 import os
 
 import datasets
-from metricx24 import models
+from scripts.evals.metricx24 import models
 import torch
 import transformers
 

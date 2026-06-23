@@ -1400,6 +1400,7 @@ def main():
     del raw_preds_turn, raw_preds_whole
 
     # ── E2E ───────────────────────────────────────────────────────
+    """
     e2e_ds = load_e2e_data("data/benchmarks/E2E_data")
     print(f"\nE2E texts: {len(e2e_ds)}")
     raw_preds = getModelPreds(
@@ -1411,6 +1412,7 @@ def main():
     all_results.update(
         correlation_bundle(e2e_ds["quality"], raw_preds, "E2E_quality")
     )
+    """
 
     # ==================================================================
     # Write JSONL
@@ -1418,7 +1420,7 @@ def main():
 
     write_results_jsonl(
         model_name=args.model_name,
-        training_dataset=args.training_dataset,
+        training_dataset=args.formatted_dataset_name,
         perturbation_type=args.perturbation_type,
         num_layers=args.num_layers,
         context_length=args.context_length,

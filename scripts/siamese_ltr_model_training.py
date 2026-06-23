@@ -3,12 +3,11 @@ import os
 
 import torch
 import torch.distributed as dist
-from datasets import concatenate_datasets
 from transformers import AutoTokenizer, TrainingArguments, set_seed
 
 import dataset_functions as d_f
 
-from ltr.args import parse_args
+from ltr.args import parse_train_args
 from ltr.checkpointing import save_final_model
 from ltr.collators import GroupAllPairsCollator
 from ltr.evaluation import baseline_winrates, evaluate_win_rate_distributed
@@ -22,7 +21,13 @@ os.environ["ACCELERATE_USE_FSDP"] = "true"
 os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
 
 
-def build_training_arguments(args, use_cuda: bool, use_bf16: bool, use_fp16: bool, world_size: int):
+def build_training_arguments(
+    args,
+    use_cuda: bool,
+    use_bf16: bool,
+    use_fp16: bool,
+    world_size: int,
+):
     training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -83,58 +88,24 @@ def log_dtype_counts(model) -> None:
 
     for name, param in model.named_parameters():
         dtype_counts[str(param.dtype)] = dtype_counts.get(str(param.dtype), 0) + param.numel()
+
         if param.dtype == torch.float32:
             logger.info(f"FP32 parameter: {name}, shape={tuple(param.shape)}")
 
     logger.info(f"Parameter dtype counts: {dtype_counts}")
 
 
-def prepare_datasets(args):
-    dataset_names = args.custom_datasets
-    max_layers = args.max_layers
+def resolve_formatted_dataset_path(args) -> str:
+    if args.formatted_dataset_path is not None:
+        return args.formatted_dataset_path
 
-    all_datasets = []
-    for ds_name in dataset_names:
-        logger.info(f"Loading dataset: {ds_name} (layer_type={args.layer_type})")
-        ds = d_f.format_custom_dataset(
-            ds_name,
-            max_layers,
-            layer_type=args.layer_type,
-            seed=args.seed,
-        )
-        ds = d_f.shuffle_and_transform_formatted_dataset(ds, seed=args.seed)
-        logger.info(f"  → {ds_name}: {len(ds)} examples")
-        all_datasets.append(ds)
-
-    if len(all_datasets) == 1:
-        merged = all_datasets[0]
-    else:
-        merged = concatenate_datasets(all_datasets)
-        logger.info(
-            f"Merged {len(all_datasets)} datasets → {len(merged)} total examples"
-        )
-
-    # Shuffle the merged dataset so examples from different sources are interleaved
-    merged = merged.shuffle(seed=args.seed)
-
-    if args.downsample_size is not None:
-        merged = merged.select(range(min(args.downsample_size, len(merged))))
-
-    split = merged.train_test_split(test_size=0.3, seed=args.seed)
-
-    train_dataset = split["train"].shuffle(seed=args.seed)
-
-    dev_test = split["test"].train_test_split(test_size=0.5, seed=args.seed)
-    dev_dataset = dev_test["train"].shuffle(seed=args.seed)
-    test_dataset = dev_test["test"].shuffle(seed=args.seed)
-
-    return train_dataset, dev_dataset, test_dataset
+    return d_f.default_formatted_dataset_path(args.formatted_dataset_name)
 
 
 def main():
     configure_logging()
 
-    args = parse_args()
+    args = parse_train_args()
     set_seed(args.seed)
 
     eval_only = getattr(args, "eval_only", False)
@@ -150,16 +121,23 @@ def main():
         os.environ["ACCELERATE_USE_FSDP"] = "true"
         os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
 
+    dataset_path = resolve_formatted_dataset_path(args)
+
     if rank == 0:
         logger.info(f"RANK={rank} LOCAL_RANK={local_rank} WORLD_SIZE={world_size}")
-        logger.info(f"Datasets to load: {args.custom_datasets}")
+        logger.info(f"Loading formatted dataset from: {dataset_path}")
+
         if eval_only:
             logger.info(
                 "Running in --eval_only mode: training will be skipped. "
                 f"Evaluating the model supplied via --model_name ({args.model_name})."
             )
 
-    train_dataset, dev_dataset, test_dataset = prepare_datasets(args)
+    dataset_dict = d_f.load_formatted_dataset_dict(dataset_path)
+
+    train_dataset = dataset_dict["train"]
+    dev_dataset = dataset_dict["dev"]
+    test_dataset = dataset_dict["test"]
 
     if rank == 0:
         logger.info(train_dataset)
@@ -236,10 +214,7 @@ def main():
     if rank == 0:
         log_dtype_counts(model)
 
-    # -----------------------------------------------------------------
-    # Training (skipped entirely when --eval_only is set)
-    # -----------------------------------------------------------------
-    final_dir = args.output_dir          # default used in eval-only mode
+    final_dir = args.output_dir
     hpo_dev_metrics = None
 
     if not eval_only:
@@ -254,11 +229,6 @@ def main():
             rank=rank,
         )
 
-        # -----------------------------------------------------------------
-        # HPO-safe dev evaluation.
-        # This evaluates ONLY the internal dev split, not external benchmarks.
-        # Use these metrics for hyperparameter selection.
-        # -----------------------------------------------------------------
         if getattr(args, "hpo_mode", False):
             hpo_dev_metrics = trainer.evaluate(
                 eval_dataset=dev_dataset,
@@ -269,12 +239,12 @@ def main():
 
             if rank == 0:
                 hpo_metrics_path = os.path.join(args.output_dir, "hpo_dev_metrics.json")
+
                 with open(hpo_metrics_path, "w", encoding="utf-8") as f:
                     json.dump(hpo_dev_metrics, f, indent=2)
 
                 logger.info(f"HPO dev metrics: {hpo_dev_metrics}")
                 logger.info(f"Saved HPO dev metrics to {hpo_metrics_path}")
-
     else:
         if rank == 0:
             logger.info("Skipping training and model saving (--eval_only mode).")
@@ -282,11 +252,6 @@ def main():
 
     trainer.accelerator.wait_for_everyone()
 
-    # ---------------------------------------------------------------------
-    # Optional final test evaluation.
-    # During HPO, skip this. After choosing the best HPs, run the best model
-    # once on your real benchmarks / final test sets.
-    # ---------------------------------------------------------------------
     if getattr(args, "skip_final_test_eval", False):
         if rank == 0:
             logger.info("Skipping final test evaluation because --skip_final_test_eval was set.")
