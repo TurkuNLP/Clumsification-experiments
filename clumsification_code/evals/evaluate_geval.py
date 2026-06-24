@@ -49,7 +49,7 @@ import asyncio
 from tqdm.auto import tqdm
 
 # Reuse your existing benchmark loaders/metrics/writer.
-import scripts.evals.evaluate_model_on_benchmark as bench
+import clumsification_code.evals.evaluate_model_on_benchmark as bench
 
 
 # ──────────────────────────────────────────────────────────────────────

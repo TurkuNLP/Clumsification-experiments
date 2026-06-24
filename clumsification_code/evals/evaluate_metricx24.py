@@ -31,10 +31,10 @@ import torch
 import transformers
 
 # metricx24 must be available in PYTHONPATH / environment
-from scripts.evals.metricx24 import models
+from clumsification_code.evals.metricx24 import models
 
 # Reuse your existing benchmark loaders/metrics/writer
-import scripts.evals.evaluate_model_on_benchmark as bench
+import clumsification_code.evals.evaluate_model_on_benchmark as bench
 
 
 class MetricX24QEInferenceModel:

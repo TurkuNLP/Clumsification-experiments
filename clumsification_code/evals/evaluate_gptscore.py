@@ -1369,7 +1369,7 @@ def main():
     patch_progress_bars_for_rank(rank)
 
     # Import after progress/logging patching.
-    import scripts.evals.evaluate_model_on_benchmark as bench
+    import clumsification_code.evals.evaluate_model_on_benchmark as bench
     patch_benchmark_module_for_rank0_only_output(bench, rank)
 
     dtype = parse_torch_dtype(args.dtype)

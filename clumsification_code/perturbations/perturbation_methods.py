@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 import numpy as np
 
 import os
-from scripts.perturbations.rule_based_evaleval import (
+from clumsification_code.perturbations.rule_based_evaleval import (
     RULE_BASED_MODEL_LABEL,
     RULE_BASED_OUTPUT_DIR,
     rule_based_perturbation,

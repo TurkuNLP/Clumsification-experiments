@@ -1,8 +1,9 @@
 import os
 
-import dataset_functions as d_f
-from ltr.args import parse_ds_create_args
-from ltr.utils import configure_logging, logger
+from clumsification_code.ltr.args import parse_ds_create_args
+from clumsification_code.ltr.utils import configure_logging, logger
+from clumsification_code.data.io import default_formatted_dataset_path
+from clumsification_code.data.hf_dataset import create_formatted_dataset_dict, save_formatted_dataset_dict
 
 
 def resolve_formatted_dataset_name(args) -> str:
@@ -25,7 +26,7 @@ def main():
     args = parse_ds_create_args()
 
     formatted_dataset_name = resolve_formatted_dataset_name(args)
-    output_path = d_f.default_formatted_dataset_path(formatted_dataset_name)
+    output_path = default_formatted_dataset_path(formatted_dataset_name)
 
     logger.info("Creating formatted dataset")
     logger.info(f"Raw dataset names: {args.custom_datasets}")
@@ -38,7 +39,7 @@ def main():
     logger.info(f"seed={args.seed}")
     logger.info(f"downsample_size={args.downsample_size}")
 
-    dataset_dict = d_f.create_formatted_dataset_dict(
+    dataset_dict, split_metadata = create_formatted_dataset_dict(
         dataset_names=args.custom_datasets,
         max_layers=args.max_layers,
         layer_type=args.layer_type,
@@ -48,6 +49,7 @@ def main():
         downsample_size=args.downsample_size,
         heldout_ratio=args.heldout_ratio,
         test_ratio_within_heldout=args.test_ratio_within_heldout,
+        return_metadata=True,
     )
 
     metadata = {
@@ -66,7 +68,9 @@ def main():
         "num_test": len(dataset_dict["test"]),
     }
 
-    d_f.save_formatted_dataset_dict(
+    metadata.update(split_metadata)
+
+    save_formatted_dataset_dict(
         dataset_dict=dataset_dict,
         output_path=output_path,
         metadata=metadata,

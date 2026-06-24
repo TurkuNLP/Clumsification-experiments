@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from hps_to_test import HPS_TO_TEST
+from scripts.configs.hpo.hps_to_test import HPS_TO_TEST
 
 
 MODEL_NAME = "intfloat/multilingual-e5-large"

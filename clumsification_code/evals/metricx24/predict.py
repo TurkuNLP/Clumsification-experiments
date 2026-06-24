@@ -19,7 +19,7 @@ import json
 import os
 
 import datasets
-from scripts.evals.metricx24 import models
+from clumsification_code.evals.metricx24 import models
 import torch
 import transformers
 

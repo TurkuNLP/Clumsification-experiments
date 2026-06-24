@@ -5,15 +5,15 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer, TrainingArguments, set_seed
 
-import dataset_functions as d_f
-
-from ltr.args import parse_train_args
-from ltr.checkpointing import save_final_model
-from ltr.collators import GroupAllPairsCollator
-from ltr.evaluation import baseline_winrates, evaluate_win_rate_distributed
-from ltr.modeling import LTRModel
-from ltr.trainer import PairwiseLTRTrainer
-from ltr.utils import configure_logging, get_preferred_param_dtype, logger
+from clumsification_code.data.io import default_formatted_dataset_path
+from clumsification_code.data.hf_dataset import load_formatted_dataset_dict
+from clumsification_code.ltr.args import parse_train_args
+from clumsification_code.ltr.checkpointing import save_final_model
+from clumsification_code.ltr.collators import GroupAllPairsCollator
+from clumsification_code.ltr.evaluation import baseline_winrates, evaluate_win_rate_distributed
+from clumsification_code.ltr.modeling import LTRModel
+from clumsification_code.ltr.trainer import PairwiseLTRTrainer
+from clumsification_code.ltr.utils import configure_logging, get_preferred_param_dtype, logger
 
 
 os.environ["WANDB_MODE"] = "disabled"
@@ -99,7 +99,7 @@ def resolve_formatted_dataset_path(args) -> str:
     if args.formatted_dataset_path is not None:
         return args.formatted_dataset_path
 
-    return d_f.default_formatted_dataset_path(args.formatted_dataset_name)
+    return default_formatted_dataset_path(args.formatted_dataset_name)
 
 
 def main():
@@ -133,7 +133,7 @@ def main():
                 f"Evaluating the model supplied via --model_name ({args.model_name})."
             )
 
-    dataset_dict = d_f.load_formatted_dataset_dict(dataset_path)
+    dataset_dict = load_formatted_dataset_dict(dataset_path)
 
     train_dataset = dataset_dict["train"]
     dev_dataset = dataset_dict["dev"]
