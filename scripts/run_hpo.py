@@ -1,16 +1,34 @@
+#!/usr/bin/env python3
+
 import argparse
 import json
+import math
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from hps_to_test import HPS_TO_TEST
 
 
-def str_bool_flag(name: str, value: bool):
-    return [name] if value else []
+MODEL_NAME = "intfloat/multilingual-e5-large"
+MAX_SEQ_LEN = 512
+DEFAULT_OBJECTIVE_KEY = "hpo_dev_win_rate"
+
+
+VALID_LOSSES = {
+    "logistic",
+    "pairwise_logistic",
+    "hinge",
+    "margin",
+    "weighted_logistic",
+    "logistic_weighted",
+    "weighted-logistic",
+}
+
+VALID_LOSS_NORMALIZATIONS = {"pairs", "items"}
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -20,73 +38,168 @@ def load_json(path: Path) -> Optional[Dict[str, Any]]:
         return json.load(f)
 
 
-def pick_objective(metrics: Dict[str, Any], objective_key: Optional[str]) -> Optional[float]:
+def dump_json(path: Path, obj: Any) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def append_jsonl(path: Path, obj: Any) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def pick_objective(
+    metrics: Optional[Dict[str, Any]],
+    objective_key: Optional[str],
+) -> Optional[float]:
     """
     Select objective value from hpo_dev_metrics.json.
 
-    If objective_key is provided, use that exact key.
-    Otherwise, try common names. You should ideally pass --objective_key explicitly
-    once you know what evaluate_win_rate_distributed returns.
+    Current trainer.evaluate(..., metric_key_prefix="hpo_dev") returns keys like:
+      - hpo_dev_win_rate
+      - hpo_dev_correct_points
+      - hpo_dev_strict_correct_pairs
+      - hpo_dev_score_tie_rate
+      - hpo_dev_total_pairs
+
+    We maximize hpo_dev_win_rate by default.
     """
-    if metrics is None:
+    if not metrics:
         return None
 
+    keys_to_try: List[str] = []
     if objective_key:
-        value = metrics.get(objective_key)
-        return float(value) if isinstance(value, (int, float)) else None
+        keys_to_try.append(objective_key)
 
-    preferred_keys = [
-        "hpo_dev_win_rate",
-        "hpo_dev_accuracy",
-        "hpo_dev_pair_accuracy",
-        "hpo_dev_acc",
-        "hpo_dev_mean_win_rate",
-    ]
+    keys_to_try.extend(
+        [
+            DEFAULT_OBJECTIVE_KEY,
+            "hpo_dev_accuracy",
+            "hpo_dev_pair_accuracy",
+            "hpo_dev_acc",
+            "hpo_dev_mean_win_rate",
+        ]
+    )
 
-    for key in preferred_keys:
+    for key in keys_to_try:
         value = metrics.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
             return float(value)
 
-    # Fallback: use first scalar hpo_dev_* metric.
+    # Conservative fallback: first finite scalar hpo_dev_* metric.
+    # This is intentionally last because e.g. total_pairs is scalar but not an
+    # optimization target.
     for key, value in metrics.items():
-        if key.startswith("hpo_dev_") and isinstance(value, (int, float)):
+        if (
+            key.startswith("hpo_dev_")
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        ):
             return float(value)
 
     return None
 
 
+def normalize_trial(trial: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make old HPO configs compatible with current training arg choices.
+
+    Old configs may contain:
+      - loss="margin_ranking"       -> current CLI does not accept this
+      - loss_normalization="batch"  -> current CLI accepts only pairs/items
+
+    This function maps those to current equivalents.
+    """
+    t = dict(trial)
+
+    loss = str(t.get("loss", "logistic"))
+    if loss == "margin_ranking":
+        loss = "hinge"
+    t["loss"] = loss
+
+    loss_normalization = str(t.get("loss_normalization", "items"))
+    if loss_normalization == "batch":
+        # Old "batch" most closely corresponds to normalizing by valid pairs
+        # rather than number of chains/items.
+        loss_normalization = "pairs"
+    t["loss_normalization"] = loss_normalization
+
+    if t["loss"] not in VALID_LOSSES:
+        raise ValueError(
+            f"Invalid loss in trial {t.get('trial_id')}: {t['loss']!r}. "
+            f"Valid losses: {sorted(VALID_LOSSES)}"
+        )
+
+    if t["loss_normalization"] not in VALID_LOSS_NORMALIZATIONS:
+        raise ValueError(
+            f"Invalid loss_normalization in trial {t.get('trial_id')}: "
+            f"{t['loss_normalization']!r}. "
+            f"Valid values: {sorted(VALID_LOSS_NORMALIZATIONS)}"
+        )
+
+    return t
+
+
+def require_trial_keys(trial: Dict[str, Any]) -> None:
+    required = {
+        "trial_id",
+        "trial_name",
+        "loss",
+        "epsilon",
+        "scale",
+        "learning_rate",
+        "warmup_ratio",
+        "weight_decay",
+        "loss_normalization",
+        "num_train_epochs",
+        "per_device_train_batch_size",
+        "gradient_accumulation_steps",
+    }
+    missing = sorted(required - set(trial))
+    if missing:
+        raise ValueError(
+            f"Trial {trial.get('trial_id', '<unknown>')} is missing keys: {missing}"
+        )
+
+
+def build_dataset_args(args: argparse.Namespace) -> List[str]:
+    if args.formatted_dataset_path:
+        return ["--formatted-dataset-path", args.formatted_dataset_path]
+    if args.formatted_dataset_name:
+        return ["--formatted-dataset-name", args.formatted_dataset_name]
+    raise ValueError(
+        "You must provide either --formatted_dataset_name or "
+        "--formatted_dataset_path. The current training script expects a "
+        "preformatted HF DatasetDict."
+    )
+
+
 def build_trial_command(
     *,
-    train_script: str,
+    args: argparse.Namespace,
     trial: Dict[str, Any],
     output_dir: Path,
-    custom_datasets,
-    seed: int,
-    per_device_eval_batch_size: int,
-    logging_steps: int,
-    dataloader_num_workers: int,
-    fsdp_layer_cls: str,
-    extra_args,
-):
+) -> List[str]:
+    nproc = len([x for x in args.cuda_visible_devices.split(",") if x.strip()])
+
     cmd = [
         "torchrun",
         "--standalone",
         "--nproc_per_node",
-        "4",
-        train_script,
+        str(nproc),
+        args.train_script,
 
-        "--model_name",
-        "intfloat/multilingual-e5-large",
+        # Current ltr.args parser uses positional model_name and max_seq_len.
+        args.model_name,
+        str(args.max_seq_len),
 
-        "--output_dir",
+        *build_dataset_args(args),
+
+        "--output-dir",
         str(output_dir),
 
-        "--max_seq_len",
-        "512",
-
         "--seed",
-        str(seed),
+        str(args.seed),
 
         "--loss",
         str(trial["loss"]),
@@ -119,65 +232,123 @@ def build_trial_command(
         str(trial["gradient_accumulation_steps"]),
 
         "--per_device_eval_batch_size",
-        str(per_device_eval_batch_size),
+        str(args.per_device_eval_batch_size),
 
         "--logging_steps",
-        str(logging_steps),
+        str(args.logging_steps),
 
         "--save_strategy",
-        "no",
+        args.save_strategy,
 
-        # We explicitly do a post-training dev eval via --hpo_mode.
-        # Avoid repeated eval during training unless you want learning curves.
+        # HPO does one explicit post-training dev eval via --hpo_mode.
         "--eval_strategy",
-        "no",
+        args.eval_strategy,
 
         "--save_total_limit",
-        "1",
+        str(args.save_total_limit),
 
         "--dataloader_num_workers",
-        str(dataloader_num_workers),
+        str(args.dataloader_num_workers),
 
         "--hpo_mode",
+
+        # Do not touch held-out test during HPO.
         "--skip_final_test_eval",
+
         "--hpo_metric_prefix",
         "hpo_dev",
+
+        "--attn_implementation",
+        args.attn_implementation,
     ]
 
-    if custom_datasets:
-        cmd.append("--custom_datasets")
-        cmd.extend(custom_datasets)
+    if args.fsdp_layer_cls:
+        cmd.extend(["--fsdp_layer_cls", args.fsdp_layer_cls])
 
-    if fsdp_layer_cls:
-        cmd.extend(["--fsdp_layer_cls", fsdp_layer_cls])
+    if args.hidden_dim is not None:
+        cmd.extend(["--hidden_dim", str(args.hidden_dim)])
 
-    if extra_args:
-        cmd.extend(extra_args)
+    if args.dropout is not None:
+        cmd.extend(["--dropout", str(args.dropout)])
+
+    if args.length_diagnostics:
+        cmd.append("--length_diagnostics")
+        cmd.extend(["--length_plot_num_bins", str(args.length_plot_num_bins)])
+        cmd.extend(["--length_plot_max_pairs", str(args.length_plot_max_pairs)])
+
+    if args.extra_args:
+        cmd.extend(args.extra_args)
 
     return cmd
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def selected_trials_from_args(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+
+    for raw_trial in HPS_TO_TEST:
+        require_trial_keys(raw_trial)
+        trial = normalize_trial(raw_trial)
+
+        trial_id = int(trial["trial_id"])
+
+        if args.start_trial_id is not None and trial_id < args.start_trial_id:
+            continue
+
+        if args.end_trial_id is not None and trial_id > args.end_trial_id:
+            continue
+
+        selected.append(trial)
+
+    return selected
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Sequential HPO runner for siamese_ltr_model_training.py"
+    )
 
     parser.add_argument(
         "--train_script",
         type=str,
-        required=True,
-        help="Path to your main training script, e.g. train_ltr.py",
+        default="scripts/siamese_ltr_model_training.py",
+        help="Path to siamese_ltr_model_training.py.",
     )
 
     parser.add_argument(
         "--output_root",
         type=str,
-        default="hpo_runs_multilingual_e5_large",
+        default="hpo_runs_multilingual_e5_large_chain5",
     )
 
     parser.add_argument(
-        "--custom_datasets",
-        nargs="+",
-        required=True,
-        help="Datasets passed to --custom_datasets in your training script.",
+        "--formatted_dataset_name",
+        type=str,
+        default=None,
+        help=(
+            "Name of a previously-created formatted dataset under "
+            "data/hf_datasets/<name>."
+        ),
+    )
+
+    parser.add_argument(
+        "--formatted_dataset_path",
+        type=str,
+        default=None,
+        help="Explicit path to a saved Hugging Face DatasetDict.",
+    )
+
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=MODEL_NAME,
+        help="Model passed as positional model_name to the training script.",
+    )
+
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=MAX_SEQ_LEN,
+        help="Max sequence length passed as positional max_seq_len.",
     )
 
     parser.add_argument(
@@ -189,8 +360,11 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=13,
-        help="Use the same seed across trials so train/dev/test splits are identical.",
+        default=42,
+        help=(
+            "Use the same seed across trials so train/dev/test splits and "
+            "dropout initialization are comparable."
+        ),
     )
 
     parser.add_argument(
@@ -216,19 +390,57 @@ def main():
         type=str,
         default="XLMRobertaLayer",
         help=(
-            "For intfloat/multilingual-e5-large this is usually XLMRobertaLayer. "
-            "If your auto-wrap code expects a fully qualified name, change this."
+            "For intfloat/multilingual-e5-large this is usually "
+            "XLMRobertaLayer."
         ),
+    )
+
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="sdpa",
+        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+    )
+
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=None,
+        help="Optional scoring head hidden dim override.",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Optional scoring head dropout override.",
+    )
+
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="no",
+        help="For HPO, usually 'no'.",
+    )
+
+    parser.add_argument(
+        "--eval_strategy",
+        type=str,
+        default="no",
+        help="For HPO, usually 'no' because --hpo_mode evaluates dev once.",
+    )
+
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=1,
     )
 
     parser.add_argument(
         "--objective_key",
         type=str,
-        default=None,
-        help=(
-            "Exact metric key from hpo_dev_metrics.json to maximize, e.g. "
-            "hpo_dev_win_rate. If omitted, the runner guesses."
-        ),
+        default=DEFAULT_OBJECTIVE_KEY,
+        help="Metric key from hpo_dev_metrics.json to maximize.",
     )
 
     parser.add_argument(
@@ -251,18 +463,58 @@ def main():
     )
 
     parser.add_argument(
+        "--overwrite_summary",
+        action="store_true",
+        help="Delete existing hpo_summary.jsonl before running.",
+    )
+
+    parser.add_argument(
+        "--length_diagnostics",
+        action="store_true",
+        help="Enable length diagnostic metrics/plots during dev evaluation.",
+    )
+
+    parser.add_argument(
+        "--length_plot_num_bins",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--length_plot_max_pairs",
+        type=int,
+        default=200000,
+    )
+
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Print commands but do not execute them.",
+    )
+
+    parser.add_argument(
         "--extra_args",
         nargs=argparse.REMAINDER,
         default=[],
-        help="Extra arguments passed through to the training script. Put after --extra_args.",
+        help=(
+            "Extra args passed to the training script. Put this last, e.g. "
+            "--extra_args --some_arg value"
+        ),
     )
 
     args = parser.parse_args()
+
+    if args.formatted_dataset_name and args.formatted_dataset_path:
+        raise ValueError(
+            "Use only one of --formatted_dataset_name or --formatted_dataset_path."
+        )
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
     summary_path = output_root / "hpo_summary.jsonl"
+    if args.overwrite_summary and summary_path.exists():
+        summary_path.unlink()
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
@@ -271,25 +523,29 @@ def main():
     env["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    selected_trials = []
-    for trial in HPS_TO_TEST:
-        trial_id = int(trial["trial_id"])
+    selected_trials = selected_trials_from_args(args)
 
-        if args.start_trial_id is not None and trial_id < args.start_trial_id:
-            continue
-        if args.end_trial_id is not None and trial_id > args.end_trial_id:
-            continue
+    if not selected_trials:
+        print("[HPO] No trials selected.", file=sys.stderr)
+        return
 
-        selected_trials.append(trial)
+    print(f"[HPO] Selected {len(selected_trials)} trial(s).")
+    print(f"[HPO] Model: {args.model_name}")
+    print(f"[HPO] Max seq len: {args.max_seq_len}")
+    print(f"[HPO] CUDA_VISIBLE_DEVICES={args.cuda_visible_devices}")
+    print(f"[HPO] Objective: {args.objective_key}")
+    print(f"[HPO] Output root: {output_root}")
 
-    best = None
+    best: Optional[Dict[str, Any]] = None
 
     for trial in selected_trials:
-        trial_name = trial["trial_name"]
+        trial_name = str(trial["trial_name"])
         trial_dir = output_root / trial_name
         trial_dir.mkdir(parents=True, exist_ok=True)
 
         metrics_path = trial_dir / "hpo_dev_metrics.json"
+        log_path = trial_dir / "run.log"
+        command_path = trial_dir / "command.json"
 
         if args.resume and metrics_path.exists():
             print(f"[HPO] Skipping existing trial: {trial_name}")
@@ -303,36 +559,64 @@ def main():
                 "objective": objective,
                 "metrics": metrics,
                 "hparams": trial,
+                "output_dir": str(trial_dir),
+                "log_path": str(log_path),
             }
 
-            with summary_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
+            append_jsonl(summary_path, record)
 
-            if objective is not None and (best is None or objective > best["objective"]):
+            if objective is not None and (
+                best is None or objective > float(best["objective"])
+            ):
                 best = record
+                dump_json(output_root / "best_trial.json", best)
 
             continue
 
         cmd = build_trial_command(
-            train_script=args.train_script,
+            args=args,
             trial=trial,
             output_dir=trial_dir,
-            custom_datasets=args.custom_datasets,
-            seed=args.seed,
-            per_device_eval_batch_size=args.per_device_eval_batch_size,
-            logging_steps=args.logging_steps,
-            dataloader_num_workers=args.dataloader_num_workers,
-            fsdp_layer_cls=args.fsdp_layer_cls,
-            extra_args=args.extra_args,
+        )
+
+        dump_json(
+            command_path,
+            {
+                "cmd": cmd,
+                "cmd_shell": " ".join(shlex.quote(x) for x in cmd),
+                "env_overrides": {
+                    "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
+                    "WANDB_MODE": env["WANDB_MODE"],
+                    "ACCELERATE_USE_FSDP": env["ACCELERATE_USE_FSDP"],
+                    "FSDP_CPU_RAM_EFFICIENT_LOADING": env[
+                        "FSDP_CPU_RAM_EFFICIENT_LOADING"
+                    ],
+                    "TOKENIZERS_PARALLELISM": env["TOKENIZERS_PARALLELISM"],
+                },
+                "trial": trial,
+            },
         )
 
         print("\n" + "=" * 100)
         print(f"[HPO] Starting {trial_name}")
         print("[HPO] Command:")
-        print(" ".join(cmd))
+        print(" ".join(shlex.quote(x) for x in cmd))
         print("=" * 100 + "\n")
 
-        log_path = trial_dir / "run.log"
+        if args.dry_run:
+            record = {
+                "trial_id": trial["trial_id"],
+                "trial_name": trial_name,
+                "status": "dry_run",
+                "objective": None,
+                "metrics": None,
+                "hparams": trial,
+                "output_dir": str(trial_dir),
+                "log_path": str(log_path),
+                "command_path": str(command_path),
+            }
+            append_jsonl(summary_path, record)
+            continue
 
         with log_path.open("w", encoding="utf-8") as log_f:
             process = subprocess.run(
@@ -356,19 +640,22 @@ def main():
             "hparams": trial,
             "output_dir": str(trial_dir),
             "log_path": str(log_path),
+            "command_path": str(command_path),
         }
 
-        with summary_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        append_jsonl(summary_path, record)
 
         if process.returncode != 0:
-            print(f"[HPO] Trial failed: {trial_name}. See {log_path}", file=sys.stderr)
+            print(
+                f"[HPO] Trial failed: {trial_name}. See {log_path}",
+                file=sys.stderr,
+            )
             continue
 
         if objective is None:
             print(
-                f"[HPO] Trial finished but objective could not be read: {trial_name}. "
-                f"Check {metrics_path}.",
+                f"[HPO] Trial finished but objective could not be read: "
+                f"{trial_name}. Check {metrics_path}.",
                 file=sys.stderr,
             )
             if metrics is not None:
@@ -377,23 +664,24 @@ def main():
 
         print(f"[HPO] Finished {trial_name}. objective={objective}")
 
-        if best is None or objective > best["objective"]:
+        if best is None or objective > float(best["objective"]):
             best = record
             best_path = output_root / "best_trial.json"
-            with best_path.open("w", encoding="utf-8") as f:
-                json.dump(best, f, indent=2)
+            dump_json(best_path, best)
 
             print(f"[HPO] New best trial: {trial_name}, objective={objective}")
             print(f"[HPO] Saved best trial to {best_path}")
 
     print("\n" + "=" * 100)
     print("[HPO] Done.")
+
     if best is not None:
         print(f"[HPO] Best trial: {best['trial_name']}")
         print(f"[HPO] Best objective: {best['objective']}")
         print(f"[HPO] Best hparams: {json.dumps(best['hparams'], indent=2)}")
     else:
         print("[HPO] No successful trial with a readable objective.")
+
     print("=" * 100)
 
 

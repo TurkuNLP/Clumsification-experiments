@@ -1084,30 +1084,11 @@ def parse_args() -> argparse.Namespace:
 
     # ── Metadata written to JSONL ───────────────────────────────────
     parser.add_argument(
-        "--training-dataset",
-        type=str,
-        required=True,
-        help="Name / tag of the training dataset used for this checkpoint.",
-    )
-    parser.add_argument(
-        "--perturbation-type",
-        type=str,
-        required=True,
-        help="Perturbation strategy used during training.",
-    )
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        required=True,
-        help="Number of perturbation layers used during training.",
-    )
-    parser.add_argument(
         "--context-length",
         type=int,
         required=True,
         help="Maximum context length the model was trained with.",
     )
-
     # ── Inference settings ──────────────────────────────────────────
     parser.add_argument(
         "--batch-size",
@@ -1418,11 +1399,35 @@ def main():
     # Write JSONL
     # ==================================================================
 
+    #Parse information from the DS name
+    def info_ds_parser(name:str):
+        num_layers = 5
+        pert_type = "clumsy"
+
+        #Getting model name
+        model_name=name[:name.find('_')]
+        name=name[name.find('_')+1:]
+        #Parsing the language info
+        lan=name[:name.find('_')]
+        name=name[name.find('_')+1:]
+        #Parsing num_layers and pert_type
+        training_ds_name=name
+        if name[name.rfind('_')+1].isnumeric():
+            pert_type = name[:name.rfind('_')]
+            num_layers = name[name.rfind('_')+1:]
+        else:
+            pert_type = name
+        return model_name, lan, pert_type, num_layers, training_ds_name
+    
+    model_name, language, pert_type, num_layers, training_ds_name = info_ds_parser(args.model_name)
+
+
+
     write_results_jsonl(
-        model_name=args.model_name,
-        training_dataset=args.formatted_dataset_name,
-        perturbation_type=args.perturbation_type,
-        num_layers=args.num_layers,
+        model_name=model_name,
+        training_dataset=language+"/"+training_ds_name,
+        perturbation_type=pert_type,
+        num_layers=num_layers,
         context_length=args.context_length,
         model_dir=args.model_dir,
         results=all_results,
