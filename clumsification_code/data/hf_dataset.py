@@ -1,8 +1,8 @@
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 import random
 from typing import Optional
-from format_dataset import *
-from splitting import *
+from clumsification_code.data.format_dataset import *
+from clumsification_code.data.splitting import *
 import shutil
 
 

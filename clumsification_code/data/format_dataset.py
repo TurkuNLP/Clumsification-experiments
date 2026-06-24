@@ -1,6 +1,6 @@
 import os
-from io import read_ds
-from pairing import generate_training_pairs_random
+from clumsification_code.data.io import read_ds
+from clumsification_code.data.pairing import generate_training_pairs_random
 from typing import Optional
 import json
 import random

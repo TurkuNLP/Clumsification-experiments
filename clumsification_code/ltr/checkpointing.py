@@ -21,11 +21,23 @@ from .utils import (
 def load_ltr_model(
     final_dir: str,
     attn_implementation: str = "sdpa",
+    param_dtype: Optional[torch.dtype] = None,
+    map_location: str = "cpu",
 ) -> LTRModel:
     head_path = os.path.join(final_dir, "ltr_head.pt")
-    head_state = torch.load(head_path, map_location="cpu")
+    if not os.path.exists(head_path):
+        raise FileNotFoundError(
+            f"Could not find ranking head at {head_path}. "
+            "Pass the trainer final directory, e.g. output_dir/final."
+        )
 
-    param_dtype = get_preferred_param_dtype()
+    head_state = torch.load(head_path, map_location=map_location)
+    param_dtype = param_dtype or get_preferred_param_dtype()
+
+    scorer_state = {
+        k.removeprefix("scorer."): v
+        for k, v in head_state["scorer"].items()
+    }
 
     model = LTRModel(
         model_name=final_dir,
@@ -35,7 +47,7 @@ def load_ltr_model(
         param_dtype=param_dtype,
     )
 
-    model.scorer.load_state_dict(head_state["scorer"])
+    model.scorer.load_state_dict(scorer_state, strict=True)
     model.to(dtype=param_dtype)
 
     assert_uniform_floating_dtype(

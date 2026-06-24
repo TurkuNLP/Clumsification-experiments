@@ -1,5 +1,5 @@
 import random
-from format_dataset import _read_originals_by_custom_id
+from clumsification_code.data.format_dataset import _read_originals_by_custom_id
 
 def split_original_ids_by_dataset(
     dataset_names: list[str],

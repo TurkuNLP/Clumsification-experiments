@@ -18,6 +18,11 @@ from scipy import stats as scipy_stats
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
+from clumsification_code.evals.inference.ltr import (
+    LTRInferenceModel,
+    load_ltr_inference_model,
+)
+from clumsification_code.evals.result_writer import json_sanitize
 
 STATIC_SANITY_TEXTS = [
     "This is a perfectly fine English sentence.",
@@ -38,166 +43,6 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "bf16": torch.bfloat16,
 }
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Model
-# ──────────────────────────────────────────────────────────────────────
-
-
-class ScoringHead(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: Optional[int] = 256,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        self.net = (
-            nn.Linear(input_dim, 1)
-            if hidden_dim is None
-            else nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1),
-            )
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
-
-
-class LTRInferenceModel(nn.Module):
-    def __init__(
-        self,
-        model_dir: str,
-        head_path: str,
-        device: torch.device,
-        attn_implementation: str = "flash_attention_2",
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-        )
-
-        self.encoder = AutoModel.from_pretrained(
-            model_dir,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            attn_implementation=attn_implementation,
-        )
-
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        if self.encoder.config.pad_token_id is None:
-            self.encoder.config.pad_token_id = self.tokenizer.pad_token_id
-
-        head_state = torch.load(head_path, map_location="cpu", weights_only=False)
-
-        scorer_state = {
-            k.removeprefix("scorer."): v
-            for k, v in head_state["scorer"].items()
-        }
-
-        self.scorer = ScoringHead(
-            input_dim=self.encoder.config.hidden_size,
-            hidden_dim=head_state["hidden_dim"],
-            dropout=head_state["dropout"],
-        )
-        self.scorer.load_state_dict(scorer_state, strict=True)
-
-        self.encoder.to(device=device).eval()
-        self.scorer.to(device=device, dtype=torch.float32).eval()
-
-    @staticmethod
-    def mean_pool(
-        last_hidden_state: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
-        summed = (last_hidden_state * mask).sum(dim=1)
-        denom = mask.sum(dim=1).clamp(min=1e-6)
-        return summed / denom
-
-    @torch.no_grad()
-    def score_texts(
-        self,
-        texts: List[str],
-        device: torch.device,
-        batch_size: int = 32,
-        max_length: int = 512,
-    ) -> np.ndarray:
-        if not texts:
-            return np.asarray([], dtype=np.float32)
-
-        scores = []
-        scorer_dtype = next(self.scorer.parameters()).dtype
-
-        for start in tqdm(range(0, len(texts), batch_size), desc="Scoring"):
-            batch = texts[start : start + batch_size]
-
-            tok = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-                pad_to_multiple_of=8,
-            ).to(device)
-
-            out = self.encoder(
-                input_ids=tok["input_ids"],
-                attention_mask=tok["attention_mask"],
-                use_cache=False,
-            )
-
-            hidden = out.last_hidden_state
-            if not torch.isfinite(hidden).all():
-                raise RuntimeError(f"Non-finite encoder states in batch {start}.")
-
-            emb = self.mean_pool(hidden, tok["attention_mask"])
-            if not torch.isfinite(emb).all():
-                raise RuntimeError(f"Non-finite pooled embeddings in batch {start}.")
-
-            batch_scores = self.scorer(emb.to(dtype=scorer_dtype))
-            if not torch.isfinite(batch_scores).all():
-                raise RuntimeError(
-                    f"Non-finite scores in batch {start}. Texts: {batch[:3]}"
-                )
-
-            scores.append(batch_scores.detach().cpu().float())
-
-        return torch.cat(scores).numpy()
-
-
-def load_model_for_benchmark(
-    model_dir: str,
-    device: torch.device,
-    attn_implementation: str,
-    dtype: torch.dtype,
-) -> LTRInferenceModel:
-    head_path = os.path.join(model_dir, "ltr_head.pt")
-
-    if not os.path.exists(head_path):
-        raise FileNotFoundError(
-            f"Could not find ranking head at {head_path}. "
-            f"Pass the trainer final directory, e.g. output_dir/final."
-        )
-
-    return LTRInferenceModel(
-        model_dir=model_dir,
-        head_path=head_path,
-        device=device,
-        attn_implementation=attn_implementation,
-        dtype=dtype,
-    )
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Data
@@ -1047,7 +892,7 @@ def main() -> None:
 
     print()
 
-    model = load_model_for_benchmark(
+    model = load_ltr_inference_model(
         model_dir=args.model_dir,
         device=device,
         dtype=dtype,

@@ -17,6 +17,7 @@ TQ_ranker*
 *.db
 *.out
 *.err
+clumsification_code/evals/sanity
 
 edu_filtering.py
 extract_jsons_P.py
