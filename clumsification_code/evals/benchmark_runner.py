@@ -116,28 +116,37 @@ def run_standard_benchmark_suite(
 
     all_results: Dict[str, Any] = {}
 
+    def update_preference_results(bench_name: str, metrics: Optional[Dict[str, Any]]) -> None:
+        if metrics is not None:
+            all_results.update(flatten_preference_metrics(bench_name, metrics))
+
     print("=" * 60)
     print("Preference-style HF benchmarks")
     print("=" * 60)
 
-    jfleg_results = data.load_jfleg_preference_pairs_by_split()
-    for split_name, (preferred, dispreferred) in jfleg_results.items():
-        bench_name = f"JFLEG_{split_name}_correction_preference"
-        metrics = eval_pairwise_preference_dataset(
-            name=bench_name,
-            model=model,
-            device=device,
-            preferred_texts=preferred,
-            dispreferred_texts=dispreferred,
-            task_name="jfleg",
-            aspect="grammar",
-            batch_size=batch_size,
-            max_length=max_length,
-        )
-        all_results.update(flatten_preference_metrics(bench_name, metrics))
+    # JFLEG
+    # Current loader returns: preferred, dispreferred
+    preferred, dispreferred = data.load_jfleg_preference_pairs(split="test")
+    bench_name = "JFLEG_test_correction_preference"
 
+    metrics = eval_pairwise_preference_dataset(
+        name=bench_name,
+        model=model,
+        device=device,
+        preferred_texts=preferred,
+        dispreferred_texts=dispreferred,
+        task_name="jfleg",
+        aspect="grammar",
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+    update_preference_results(bench_name, metrics)
+
+    # MultiBLiMP
+    # Current loader returns: preferred, dispreferred
     preferred, dispreferred = data.load_multiblimp_english_preference_pairs()
     bench_name = "MultiBLiMP_eng_minimal_pair_preference"
+
     metrics = eval_pairwise_preference_dataset(
         name=bench_name,
         model=model,
@@ -149,23 +158,25 @@ def run_standard_benchmark_suite(
         batch_size=batch_size,
         max_length=max_length,
     )
-    all_results.update(flatten_preference_metrics(bench_name, metrics))
+    update_preference_results(bench_name, metrics)
 
-    story_results = data.load_story_cloze_preference_pairs_by_split()
-    for split_name, (preferred, dispreferred) in story_results.items():
-        bench_name = f"StoryCloze_{split_name}_ending_preference"
-        metrics = eval_pairwise_preference_dataset(
-            name=bench_name,
-            model=model,
-            device=device,
-            preferred_texts=preferred,
-            dispreferred_texts=dispreferred,
-            task_name="story_cloze",
-            aspect="coherence",
-            batch_size=batch_size,
-            max_length=max_length,
-        )
-        all_results.update(flatten_preference_metrics(bench_name, metrics))
+    # Story Cloze
+    # Current loader returns: preferred, dispreferred
+    preferred, dispreferred = data.load_story_cloze_preference_pairs(split="eval")
+    bench_name = "StoryCloze_eval_ending_preference"
+
+    metrics = eval_pairwise_preference_dataset(
+        name=bench_name,
+        model=model,
+        device=device,
+        preferred_texts=preferred,
+        dispreferred_texts=dispreferred,
+        task_name="story_cloze",
+        aspect="coherence",
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+    update_preference_results(bench_name, metrics)
 
     print()
     print("=" * 60)

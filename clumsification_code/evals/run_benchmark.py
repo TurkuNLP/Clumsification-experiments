@@ -58,13 +58,10 @@ def add_gptscore_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--length-normalization", default="mean", choices=["mean", "sum"])
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-original-causal-tokenization", action="store_true")
-    parser.add_argument("--max-input-length", type=int, default=None)
-
 
 def add_metricx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metricx-model-name-or-path", default=None)
     parser.add_argument("--tokenizer", default="google/mt5-xl")
-    parser.add_argument("--max-input-length", type=int, default=None)
 
 
 def build_scorer(args: argparse.Namespace, device: torch.device):
@@ -95,7 +92,7 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
             tokenizer_name_or_path=args.tokenizer_name_or_path,
             model_type=args.model_type,
             batch_size=args.batch_size,
-            max_input_length=args.max_input_length or args.max_length,
+            max_input_length=args.max_length,
             dtype=dtype,
             device=device,
             device_map=args.device_map,
@@ -117,7 +114,7 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
             model_name_or_path=args.metricx_model_name_or_path,
             tokenizer_name=args.tokenizer,
             batch_size=args.batch_size,
-            max_input_length=args.max_input_length or args.max_length,
+            max_input_length=args.max_length,
         )
 
     if args.scorer == "geval":
@@ -158,9 +155,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         model=model,
         device=device,
         batch_size=args.batch_size,
-        max_length=args.max_input_length or args.max_length
-        if hasattr(args, "max_input_length")
-        else args.max_length,
+        max_length=args.max_length
     )
 
     model_dir = (
