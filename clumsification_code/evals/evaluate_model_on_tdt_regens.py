@@ -13,16 +13,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from scipy import stats as scipy_stats
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer
 
 from clumsification_code.evals.inference.ltr import (
     LTRInferenceModel,
     load_ltr_inference_model,
 )
 from clumsification_code.evals.result_writer import json_sanitize
+from clumsification_code.evals.run_benchmark import info_ds_parser
 
 STATIC_SANITY_TEXTS = [
     "This is a perfectly fine English sentence.",
@@ -571,9 +570,11 @@ def json_sanitize(x: Any) -> Any:
     return x
 
 
-def append_compact_jsonl(model_name: str, record: Dict[str, Any]) -> Path:
-    EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = EVAL_LOG_DIR / f"{model_name}.jsonl"
+def append_compact_jsonl(log_dir: Path, model_name: str, record: Dict[str, Any]) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name).strip("-")
+    out_path = log_dir / f"{safe_model_name}.jsonl"
 
     with out_path.open("a", encoding="utf-8") as writer:
         writer.write(json.dumps(json_sanitize(record), ensure_ascii=False) + "\n")
@@ -604,20 +605,32 @@ def build_compact_record(
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "eval_type": "ud_regen_only",
-        "evaluator_model_name": args.model_name,
-        "evaluator_model_dir": args.model_dir,
+
+        # Raw user-provided model identifier.
+        "model_name_arg": args.model_name,
+
+        # Parsed from info_ds_parser(args.model_name).
+        "evaluator_model_name": args.parsed_model_name,
+        "training_language": args.parsed_training_language,
         "training_dataset": args.training_dataset,
         "perturbation_type": args.perturbation_type,
         "num_layers": args.num_layers,
-        "context_length": args.context_length,
-        "data_folder": args.resolved_data_folder,
+
+        # Runtime/config.
+        "evaluator_model_dir": str(args.model_dir),
+        "base_dir": str(args.base_dir),
+        "data_folder": str(args.resolved_data_folder),
         "language": args.language,
         "group_by": args.group_by,
         "duplicate_id_policy": args.duplicate_id_policy,
         "batch_size": args.batch_size,
         "max_length": args.max_length,
-        "dtype": args.dtype,
+        "context_length": args.context_length,
+        "max_seq_len": args.max_seq_len,
+        "dtype": str(args.dtype).replace("torch.", ""),
         "attn_implementation": args.attn_implementation,
+
+        # Outputs/results.
         "run_output_dir": str(run_output_dir),
         "n_scored_texts": int(len(scored_df)),
         "n_splits": int(len(summary_df)),
@@ -717,7 +730,11 @@ def run_evaluation(
     with (run_output_dir / "compact_summary.json").open("w", encoding="utf-8") as writer:
         json.dump(json_sanitize(compact_record), writer, ensure_ascii=False, indent=2)
 
-    jsonl_path = append_compact_jsonl(args.model_name, compact_record)
+    jsonl_path = append_compact_jsonl(
+        log_dir=run_output_dir.parent,
+        model_name=args.model_name,
+        record=compact_record,
+    )
 
     print(f"\n✓ Saved run outputs to: {run_output_dir}")
     print(f"✓ Appended compact JSONL record to: {jsonl_path}")
@@ -741,8 +758,20 @@ def run_evaluation(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a QE/LTR model on regenerated UD documents only.",
+        description=(
+            "Evaluate a QE/LTR model on every UD regeneration subfolder inside "
+            "a base directory."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--base-dir",
+        required=True,
+        help=(
+            "Base directory containing language subfolders, e.g. "
+            "data/benchmarks/ud_regens/ with subfolders en, es, fi."
+        ),
     )
 
     parser.add_argument(
@@ -752,150 +781,124 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to final trainer directory containing ltr_head.pt.",
     )
+
     parser.add_argument(
         "--model-name",
         required=True,
-        help="Short evaluator model name used for logs, e.g. QE0.6B.",
-    )
-
-    parser.add_argument("--training-dataset", default="")
-    parser.add_argument("--perturbation-type", default="")
-    parser.add_argument("--num-layers", type=int, default=-1)
-    parser.add_argument("--context-length", type=int, default=-1)
-
-    parser.add_argument(
-        "--data-folder",
-        default=None,
-        help="Folder containing *_regens_*.jsonl files. ud_data.jsonl is ignored.",
-    )
-    parser.add_argument(
-        "--base-folder",
-        default=None,
-        help="Optional base folder. If provided with --language, data folder is base/language.",
-    )
-    parser.add_argument(
-        "--language",
-        "--lan",
-        dest="language",
-        default=None,
-        help="Language code, e.g. fi, en, sv.",
-    )
-    parser.add_argument(
-        "--group-by",
-        default="file",
-        choices=["model_effort", "file"],
         help=(
-            "'file' keeps each regeneration file as a separate split. "
-            "'model_effort' groups rows by model/effort."
+            "Model/dataset-style name parsed by info_ds_parser, e.g. "
+            "QE0.6B_fi_some_training_dataset_5."
         ),
     )
-    parser.add_argument(
-        "--duplicate-id-policy",
-        default="mean",
-        choices=["mean", "first", "error"],
-        help=(
-            "For pre-scoring duplicate IDs within a split, 'mean' and 'first' "
-            "both keep the first row. 'error' fails."
-        ),
-    )
-    parser.add_argument(
-        "--expected-order",
-        default="",
-        help="Optional comma-separated split order from best to worst.",
-    )
 
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument(
-        "--dtype",
-        default="bfloat16",
-        choices=list(_DTYPE_MAP),
-        help="Torch dtype for the encoder.",
-    )
-    parser.add_argument(
-        "--attn-implementation",
-        default="flash_attention_2",
-        help="Attention implementation passed to AutoModel.from_pretrained.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="data/evals/ud_regen_runs",
-        help="Directory where timestamped run outputs are written.",
-    )
-    parser.add_argument(
-        "--skip-sanity-check",
-        action="store_true",
-        help="Deprecated/ignored. Static sanity checks are always run.",
+        "--max-length",
+        type=int,
+        required=True,
+        help="Used both as scoring max_length and logged context/max sequence length.",
     )
 
     return parser.parse_args()
 
+def attach_default_runtime_config(args: argparse.Namespace, device: torch.device) -> argparse.Namespace:
+    parsed_model_name, parsed_lan, pert_type, num_layers, training_ds_name = info_ds_parser(
+        args.model_name
+    )
 
-def resolve_data_folder(args: argparse.Namespace) -> Path:
-    if args.data_folder is not None:
-        return Path(args.data_folder)
+    try:
+        num_layers = int(num_layers)
+    except Exception:
+        num_layers = -1
 
-    if args.base_folder is not None and args.language is not None:
-        return Path(args.base_folder) / args.language
+    args.parsed_model_name = parsed_model_name
+    args.parsed_training_language = parsed_lan
+    args.perturbation_type = pert_type
+    args.num_layers = num_layers
+    args.training_dataset = training_ds_name
 
-    raise ValueError("Provide either --data-folder or both --base-folder and --language.")
+    # The user's max length is used for both fields.
+    args.context_length = args.max_length
+    args.max_seq_len = args.max_length
+
+    # Internal defaults that are no longer user-facing CLI args.
+    args.group_by = "file"
+    args.duplicate_id_policy = "mean"
+    args.batch_size = 32
+    args.expected_order = ""
+
+    # Safer default on CPU. You can force bfloat16 here if your loader requires it.
+    args.dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
+    # If flash_attention_2 is unavailable in your environment, use "eager".
+    args.attn_implementation = "flash_attention_2" if device.type == "cuda" else "eager"
+
+    return args
+
+def discover_eval_folders(base_dir: Path) -> List[Path]:
+    base_dir = Path(base_dir)
+
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Base directory does not exist: {base_dir}")
+
+    if not base_dir.is_dir():
+        raise NotADirectoryError(f"Base path is not a directory: {base_dir}")
+
+    eval_folders = []
+
+    for child in sorted(base_dir.iterdir()):
+        if not child.is_dir():
+            continue
+
+        # Skip output folders if someone points base-dir too low.
+        if child.name == "results":
+            continue
+
+        if list(child.glob("*_regens_*.jsonl")):
+            eval_folders.append(child)
+        else:
+            print(f"Skipping {child}: no *_regens_*.jsonl files found.")
+
+    if not eval_folders:
+        raise FileNotFoundError(
+            f"No language/eval subfolders with *_regens_*.jsonl files found in {base_dir}"
+        )
+
+    return eval_folders
 
 
 def main() -> None:
     args = parse_args()
 
-    data_folder = resolve_data_folder(args)
-    args.resolved_data_folder = str(data_folder)
-
-    if args.language is None:
-        args.language = data_folder.name
+    args.base_dir = Path(args.base_dir)
+    args.model_dir = Path(args.model_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = _DTYPE_MAP[args.dtype]
+    args = attach_default_runtime_config(args, device=device)
 
-    print(f"Device       : {device}")
-    print(f"Model dir    : {args.model_dir}")
-    print(f"Model name   : {args.model_name}")
-    print(f"dtype        : {dtype}")
-    print(f"Data folder  : {data_folder}")
-    print(f"Language     : {args.language}")
-    print(f"group_by     : {args.group_by}")
+    print(f"Device          : {device}")
+    print(f"Model dir       : {args.model_dir}")
+    print(f"Model name arg  : {args.model_name}")
+    print(f"Parsed model    : {args.parsed_model_name}")
+    print(f"Training lang   : {args.parsed_training_language}")
+    print(f"Training dataset: {args.training_dataset}")
+    print(f"Perturbation    : {args.perturbation_type}")
+    print(f"Num layers      : {args.num_layers}")
+    print(f"Max length      : {args.max_length}")
+    print(f"dtype           : {args.dtype}")
+    print(f"Base dir        : {args.base_dir}")
     print()
 
-    data_df = load_regen_rows(
-        data_folder=data_folder,
-        language=args.language,
-        group_by=args.group_by,
-    )
+    eval_folders = discover_eval_folders(args.base_dir)
 
-    print(
-        f"Loaded {len(data_df)} regenerated texts across "
-        f"{data_df['split'].nunique()} raw splits."
-    )
-
-    data_df = restrict_to_common_regen_ids(
-        data_df,
-        duplicate_id_policy=args.duplicate_id_policy,
-    )
-
-    print(
-        f"After filtering to common regeneration IDs: "
-        f"{len(data_df)} texts across {data_df['split'].nunique()} splits."
-    )
-    print("Every split now has the same IDs in the same reference order:")
-
-    for split_name, split_df in data_df.groupby("split", sort=True):
-        print(
-            f"  {split_name}: "
-            f"{len(split_df)} rows, {split_df['id'].nunique()} unique IDs"
-        )
-
+    print("Evaluation folders:")
+    for folder in eval_folders:
+        print(f"  - {folder}")
     print()
 
     model = load_ltr_inference_model(
         model_dir=args.model_dir,
         device=device,
-        dtype=dtype,
+        dtype=args.dtype,
         attn_implementation=args.attn_implementation,
     )
 
@@ -914,19 +917,57 @@ def main() -> None:
     print()
 
     safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.model_name).strip("-")
-    run_output_dir = (
-        Path(args.output_dir)
-        / safe_model_name
-        / f"{args.language}_{utc_timestamp_for_filename()}"
-    )
 
-    run_evaluation(
-        model=model,
-        data_df=data_df,
-        device=device,
-        args=args,
-        run_output_dir=run_output_dir,
-    )
+    for eval_folder in eval_folders:
+        language = eval_folder.name
+
+        print("\n" + "#" * 80)
+        print(f"Evaluating folder: {eval_folder}")
+        print(f"Language         : {language}")
+        print("#" * 80)
+
+        run_args = argparse.Namespace(**vars(args))
+        run_args.language = language
+        run_args.resolved_data_folder = str(eval_folder)
+
+        data_df = load_regen_rows(
+            data_folder=eval_folder,
+            language=language,
+            group_by=run_args.group_by,
+        )
+
+        print(
+            f"Loaded {len(data_df)} regenerated texts across "
+            f"{data_df['split'].nunique()} raw splits."
+        )
+
+        data_df = restrict_to_common_regen_ids(
+            data_df,
+            duplicate_id_policy=run_args.duplicate_id_policy,
+        )
+
+        print(
+            f"After filtering to common regeneration IDs: "
+            f"{len(data_df)} texts across {data_df['split'].nunique()} splits."
+        )
+        print("Every split now has the same IDs in the same reference order:")
+
+        for split_name, split_df in data_df.groupby("split", sort=True):
+            print(
+                f"  {split_name}: "
+                f"{len(split_df)} rows, {split_df['id'].nunique()} unique IDs"
+            )
+
+        results_dir = eval_folder / "results"
+        run_output_dir = results_dir / f"{safe_model_name}_{utc_timestamp_for_filename()}"
+
+        run_evaluation(
+            model=model,
+            data_df=data_df,
+            device=device,
+            args=run_args,
+            run_output_dir=run_output_dir,
+        )
 
 
 if __name__ == "__main__":

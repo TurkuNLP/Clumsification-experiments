@@ -18,6 +18,26 @@ _DTYPE_MAP = {
     "bf16": torch.bfloat16,
 }
 
+#Parse information from the DS name
+def info_ds_parser(name:str):
+    num_layers = 5
+    pert_type = "clumsy"
+
+    #Getting model name
+    model_name=name[:name.find('_')]
+    name=name[name.find('_')+1:]
+    #Parsing the language info
+    lan=name[:name.find('_')]
+    name=name[name.find('_')+1:]
+    #Parsing num_layers and pert_type
+    training_ds_name=name
+    if name[name.rfind('_')+1].isnumeric():
+        pert_type = name[:name.rfind('_')]
+        num_layers = name[name.rfind('_')+1:]
+    else:
+        pert_type = name
+    return model_name, lan, pert_type, num_layers, training_ds_name
+
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -164,27 +184,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         or getattr(args, "metricx_model_name_or_path", "")
     )
 
-    if args.scorer == 'ltr':
-        #Parse information from the DS name
-        def info_ds_parser(name:str):
-            num_layers = 5
-            pert_type = "clumsy"
-
-            #Getting model name
-            model_name=name[:name.find('_')]
-            name=name[name.find('_')+1:]
-            #Parsing the language info
-            lan=name[:name.find('_')]
-            name=name[name.find('_')+1:]
-            #Parsing num_layers and pert_type
-            training_ds_name=name
-            if name[name.rfind('_')+1].isnumeric():
-                pert_type = name[:name.rfind('_')]
-                num_layers = name[name.rfind('_')+1:]
-            else:
-                pert_type = name
-            return model_name, lan, pert_type, num_layers, training_ds_name
-        
+    if args.scorer == 'ltr':        
         model_name, language, pert_type, num_layers, training_ds_name = info_ds_parser(args.model_name)
 
         metadata = EvalMetadata(
