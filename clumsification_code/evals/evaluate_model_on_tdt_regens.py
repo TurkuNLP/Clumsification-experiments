@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 from datetime import datetime, timezone
 from itertools import combinations
@@ -14,61 +13,131 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import stats as scipy_stats
-from tqdm.auto import tqdm
 
-from clumsification_code.evals.inference.ltr import (
-    LTRInferenceModel,
-    load_ltr_inference_model,
+from clumsification_code.evals.inference.base import TextScorer
+from clumsification_code.evals.run_benchmark import (
+    add_common_args,
+    add_gptscore_args,
+    add_metricx_args,
+    build_scorer,
+    info_ds_parser,
 )
-from clumsification_code.evals.result_writer import json_sanitize
-from clumsification_code.evals.run_benchmark import info_ds_parser
+
 
 STATIC_SANITY_TEXTS = [
     "This is a perfectly fine English sentence.",
     "This no be fluent English sentence",
-    "This sentence can be called by the term fluent and is as such an English sentence with such a quality.",
-    "Opettaja antoi meille pitkän esineen nimeltä lauta, joka oli niin kevyt, että jokainen jaksoi kantaa sitä vuorollaan.",
-    "Opettaja antoi meille pitkän ja kevyen laudan, jota jokainen jaksoi kantaa vuorollaan.",
-    "Opettaja antoi meille pitkän laudan, joka oli niin kevyt, että jokainen jaksoi kantaa sitä vuorollaan.",
+    (
+        "This sentence can be called by the term fluent and is as such an "
+        "English sentence with such a quality."
+    ),
+    (
+        "Opettaja antoi meille pitkän esineen nimeltä lauta, joka oli niin "
+        "kevyt, että jokainen jaksoi kantaa sitä vuorollaan."
+    ),
+    (
+        "Opettaja antoi meille pitkän ja kevyen laudan, jota jokainen jaksoi "
+        "kantaa vuorollaan."
+    ),
+    (
+        "Opettaja antoi meille pitkän laudan, joka oli niin kevyt, että "
+        "jokainen jaksoi kantaa sitä vuorollaan."
+    ),
 ]
 
-EVAL_LOG_DIR = Path("data/evals/ud_regen")
-
-_DTYPE_MAP = {
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "float16": torch.float16,
-    "fp16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-}
 
 # ──────────────────────────────────────────────────────────────────────
-# Data
+# Small utilities
 # ──────────────────────────────────────────────────────────────────────
+
+
+def utc_timestamp_for_filename() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def clean_text(x: Any) -> str:
     return "" if x is None else str(x).strip()
 
 
+def safe_filename_part(x: Any) -> str:
+    value = str(x).strip()
+    value = re.sub(r"\s+", "-", value)
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
+    return value.strip("-") or "unknown"
+
+
+def json_sanitize(x: Any) -> Any:
+    if isinstance(x, dict):
+        return {str(k): json_sanitize(v) for k, v in x.items()}
+
+    if isinstance(x, (list, tuple)):
+        return [json_sanitize(v) for v in x]
+
+    if isinstance(x, np.integer):
+        return int(x)
+
+    if isinstance(x, np.floating):
+        return json_sanitize(float(x))
+
+    if isinstance(x, np.bool_):
+        return bool(x)
+
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+
+    if not isinstance(x, (str, bytes)):
+        try:
+            if pd.isna(x):
+                return None
+        except Exception:
+            pass
+
+    return x
+
+
+def maybe_set_prompt_context(
+    model: TextScorer,
+    task_name: str,
+    aspect: str,
+) -> None:
+    """
+    GPTScore/G-Eval-style scorers can optionally expose set_prompt_context().
+    LTR and MetricX simply ignore this.
+    """
+    setter = getattr(model, "set_prompt_context", None)
+    if callable(setter):
+        setter(task_name, aspect)
+
+
+def scorer_model_path(args: argparse.Namespace) -> str:
+    return (
+        getattr(args, "model_dir", "")
+        or getattr(args, "hf_model_name_or_path", "")
+        or getattr(args, "metricx_model_name_or_path", "")
+        or ""
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Data loading
+# ──────────────────────────────────────────────────────────────────────
+
+
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows = []
+    rows: List[Dict[str, Any]] = []
+
     with path.open("r", encoding="utf-8") as reader:
         for line in reader:
             line = line.strip()
             if line:
                 rows.append(json.loads(line))
+
     return rows
 
 
 def extract_run_id(path: Path) -> Optional[int]:
     match = re.search(r"_regens_(\d+)\.jsonl$", path.name)
     return int(match.group(1)) if match else None
-
-
-def safe_split_part(x: Any) -> str:
-    return re.sub(r"\s+", "-", str(x).strip())
 
 
 def make_split_name(
@@ -81,9 +150,9 @@ def make_split_name(
         return source_path.name.removesuffix(".jsonl")
 
     if group_by == "model_effort":
-        return f"{safe_split_part(generator_model)}__{safe_split_part(effort)}"
+        return f"{safe_filename_part(generator_model)}__{safe_filename_part(effort)}"
 
-    raise ValueError(f"Unknown group_by value: {group_by}")
+    raise ValueError(f"Unknown group_by value: {group_by!r}")
 
 
 def load_regen_rows(
@@ -103,6 +172,7 @@ def load_regen_rows(
         raise FileNotFoundError(f"Data folder does not exist: {data_folder}")
 
     regen_paths = sorted(data_folder.glob("*_regens_*.jsonl"))
+
     if not regen_paths:
         raise FileNotFoundError(f"No *_regens_*.jsonl files found in {data_folder}")
 
@@ -152,20 +222,25 @@ def load_regen_rows(
 
 def restrict_to_common_regen_ids(
     df: pd.DataFrame,
-    duplicate_id_policy: str = "mean",
+    duplicate_id_policy: str = "first",
 ) -> pd.DataFrame:
     """
     Keep only IDs present in every regeneration split.
 
-    Duplicates are resolved before scoring so each split scores exactly one
-    text per common ID. For pre-scoring duplicates, both "mean" and "first"
-    keep the first row. Use "error" to fail instead.
+    Duplicates are resolved before scoring so each split scores exactly one text
+    per common ID.
+
+    duplicate_id_policy:
+      - "first": keep the first row per duplicate ID inside each split
+      - "mean": backward-compatible alias for "first" before scoring
+      - "error": fail on duplicate IDs
     """
-    valid_policies = {"mean", "first", "error"}
+    valid_policies = {"first", "mean", "error"}
+
     if duplicate_id_policy not in valid_policies:
         raise ValueError(
             f"duplicate_id_policy must be one of {sorted(valid_policies)}, "
-            f"got {duplicate_id_policy}"
+            f"got {duplicate_id_policy!r}"
         )
 
     df = df.copy()
@@ -173,6 +248,7 @@ def restrict_to_common_regen_ids(
     df["split"] = df["split"].astype(str)
 
     split_names = sorted(df["split"].unique())
+
     if len(split_names) < 2:
         raise ValueError(
             "Need at least two regeneration splits to compare. "
@@ -191,10 +267,14 @@ def restrict_to_common_regen_ids(
 
             if duplicate_id_policy == "error":
                 raise ValueError(
-                    f"Split '{split_name}' contains duplicate IDs before scoring: "
+                    f"Split {split_name!r} contains duplicate IDs before scoring: "
                     f"{n_dup_ids} IDs / {n_dup_rows} rows."
                 )
 
+            print(
+                f"Warning: split {split_name!r} contains duplicate IDs "
+                f"({n_dup_ids} IDs / {n_dup_rows} rows). Keeping first occurrence."
+            )
             split_df = split_df.drop_duplicates(subset=["id"], keep="first")
 
         deduped_parts.append(split_df)
@@ -234,10 +314,12 @@ def restrict_to_common_regen_ids(
     for split_name in split_names:
         split_df = df[df["split"] == split_name].copy()
         split_df = split_df[split_df["id"].isin(common_ids)]
-        split_df = split_df.set_index("id", drop=False).loc[common_ids].reset_index(drop=True)
+        split_df = split_df.set_index("id", drop=False).loc[common_ids].reset_index(
+            drop=True
+        )
 
         if split_df["id"].tolist() != common_ids:
-            raise RuntimeError(f"Internal alignment error for split '{split_name}'.")
+            raise RuntimeError(f"Internal alignment error for split {split_name!r}.")
 
         ordered_parts.append(split_df)
 
@@ -256,6 +338,55 @@ def restrict_to_common_regen_ids(
     return aligned_df.drop(columns=["_row_order"], errors="ignore")
 
 
+def discover_eval_folders(
+    base_dir: Path,
+    languages: Optional[List[str]] = None,
+) -> List[Path]:
+    """
+    Accept either:
+      1. a base dir containing language subfolders, or
+      2. a single eval/language dir containing *_regens_*.jsonl files.
+    """
+    base_dir = Path(base_dir)
+
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Base directory does not exist: {base_dir}")
+
+    if not base_dir.is_dir():
+        raise NotADirectoryError(f"Base path is not a directory: {base_dir}")
+
+    allowed = set(languages or [])
+
+    if list(base_dir.glob("*_regens_*.jsonl")):
+        if allowed and base_dir.name not in allowed:
+            return []
+        return [base_dir]
+
+    eval_folders: List[Path] = []
+
+    for child in sorted(base_dir.iterdir()):
+        if not child.is_dir():
+            continue
+
+        if child.name == "results":
+            continue
+
+        if allowed and child.name not in allowed:
+            continue
+
+        if list(child.glob("*_regens_*.jsonl")):
+            eval_folders.append(child)
+        else:
+            print(f"Skipping {child}: no *_regens_*.jsonl files found.")
+
+    if not eval_folders:
+        raise FileNotFoundError(
+            f"No eval folders with *_regens_*.jsonl files found in {base_dir}"
+        )
+
+    return eval_folders
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Scoring and metrics
 # ──────────────────────────────────────────────────────────────────────
@@ -263,25 +394,40 @@ def restrict_to_common_regen_ids(
 
 def score_dataframe(
     df: pd.DataFrame,
-    model: LTRInferenceModel,
+    model: TextScorer,
     device: torch.device,
     batch_size: int,
     max_length: int,
+    task_name: str,
+    aspect: str,
+    lower_is_better: bool = False,
 ) -> pd.DataFrame:
+    maybe_set_prompt_context(model, task_name=task_name, aspect=aspect)
+
     parts = []
+    score_multiplier = -1.0 if lower_is_better else 1.0
 
     for split_name, split_df in df.groupby("split", sort=True):
         split_df = split_df.copy()
 
-        print(f"\n>>> Scoring split '{split_name}' ({len(split_df)} texts)")
+        print(f"\n>>> Scoring split {split_name!r} ({len(split_df)} texts)")
 
-        split_df["score"] = model.score_texts(
+        scores = model.score_texts(
             texts=split_df["text"].tolist(),
             device=device,
             batch_size=batch_size,
             max_length=max_length,
-        ).astype(float)
+        )
 
+        scores = np.asarray(scores, dtype=np.float64)
+
+        if len(scores) != len(split_df):
+            raise RuntimeError(
+                f"Scorer returned {len(scores)} scores for {len(split_df)} texts "
+                f"in split {split_name!r}."
+            )
+
+        split_df["score"] = scores * score_multiplier
         parts.append(split_df)
 
     return pd.concat(parts, ignore_index=True)
@@ -416,6 +562,7 @@ def build_pairwise_matrix(
     value: str,
 ) -> pd.DataFrame:
     valid_values = {"strict_winrate", "tie_aware_winrate", "mean_delta"}
+
     if value not in valid_values:
         raise ValueError(f"value must be one of {sorted(valid_values)}, got {value}")
 
@@ -502,14 +649,17 @@ def compute_expected_order_metrics(
         worse = present[worse_idx]
 
         arr_better, arr_worse, common_ids = align_scores(scored[better], scored[worse])
+
         if not common_ids:
             continue
 
         deltas = arr_better - arr_worse
-
         strict_credits.extend((deltas > 0).astype(float).tolist())
         tie_aware_credits.extend(
-            ((deltas > 0).astype(float) + 0.5 * (deltas == 0).astype(float)).tolist()
+            (
+                (deltas > 0).astype(float)
+                + 0.5 * (deltas == 0).astype(float)
+            ).tolist()
         )
         n_split_comparisons += 1
 
@@ -537,44 +687,14 @@ def compute_expected_order_metrics(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def utc_timestamp_for_filename() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def json_sanitize(x: Any) -> Any:
-    if isinstance(x, dict):
-        return {str(k): json_sanitize(v) for k, v in x.items()}
-
-    if isinstance(x, (list, tuple)):
-        return [json_sanitize(v) for v in x]
-
-    if isinstance(x, np.integer):
-        return int(x)
-
-    if isinstance(x, np.floating):
-        return json_sanitize(float(x))
-
-    if isinstance(x, np.bool_):
-        return bool(x)
-
-    if isinstance(x, float):
-        return x if math.isfinite(x) else None
-
-    if not isinstance(x, (str, bytes)):
-        try:
-            if pd.isna(x):
-                return None
-        except Exception:
-            pass
-
-    return x
-
-
-def append_compact_jsonl(log_dir: Path, model_name: str, record: Dict[str, Any]) -> Path:
+def append_compact_jsonl(
+    log_dir: Path,
+    run_name: str,
+    record: Dict[str, Any],
+) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name).strip("-")
-    out_path = log_dir / f"{safe_model_name}.jsonl"
+    out_path = log_dir / f"{safe_filename_part(run_name)}.jsonl"
 
     with out_path.open("a", encoding="utf-8") as writer:
         writer.write(json.dumps(json_sanitize(record), ensure_ascii=False) + "\n")
@@ -604,20 +724,15 @@ def build_compact_record(
 
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "eval_type": "ud_regen_only",
-
-        # Raw user-provided model identifier.
+        "eval_type": "tdt_regen_only",
+        "scorer": args.scorer,
         "model_name_arg": args.model_name,
-
-        # Parsed from info_ds_parser(args.model_name).
-        "evaluator_model_name": args.parsed_model_name,
-        "training_language": args.parsed_training_language,
+        "evaluator_model_name": args.evaluator_model_name,
+        "evaluator_model_path": scorer_model_path(args),
+        "training_language": args.training_language,
         "training_dataset": args.training_dataset,
         "perturbation_type": args.perturbation_type,
         "num_layers": args.num_layers,
-
-        # Runtime/config.
-        "evaluator_model_dir": str(args.model_dir),
         "base_dir": str(args.base_dir),
         "data_folder": str(args.resolved_data_folder),
         "language": args.language,
@@ -626,11 +741,13 @@ def build_compact_record(
         "batch_size": args.batch_size,
         "max_length": args.max_length,
         "context_length": args.context_length,
-        "max_seq_len": args.max_seq_len,
-        "dtype": str(args.dtype).replace("torch.", ""),
+        "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
-
-        # Outputs/results.
+        "score_task_name": args.score_task_name,
+        "score_aspect": args.score_aspect,
+        "score_direction": "lower_is_better_inverted"
+        if args.lower_is_better
+        else "higher_is_better",
         "run_output_dir": str(run_output_dir),
         "n_scored_texts": int(len(scored_df)),
         "n_splits": int(len(summary_df)),
@@ -643,13 +760,8 @@ def build_compact_record(
     return record
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Evaluation
-# ──────────────────────────────────────────────────────────────────────
-
-
 def run_evaluation(
-    model: LTRInferenceModel,
+    model: TextScorer,
     data_df: pd.DataFrame,
     device: torch.device,
     args: argparse.Namespace,
@@ -661,6 +773,9 @@ def run_evaluation(
         device=device,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        task_name=args.score_task_name,
+        aspect=args.score_aspect,
+        lower_is_better=args.lower_is_better,
     )
 
     summary_df = compute_summary_scores(scored_df)
@@ -671,7 +786,8 @@ def run_evaluation(
     tie_aware_matrix = build_pairwise_matrix(scored, "tie_aware_winrate")
     mean_delta_matrix = build_pairwise_matrix(scored, "mean_delta")
 
-    expected_order_metrics = {}
+    expected_order_metrics: Dict[str, Any] = {}
+
     if args.expected_order:
         expected_order_metrics = compute_expected_order_metrics(
             expected_order=[
@@ -732,7 +848,7 @@ def run_evaluation(
 
     jsonl_path = append_compact_jsonl(
         log_dir=run_output_dir.parent,
-        model_name=args.model_name,
+        run_name=f"{args.scorer}-{args.model_name}",
         record=compact_record,
     )
 
@@ -756,167 +872,248 @@ def run_evaluation(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a QE/LTR model on every UD regeneration subfolder inside "
-            "a base directory."
+            "Evaluate a QE scorer on TDT/UD regenerated texts. The scorer "
+            "backend is shared with run_benchmark.py."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Shared benchmark/scorer args:
+    add_common_args(parser)
+    add_gptscore_args(parser)
+    add_metricx_args(parser)
+
+    # Optional G-Eval args if available in this checkout.
+    try:
+        from clumsification_code.evals.geval.cli import add_geval_args
+
+        add_geval_args(parser)
+    except Exception:
+        pass
+
+    # TDT regeneration specific args:
     parser.add_argument(
         "--base-dir",
         required=True,
         help=(
             "Base directory containing language subfolders, e.g. "
-            "data/benchmarks/ud_regens/ with subfolders en, es, fi."
+            "data/benchmarks/ud_regens, or a single folder containing "
+            "*_regens_*.jsonl files."
         ),
     )
-
     parser.add_argument(
-        "--model-dir",
-        "--model",
-        dest="model_dir",
-        required=True,
-        help="Path to final trainer directory containing ltr_head.pt.",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        required=True,
+        "--output-dir",
+        default=None,
         help=(
-            "Model/dataset-style name parsed by info_ds_parser, e.g. "
-            "QE0.6B_fi_some_training_dataset_5."
+            "Optional output root. By default, outputs are written under "
+            "<eval_folder>/results/."
         ),
     )
-
     parser.add_argument(
-        "--max-length",
-        type=int,
-        required=True,
-        help="Used both as scoring max_length and logged context/max sequence length.",
+        "--languages",
+        default="",
+        help=(
+            "Optional comma-separated language/eval folder names to run, e.g. "
+            "fi,en. Empty means all discovered folders."
+        ),
+    )
+    parser.add_argument(
+        "--group-by",
+        default="file",
+        choices=["file", "model_effort"],
+        help="How to define comparison splits from regeneration JSONL files.",
+    )
+    parser.add_argument(
+        "--duplicate-id-policy",
+        default="first",
+        choices=["first", "mean", "error"],
+        help=(
+            "How to handle duplicate IDs inside a split before scoring. "
+            "'mean' is kept as a backward-compatible alias for 'first'."
+        ),
+    )
+    parser.add_argument(
+        "--expected-order",
+        default="",
+        help=(
+            "Optional comma-separated split names from expected best to worst. "
+            "Used only for extra diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--score-task-name",
+        default="tdt_regen",
+        help="Prompt task name for prompt-aware scorers such as GPTScore/G-Eval.",
+    )
+    parser.add_argument(
+        "--score-aspect",
+        default="quality",
+        help="Prompt aspect for prompt-aware scorers such as GPTScore/G-Eval.",
+    )
+    parser.add_argument(
+        "--lower-is-better",
+        action="store_true",
+        help=(
+            "Use if a custom scorer returns lower-is-better values. Scores are "
+            "multiplied by -1 so all downstream metrics remain higher-is-better. "
+            "Do not use this for the current MetricX24 adapter because it already "
+            "returns higher-is-better by default."
+        ),
+    )
+    parser.add_argument(
+        "--skip-sanity-check",
+        action="store_true",
+        help="Skip scoring the static sanity-check texts before the eval.",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
-def attach_default_runtime_config(args: argparse.Namespace, device: torch.device) -> argparse.Namespace:
-    parsed_model_name, parsed_lan, pert_type, num_layers, training_ds_name = info_ds_parser(
-        args.model_name
-    )
 
-    try:
-        num_layers = int(num_layers)
-    except Exception:
-        num_layers = -1
+def attach_runtime_metadata(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> argparse.Namespace:
+    args.base_dir = Path(args.base_dir)
 
-    args.parsed_model_name = parsed_model_name
-    args.parsed_training_language = parsed_lan
-    args.perturbation_type = pert_type
-    args.num_layers = num_layers
-    args.training_dataset = training_ds_name
+    if getattr(args, "model_dir", ""):
+        args.model_dir = str(Path(args.model_dir))
 
-    # The user's max length is used for both fields.
-    args.context_length = args.max_length
-    args.max_seq_len = args.max_length
+    if args.context_length < 0:
+        args.context_length = args.max_length
 
-    # Internal defaults that are no longer user-facing CLI args.
-    args.group_by = "file"
-    args.duplicate_id_policy = "mean"
-    args.batch_size = 32
-    args.expected_order = ""
+    args.evaluator_model_name = args.model_name
+    args.training_language = ""
 
-    # Safer default on CPU. You can force bfloat16 here if your loader requires it.
-    args.dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    if args.scorer == "ltr":
+        try:
+            parsed_model_name, parsed_lan, pert_type, num_layers, training_ds_name = (
+                info_ds_parser(args.model_name)
+            )
 
-    # If flash_attention_2 is unavailable in your environment, use "eager".
-    args.attn_implementation = "flash_attention_2" if device.type == "cuda" else "eager"
+            args.evaluator_model_name = parsed_model_name
+            args.training_language = parsed_lan
+
+            if not args.perturbation_type:
+                args.perturbation_type = pert_type
+
+            if args.num_layers < 0:
+                try:
+                    args.num_layers = int(num_layers)
+                except Exception:
+                    args.num_layers = -1
+
+            if not args.training_dataset:
+                args.training_dataset = training_ds_name
+
+        except Exception as exc:
+            print(
+                f"Warning: could not parse LTR model name {args.model_name!r} "
+                f"with info_ds_parser: {exc}"
+            )
+
+    else:
+        if not args.training_dataset:
+            args.training_dataset = "none"
+
+        if not args.perturbation_type:
+            args.perturbation_type = "none"
+
+        if args.num_layers < 0:
+            args.num_layers = 0
+
+    # The default shared args use flash_attention_2. Avoid surprising CPU failure.
+    if device.type == "cpu" and args.attn_implementation == "flash_attention_2":
+        args.attn_implementation = "eager"
+
+    # Same practical safeguard for local torch models on CPU.
+    if device.type == "cpu" and args.dtype in {"bfloat16", "bf16", "float16", "fp16"}:
+        print(
+            f"CPU detected with dtype={args.dtype!r}; overriding to float32 "
+            "for safer local inference."
+        )
+        args.dtype = "float32"
 
     return args
 
-def discover_eval_folders(base_dir: Path) -> List[Path]:
-    base_dir = Path(base_dir)
 
-    if not base_dir.exists():
-        raise FileNotFoundError(f"Base directory does not exist: {base_dir}")
-
-    if not base_dir.is_dir():
-        raise NotADirectoryError(f"Base path is not a directory: {base_dir}")
-
-    eval_folders = []
-
-    for child in sorted(base_dir.iterdir()):
-        if not child.is_dir():
-            continue
-
-        # Skip output folders if someone points base-dir too low.
-        if child.name == "results":
-            continue
-
-        if list(child.glob("*_regens_*.jsonl")):
-            eval_folders.append(child)
-        else:
-            print(f"Skipping {child}: no *_regens_*.jsonl files found.")
-
-    if not eval_folders:
-        raise FileNotFoundError(
-            f"No language/eval subfolders with *_regens_*.jsonl files found in {base_dir}"
-        )
-
-    return eval_folders
-
-
-def main() -> None:
-    args = parse_args()
-
-    args.base_dir = Path(args.base_dir)
-    args.model_dir = Path(args.model_dir)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args = attach_default_runtime_config(args, device=device)
-
-    print(f"Device          : {device}")
-    print(f"Model dir       : {args.model_dir}")
-    print(f"Model name arg  : {args.model_name}")
-    print(f"Parsed model    : {args.parsed_model_name}")
-    print(f"Training lang   : {args.parsed_training_language}")
-    print(f"Training dataset: {args.training_dataset}")
-    print(f"Perturbation    : {args.perturbation_type}")
-    print(f"Num layers      : {args.num_layers}")
-    print(f"Max length      : {args.max_length}")
-    print(f"dtype           : {args.dtype}")
-    print(f"Base dir        : {args.base_dir}")
-    print()
-
-    eval_folders = discover_eval_folders(args.base_dir)
-
-    print("Evaluation folders:")
-    for folder in eval_folders:
-        print(f"  - {folder}")
-    print()
-
-    model = load_ltr_inference_model(
-        model_dir=args.model_dir,
-        device=device,
-        dtype=args.dtype,
-        attn_implementation=args.attn_implementation,
+def run_static_sanity_check(
+    model: TextScorer,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> None:
+    maybe_set_prompt_context(
+        model,
+        task_name=args.score_task_name,
+        aspect=args.score_aspect,
     )
 
     print("Running static sanity check texts:")
+
     for i, text in enumerate(STATIC_SANITY_TEXTS, start=1):
         print(f"  [{i}] {text}")
 
-    sanity_scores = model.score_texts(
+    scores = model.score_texts(
         STATIC_SANITY_TEXTS,
         device=device,
         batch_size=min(3, args.batch_size),
         max_length=min(args.max_length, 128),
     )
 
-    print("Static sanity check scores:", sanity_scores)
+    scores = np.asarray(scores, dtype=np.float64)
+
+    if args.lower_is_better:
+        scores = -scores
+
+    print("Static sanity check scores:", scores)
     print()
 
-    safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.model_name).strip("-")
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = attach_runtime_metadata(args, device=device)
+
+    print(f"Device          : {device}")
+    print(f"Scorer          : {args.scorer}")
+    print(f"Model name arg  : {args.model_name}")
+    print(f"Model path      : {scorer_model_path(args)}")
+    print(f"Parsed/eval name: {args.evaluator_model_name}")
+    print(f"Training lang   : {args.training_language}")
+    print(f"Training dataset: {args.training_dataset}")
+    print(f"Perturbation    : {args.perturbation_type}")
+    print(f"Num layers      : {args.num_layers}")
+    print(f"Max length      : {args.max_length}")
+    print(f"Batch size      : {args.batch_size}")
+    print(f"dtype           : {args.dtype}")
+    print(f"Base dir        : {args.base_dir}")
+    print(f"Prompt context  : task={args.score_task_name!r}, aspect={args.score_aspect!r}")
+    print()
+
+    languages = [
+        x.strip()
+        for x in args.languages.split(",")
+        if x.strip()
+    ]
+
+    eval_folders = discover_eval_folders(args.base_dir, languages=languages or None)
+
+    print("Evaluation folders:")
+
+    for folder in eval_folders:
+        print(f"  - {folder}")
+
+    print()
+
+    model = build_scorer(args, device)
+
+    if not args.skip_sanity_check:
+        run_static_sanity_check(model=model, device=device, args=args)
+
+    safe_run_name = safe_filename_part(f"{args.scorer}-{args.model_name}")
 
     for eval_folder in eval_folders:
         language = eval_folder.name
@@ -958,8 +1155,12 @@ def main() -> None:
                 f"{len(split_df)} rows, {split_df['id'].nunique()} unique IDs"
             )
 
-        results_dir = eval_folder / "results"
-        run_output_dir = results_dir / f"{safe_model_name}_{utc_timestamp_for_filename()}"
+        if args.output_dir:
+            results_dir = Path(args.output_dir) / language
+        else:
+            results_dir = eval_folder / "results"
+
+        run_output_dir = results_dir / f"{safe_run_name}_{utc_timestamp_for_filename()}"
 
         run_evaluation(
             model=model,
