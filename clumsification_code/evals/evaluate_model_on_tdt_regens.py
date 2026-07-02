@@ -191,6 +191,7 @@ def load_regen_rows(
                 continue
 
             generator_model = str(item.get("model", "unknown_model"))
+            generator_family = parse_model_family(generator_model)
             effort = str(item.get("effort", "unknown_effort"))
 
             rows.append(
@@ -205,6 +206,7 @@ def load_regen_rows(
                     "id": str(uid),
                     "text": text,
                     "generator_model": generator_model,
+                    "generator_family": generator_family,
                     "effort": effort,
                     "language": str(item.get("language", inferred_language)),
                     "source_file": str(regen_path),
@@ -391,6 +393,301 @@ def discover_eval_folders(
 # Scoring and metrics
 # ──────────────────────────────────────────────────────────────────────
 
+def parse_model_family(model_name: str) -> str:
+    name = clean_text(model_name).lower()
+    # Expected formats: gpt-5.4-mini, gemini-3-flash-preview
+    if name.startswith("gpt"):
+        return "gpt"
+    if name.startswith("gemini"):
+        return "gemini"
+
+    # Fallback if prefixes are not exact
+    m = re.match(r"^(gpt|gemini)\b", name)
+    if m:
+        return m.group(1)
+
+    return "other"
+
+
+def compute_model_summary_scores(scored_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (generator_family, generator_model) score stats and mean-based ranking
+    inside each family.
+    """
+    grouped = scored_df.groupby(["generator_family", "generator_model"], sort=True)
+
+    summary = grouped["score"].agg(
+        n="count",
+        mean="mean",
+        std="std",
+        median="median",
+        min="min",
+        max="max",
+    )
+    summary["std"] = summary["std"].fillna(0.0)
+    summary["sem"] = summary["std"] / np.sqrt(summary["n"].clip(lower=1))
+
+    summary["rank_by_mean"] = (
+        summary.groupby(level=0)["mean"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
+
+    return summary[
+        ["n", "mean", "std", "sem", "median", "min", "max", "rank_by_mean"]
+    ].sort_values(["generator_family", "rank_by_mean", "generator_model"])
+
+
+def build_family_model_score_maps(
+    scored_df: pd.DataFrame,
+    duplicate_id_policy: str = "first",
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Build nested dict:
+      family -> model -> {id -> score}
+    Duplicates within (family, model, id) are handled by policy.
+    """
+    valid_policies = {"first", "mean", "error"}
+
+    if duplicate_id_policy not in valid_policies:
+        raise ValueError(
+            f"duplicate_id_policy must be one of {sorted(valid_policies)}, "
+            f"got {duplicate_id_policy!r}"
+        )
+
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+    for (family, model_name), model_df in scored_df.groupby(
+        ["generator_family", "generator_model"], sort=True
+    ):
+        tmp = model_df[["id", "score"]].copy()
+        tmp["id"] = tmp["id"].astype(str)
+
+        dup_mask = tmp.duplicated(subset=["id"], keep=False)
+        if dup_mask.any():
+            n_dup_rows = int(dup_mask.sum())
+            n_dup_ids = int(tmp.loc[dup_mask, "id"].nunique())
+
+            if duplicate_id_policy == "error":
+                raise ValueError(
+                    f"Duplicate IDs for family/model ({family!r}, {model_name!r}): "
+                    f"{n_dup_ids} IDs / {n_dup_rows} rows."
+                )
+
+            if duplicate_id_policy == "mean":
+                tmp = tmp.groupby("id", as_index=False)["score"].mean()
+            else:
+                # "first" (also backward-compatible behavior)
+                print(
+                    f"Warning: duplicate IDs for family/model ({family!r}, {model_name!r}) "
+                    f"({n_dup_ids} IDs / {n_dup_rows} rows). Keeping first occurrence."
+                )
+                tmp = tmp.drop_duplicates(subset=["id"], keep="first")
+
+        score_map = {
+            str(row["id"]): float(row["score"])
+            for _, row in tmp.iterrows()
+            if math.isfinite(float(row["score"]))
+        }
+
+        out.setdefault(str(family), {})[str(model_name)] = score_map
+
+    return out
+
+
+def compute_pairwise_winrates_by_family(
+    family_model_scores: Dict[str, Dict[str, Dict[str, float]]],
+) -> pd.DataFrame:
+    rows = []
+
+    for family, model_scores in sorted(family_model_scores.items()):
+        models = sorted(model_scores.keys())
+
+        if len(models) < 2:
+            continue
+
+        for model_a, model_b in combinations(models, 2):
+            arr_a, arr_b, common_ids = align_scores(
+                model_scores[model_a], model_scores[model_b]
+            )
+            n = len(common_ids)
+
+            if n == 0:
+                rows.append(
+                    {
+                        "generator_family": family,
+                        "model_a": model_a,
+                        "model_b": model_b,
+                        "n_shared": 0,
+                        "wins_a": 0,
+                        "wins_b": 0,
+                        "ties": 0,
+                        "win_rate_a": np.nan,
+                        "win_rate_b": np.nan,
+                        "tie_rate": np.nan,
+                        "tie_aware_win_rate_a": np.nan,
+                        "tie_aware_win_rate_b": np.nan,
+                        "mean_delta_a_minus_b": np.nan,
+                        "median_delta_a_minus_b": np.nan,
+                        "binom_p": np.nan,
+                    }
+                )
+                continue
+
+            deltas = arr_a - arr_b
+            wins_a = int((deltas > 0).sum())
+            wins_b = int((deltas < 0).sum())
+            ties = int((deltas == 0).sum())
+            decisive = wins_a + wins_b
+
+            rows.append(
+                {
+                    "generator_family": family,
+                    "model_a": model_a,
+                    "model_b": model_b,
+                    "n_shared": n,
+                    "wins_a": wins_a,
+                    "wins_b": wins_b,
+                    "ties": ties,
+                    "win_rate_a": wins_a / n,
+                    "win_rate_b": wins_b / n,
+                    "tie_rate": ties / n,
+                    "tie_aware_win_rate_a": (wins_a + 0.5 * ties) / n,
+                    "tie_aware_win_rate_b": (wins_b + 0.5 * ties) / n,
+                    "mean_delta_a_minus_b": float(np.mean(deltas)),
+                    "median_delta_a_minus_b": float(np.median(deltas)),
+                    "binom_p": (
+                        float(scipy_stats.binomtest(wins_a, decisive, 0.5).pvalue)
+                        if decisive
+                        else 1.0
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def compute_pairwise_model_ranking(
+    pairwise_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Rank models within each family using average tie-aware pairwise win rate
+    against other models in the same family.
+    """
+    if pairwise_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "generator_family",
+                "generator_model",
+                "pairwise_matchups",
+                "avg_tie_aware_winrate_vs_others",
+                "avg_strict_winrate_vs_others",
+                "rank_by_pairwise_winrate",
+            ]
+        )
+
+    rows = []
+
+    for family, fam_df in pairwise_df.groupby("generator_family", sort=True):
+        per_model = []
+
+        models = sorted(set(fam_df["model_a"]).union(set(fam_df["model_b"])))
+
+        for model_name in models:
+            as_a = fam_df[fam_df["model_a"] == model_name][
+                ["tie_aware_win_rate_a", "win_rate_a"]
+            ].rename(
+                columns={
+                    "tie_aware_win_rate_a": "tie_aware_wr",
+                    "win_rate_a": "strict_wr",
+                }
+            )
+            as_b = fam_df[fam_df["model_b"] == model_name][
+                ["tie_aware_win_rate_b", "win_rate_b"]
+            ].rename(
+                columns={
+                    "tie_aware_win_rate_b": "tie_aware_wr",
+                    "win_rate_b": "strict_wr",
+                }
+            )
+
+            joined = pd.concat([as_a, as_b], ignore_index=True)
+
+            per_model.append(
+                {
+                    "generator_family": family,
+                    "generator_model": model_name,
+                    "pairwise_matchups": int(len(joined)),
+                    "avg_tie_aware_winrate_vs_others": float(
+                        joined["tie_aware_wr"].mean()
+                    )
+                    if len(joined)
+                    else np.nan,
+                    "avg_strict_winrate_vs_others": float(
+                        joined["strict_wr"].mean()
+                    )
+                    if len(joined)
+                    else np.nan,
+                }
+            )
+
+        fam_rank_df = pd.DataFrame(per_model)
+        fam_rank_df["rank_by_pairwise_winrate"] = (
+            fam_rank_df["avg_tie_aware_winrate_vs_others"]
+            .rank(ascending=False, method="min")
+            .astype(int)
+        )
+
+        rows.append(
+            fam_rank_df.sort_values(
+                ["rank_by_pairwise_winrate", "generator_model"]
+            )
+        )
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_pairwise_matrix_by_family(
+    family_model_scores: Dict[str, Dict[str, Dict[str, float]]],
+    value: str,
+) -> Dict[str, pd.DataFrame]:
+    valid_values = {"strict_winrate", "tie_aware_winrate", "mean_delta"}
+
+    if value not in valid_values:
+        raise ValueError(f"value must be one of {sorted(valid_values)}, got {value}")
+
+    out: Dict[str, pd.DataFrame] = {}
+
+    for family, model_scores in sorted(family_model_scores.items()):
+        models = sorted(model_scores)
+        matrix = pd.DataFrame(np.nan, index=models, columns=models)
+
+        for model_a, model_b in combinations(models, 2):
+            arr_a, arr_b, _ = align_scores(model_scores[model_a], model_scores[model_b])
+            n = len(arr_a)
+
+            if n == 0:
+                continue
+
+            deltas = arr_a - arr_b
+            wins_a = float((deltas > 0).sum())
+            wins_b = float((deltas < 0).sum())
+            ties = float((deltas == 0).sum())
+
+            if value == "strict_winrate":
+                matrix.loc[model_a, model_b] = wins_a / n
+                matrix.loc[model_b, model_a] = wins_b / n
+            elif value == "tie_aware_winrate":
+                matrix.loc[model_a, model_b] = (wins_a + 0.5 * ties) / n
+                matrix.loc[model_b, model_a] = (wins_b + 0.5 * ties) / n
+            else:
+                mean_delta = float(np.mean(deltas))
+                matrix.loc[model_a, model_b] = mean_delta
+                matrix.loc[model_b, model_a] = -mean_delta
+
+        out[family] = matrix
+
+    return out
 
 def score_dataframe(
     df: pd.DataFrame,
@@ -706,25 +1003,37 @@ def build_compact_record(
     args: argparse.Namespace,
     run_output_dir: Path,
     scored_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
-    expected_order_metrics: Dict[str, Any],
+    model_summary_df: pd.DataFrame,
+    pairwise_df: pd.DataFrame,
+    pairwise_rank_df: pd.DataFrame,
 ) -> Dict[str, Any]:
-    summary_sorted = summary_df.sort_values("rank_by_mean", ascending=True)
-    best_split = str(summary_sorted.index[0]) if len(summary_sorted) else None
+    model_summary_rows = model_summary_df.reset_index().to_dict("records")
+    pairwise_rows = pairwise_df.to_dict("records")
+    pairwise_rank_rows = pairwise_rank_df.to_dict("records")
 
-    split_mean_scores = {
-        str(split): float(row["mean"])
-        for split, row in summary_df.iterrows()
-    }
+    best_by_mean: Dict[str, Optional[str]] = {}
+    best_by_pairwise: Dict[str, Optional[str]] = {}
 
-    split_ranks_by_mean = {
-        str(split): int(row["rank_by_mean"])
-        for split, row in summary_df.iterrows()
-    }
+    if not model_summary_df.empty:
+        tmp = model_summary_df.reset_index()
+        for fam, fam_df in tmp.groupby("generator_family", sort=True):
+            fam_df = fam_df.sort_values(["rank_by_mean", "generator_model"])
+            best_by_mean[str(fam)] = (
+                str(fam_df.iloc[0]["generator_model"]) if len(fam_df) else None
+            )
+
+    if not pairwise_rank_df.empty:
+        for fam, fam_df in pairwise_rank_df.groupby("generator_family", sort=True):
+            fam_df = fam_df.sort_values(
+                ["rank_by_pairwise_winrate", "generator_model"]
+            )
+            best_by_pairwise[str(fam)] = (
+                str(fam_df.iloc[0]["generator_model"]) if len(fam_df) else None
+            )
 
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "eval_type": "tdt_regen_only",
+        "eval_type": "tdt_regen_familywise",
         "scorer": args.scorer,
         "model_name_arg": args.model_name,
         "evaluator_model_name": args.evaluator_model_name,
@@ -736,8 +1045,6 @@ def build_compact_record(
         "base_dir": str(args.base_dir),
         "data_folder": str(args.resolved_data_folder),
         "language": args.language,
-        "group_by": args.group_by,
-        "duplicate_id_policy": args.duplicate_id_policy,
         "batch_size": args.batch_size,
         "max_length": args.max_length,
         "context_length": args.context_length,
@@ -750,13 +1057,16 @@ def build_compact_record(
         else "higher_is_better",
         "run_output_dir": str(run_output_dir),
         "n_scored_texts": int(len(scored_df)),
-        "n_splits": int(len(summary_df)),
-        "best_split_by_mean": best_split,
-        "split_mean_scores": split_mean_scores,
-        "split_ranks_by_mean": split_ranks_by_mean,
+        "n_families": int(scored_df["generator_family"].nunique()),
+        "n_models": int(scored_df["generator_model"].nunique()),
+        "best_model_by_mean_per_family": best_by_mean,
+        "best_model_by_pairwise_winrate_per_family": best_by_pairwise,
+        # Easy to consume later in notebooks:
+        "model_summary_rows": model_summary_rows,
+        "pairwise_winrates_rows": pairwise_rows,
+        "pairwise_ranking_rows": pairwise_rank_rows,
     }
 
-    record.update(expected_order_metrics)
     return record
 
 
@@ -778,48 +1088,45 @@ def run_evaluation(
         lower_is_better=args.lower_is_better,
     )
 
-    summary_df = compute_summary_scores(scored_df)
-    scored = scores_by_split_and_id(scored_df)
+    model_summary_df = compute_model_summary_scores(scored_df)
 
-    pairwise_df = compute_pairwise_winrates(scored)
-    strict_matrix = build_pairwise_matrix(scored, "strict_winrate")
-    tie_aware_matrix = build_pairwise_matrix(scored, "tie_aware_winrate")
-    mean_delta_matrix = build_pairwise_matrix(scored, "mean_delta")
+    family_model_scores = build_family_model_score_maps(
+        scored_df,
+        duplicate_id_policy=args.duplicate_id_policy,
+    )
+    pairwise_df = compute_pairwise_winrates_by_family(family_model_scores)
+    pairwise_rank_df = compute_pairwise_model_ranking(pairwise_df)
 
-    expected_order_metrics: Dict[str, Any] = {}
-
-    if args.expected_order:
-        expected_order_metrics = compute_expected_order_metrics(
-            expected_order=[
-                x.strip()
-                for x in args.expected_order.split(",")
-                if x.strip()
-            ],
-            scored=scored,
-            summary_df=summary_df,
-        )
+    strict_mats = build_pairwise_matrix_by_family(
+        family_model_scores, value="strict_winrate"
+    )
+    tie_aware_mats = build_pairwise_matrix_by_family(
+        family_model_scores, value="tie_aware_winrate"
+    )
+    mean_delta_mats = build_pairwise_matrix_by_family(
+        family_model_scores, value="mean_delta"
+    )
 
     print("\n" + "=" * 70)
-    print("PER-SPLIT AVERAGE QUALITY SCORES")
+    print("PER-MODEL SCORE SUMMARY (within families)")
     print("=" * 70)
-    print(summary_df.to_string())
+    print(model_summary_df.to_string())
 
     print("\n" + "=" * 70)
-    print("PAIRWISE WIN RATES")
+    print("PAIRWISE WIN RATES (within families only)")
     print("=" * 70)
-    print(pairwise_df.to_string(index=False))
+    if len(pairwise_df):
+        print(pairwise_df.to_string(index=False))
+    else:
+        print("No within-family model pairs available.")
 
     print("\n" + "=" * 70)
-    print("TIE-AWARE WIN-RATE MATRIX — row beats column")
+    print("PAIRWISE-BASED MODEL RANKING (within families)")
     print("=" * 70)
-    print(tie_aware_matrix.to_string())
-
-    if expected_order_metrics:
-        print("\n" + "=" * 70)
-        print("EXPECTED ORDER METRICS")
-        print("=" * 70)
-        for key, value in expected_order_metrics.items():
-            print(f"  {key}: {value}")
+    if len(pairwise_rank_df):
+        print(pairwise_rank_df.to_string(index=False))
+    else:
+        print("No pairwise ranking available.")
 
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -829,23 +1136,32 @@ def run_evaluation(
         lines=True,
         force_ascii=False,
     )
-    summary_df.to_csv(run_output_dir / "summary_scores.csv")
-    pairwise_df.to_csv(run_output_dir / "pairwise_winrates.csv", index=False)
-    strict_matrix.to_csv(run_output_dir / "strict_winrate_matrix.csv")
-    tie_aware_matrix.to_csv(run_output_dir / "tie_aware_winrate_matrix.csv")
-    mean_delta_matrix.to_csv(run_output_dir / "mean_delta_matrix.csv")
+    model_summary_df.to_csv(run_output_dir / "model_summary_scores.csv")
+    pairwise_df.to_csv(run_output_dir / "pairwise_winrates_by_family.csv", index=False)
+    pairwise_rank_df.to_csv(
+        run_output_dir / "pairwise_ranking_by_family.csv", index=False
+    )
+
+    for family, mat in strict_mats.items():
+        mat.to_csv(run_output_dir / f"strict_winrate_matrix_{safe_filename_part(family)}.csv")
+    for family, mat in tie_aware_mats.items():
+        mat.to_csv(run_output_dir / f"tie_aware_winrate_matrix_{safe_filename_part(family)}.csv")
+    for family, mat in mean_delta_mats.items():
+        mat.to_csv(run_output_dir / f"mean_delta_matrix_{safe_filename_part(family)}.csv")
 
     compact_record = build_compact_record(
         args=args,
         run_output_dir=run_output_dir,
         scored_df=scored_df,
-        summary_df=summary_df,
-        expected_order_metrics=expected_order_metrics,
+        model_summary_df=model_summary_df,
+        pairwise_df=pairwise_df,
+        pairwise_rank_df=pairwise_rank_df,
     )
 
     with (run_output_dir / "compact_summary.json").open("w", encoding="utf-8") as writer:
         json.dump(json_sanitize(compact_record), writer, ensure_ascii=False, indent=2)
 
+    # Keep this behavior: one JSONL per evaluator/scorer combo
     jsonl_path = append_compact_jsonl(
         log_dir=run_output_dir.parent,
         run_name=f"{args.scorer}-{args.model_name}",
@@ -857,12 +1173,12 @@ def run_evaluation(
 
     return {
         "scored_df": scored_df,
-        "summary_df": summary_df,
+        "model_summary_df": model_summary_df,
         "pairwise_df": pairwise_df,
-        "strict_matrix": strict_matrix,
-        "tie_aware_matrix": tie_aware_matrix,
-        "mean_delta_matrix": mean_delta_matrix,
-        "expected_order_metrics": expected_order_metrics,
+        "pairwise_rank_df": pairwise_rank_df,
+        "strict_mats": strict_mats,
+        "tie_aware_mats": tie_aware_mats,
+        "mean_delta_mats": mean_delta_mats,
         "compact_record": compact_record,
     }
 
@@ -1138,21 +1454,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             f"{data_df['split'].nunique()} raw splits."
         )
 
-        data_df = restrict_to_common_regen_ids(
-            data_df,
-            duplicate_id_policy=run_args.duplicate_id_policy,
-        )
-
         print(
-            f"After filtering to common regeneration IDs: "
-            f"{len(data_df)} texts across {data_df['split'].nunique()} splits."
+            f"Loaded {len(data_df)} regenerated texts across "
+            f"{data_df['generator_family'].nunique()} families and "
+            f"{data_df['generator_model'].nunique()} models."
         )
-        print("Every split now has the same IDs in the same reference order:")
 
-        for split_name, split_df in data_df.groupby("split", sort=True):
+        for fam, fam_df in data_df.groupby("generator_family", sort=True):
             print(
-                f"  {split_name}: "
-                f"{len(split_df)} rows, {split_df['id'].nunique()} unique IDs"
+                f"  Family={fam}: {fam_df['generator_model'].nunique()} models, "
+                f"{len(fam_df)} texts"
             )
 
         if args.output_dir:
