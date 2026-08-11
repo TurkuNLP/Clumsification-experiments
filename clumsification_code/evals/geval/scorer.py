@@ -176,6 +176,10 @@ class GEvalScorer:
             return {"type": "json_object"}
 
         return None
+    
+    def set_prompt_context(self, task_name: str, aspect: str) -> None:
+        self.task = task_name
+        self.aspect = aspect
 
     async def _score_one_uncached_async(self, text: str) -> Dict[str, Any]:
         messages = self._build_messages(text)
