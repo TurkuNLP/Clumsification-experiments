@@ -7,7 +7,10 @@ import os
 
 from datasets import Dataset, DatasetDict, load_from_disk
 
-from clumsification_code.data.format_dataset import format_custom_dataset
+from clumsification_code.data.format_dataset import (
+    format_custom_dataset,
+    scored_original_ids,
+)
 from clumsification_code.data.pairing import generate_training_pairs_random
 from clumsification_code.data.splitting import (
     assert_no_original_id_leakage,
@@ -143,6 +146,7 @@ def create_formatted_dataset_dict(
     downsample_size: Optional[int] = None,
     heldout_ratio: float = 0.3,
     test_ratio_within_heldout: float = 0.5,
+    score_names: Optional[list[str]] = None,
     return_metadata: bool = False,
 ):
     """
@@ -154,11 +158,33 @@ def create_formatted_dataset_dict(
     if not dataset_names:
         raise ValueError("At least one dataset name must be supplied.")
 
+    score_name_filter = set(score_names) if score_names is not None else None
+    if score_name_filter is not None and not score_name_filter:
+        raise ValueError("score_names must not be empty when supplied.")
+
+    eligible_original_ids = None
+    if score_name_filter is not None:
+        layer_folders = {
+            "clumsy": {"perturbed_layers"},
+            "trad": {"trad_perturbed_layers"},
+            "mix": {"perturbed_layers", "trad_perturbed_layers"},
+            "all": {"perturbed_layers", "trad_perturbed_layers"},
+        }[layer_type]
+        eligible_original_ids = {
+            dataset_name: scored_original_ids(
+                dataset_name,
+                layer_folders=layer_folders,
+                score_names=score_name_filter,
+            )
+            for dataset_name in dataset_names
+        }
+
     split_ids = split_original_ids_by_dataset(
         dataset_names=dataset_names,
         heldout_ratio=heldout_ratio,
         test_ratio_within_heldout=test_ratio_within_heldout,
         seed=seed,
+        eligible_original_ids=eligible_original_ids,
     )
     assert_no_original_id_leakage(split_ids)
 
@@ -222,6 +248,9 @@ def create_formatted_dataset_dict(
         "split_strategy": "original_custom_id_group_split_before_formatting",
         "split_original_ids": split_ids_to_metadata(split_ids),
         "score_fields": score_names,
+        "score_aware_split_fields": sorted(score_name_filter)
+        if score_name_filter is not None
+        else None,
         "num_original_ids": {
             split_name: {
                 dataset_name: len(ids)

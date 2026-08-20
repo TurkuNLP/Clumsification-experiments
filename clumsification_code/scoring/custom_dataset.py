@@ -387,6 +387,9 @@ def score_custom_dataset(
         seed=seed,
     )
     score_dir = dataset_dir / "scores"
+    # Keep scores from the two perturbation sources separate.  The same method
+    # can therefore be run for both folders without overwriting either result.
+    score_dir = score_dir / layer_directory
     score_path = score_dir / f"{scoring_type}.jsonl"
     error_path = score_dir / f"{scoring_type}.errors.jsonl"
     metadata_path = score_dir / f"{scoring_type}.metadata.json"
@@ -427,6 +430,7 @@ def score_custom_dataset(
     score_rows = [
         {
             "base_text_id": task.base_text_id,
+            "source_folder": layer_directory,
             "source_layer": task.source_layer,
             "target_layer": task.target_layer,
             "score_name": scoring_type,
@@ -438,6 +442,7 @@ def score_custom_dataset(
     error_rows = [
         {
             "base_text_id": failure.task.base_text_id,
+            "source_folder": layer_directory,
             "source_layer": failure.task.source_layer,
             "target_layer": failure.task.target_layer,
             "score_name": scoring_type,

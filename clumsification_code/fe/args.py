@@ -12,6 +12,16 @@ def _add_dataset_creation_args(parser: argparse.ArgumentParser) -> None:
                         choices=["clumsy", "trad", "mix", "all"],
                         help="The perturbation type to use.")
     parser.add_argument("--max-layers", type=int, default=None)
+    parser.add_argument(
+        "--score-names",
+        nargs="+",
+        type=str,
+        default=None,
+        help=(
+            "Score fields that must be present when splitting source IDs. Use this "
+            "when creating a regression dataset from a partially scored custom dataset."
+        ),
+    )
     parser.add_argument("--downsample-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--random-pairs", action="store_true", default=False,

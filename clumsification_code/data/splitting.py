@@ -7,6 +7,7 @@ def split_original_ids_by_dataset(
     heldout_ratio: float = 0.3,
     test_ratio_within_heldout: float = 0.5,
     seed: int = 42,
+    eligible_original_ids: dict[str, set[int]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """
     Split stable original-document IDs, not generated training examples.
@@ -31,6 +32,15 @@ def split_original_ids_by_dataset(
 
     for ds_name in dataset_names:
         original_ids = sorted(_read_originals_by_custom_id(ds_name).keys())
+        if eligible_original_ids is not None:
+            requested_ids = eligible_original_ids.get(ds_name, set())
+            unknown_ids = requested_ids - set(original_ids)
+            if unknown_ids:
+                raise ValueError(
+                    f"{ds_name}: eligible score IDs are not present in original.jsonl: "
+                    f"{sorted(unknown_ids)[:20]}"
+                )
+            original_ids = sorted(requested_ids)
         groups.extend((ds_name, original_id) for original_id in original_ids)
 
     if len(groups) < 3:

@@ -4,6 +4,7 @@ import math
 import numbers
 import os
 import random
+from pathlib import Path
 from typing import Optional
 
 from clumsification_code.data.io import read_ds
@@ -76,6 +77,95 @@ def _read_originals_by_custom_id(custom_dataset_name: str) -> dict[int, dict]:
     return originals_by_id
 
 
+def load_external_scores(
+    custom_dataset_name: str,
+) -> dict[tuple[str, int, int], dict[str, float]]:
+    """Read successful score JSONL files keyed by source folder, ID, and layer.
+
+    Score files are intentionally separate from raw texts.  ``source_folder``
+    makes scores for ``perturbed_layers`` and ``trad_perturbed_layers``
+    unambiguous even when they share the same original ID and numeric layer.
+    Error files are never read as supervision.
+    """
+    score_root = Path("data") / "custom_datasets" / custom_dataset_name / "scores"
+    if not score_root.is_dir():
+        return {}
+
+    scores: dict[tuple[str, int, int], dict[str, float]] = {}
+    for score_path in sorted(score_root.rglob("*.jsonl")):
+        if score_path.name.endswith(".errors.jsonl"):
+            continue
+
+        for row_no, row in enumerate(read_ds(str(score_path)), start=1):
+            required_fields = {
+                "base_text_id",
+                "source_folder",
+                "source_layer",
+                "target_layer",
+                "score_name",
+                "score_value",
+            }
+            missing_fields = required_fields - set(row)
+            if missing_fields:
+                raise ValueError(
+                    f"{score_path}:{row_no} is missing score field(s): "
+                    f"{sorted(missing_fields)}. Re-run scoring to produce the "
+                    "current score schema."
+                )
+
+            source_folder = row["source_folder"]
+            score_name = row["score_name"]
+            if not isinstance(source_folder, str) or not source_folder:
+                raise ValueError(f"{score_path}:{row_no}: source_folder must be a string.")
+            if not isinstance(score_name, str) or not score_name:
+                raise ValueError(f"{score_path}:{row_no}: score_name must be a string.")
+            source_layer = _coerce_custom_id(
+                row["source_layer"], context=f"{score_path}:{row_no}:source_layer"
+            )
+            if source_layer != 0:
+                raise ValueError(
+                    f"{score_path}:{row_no}: source_layer must be 0 when scores "
+                    "are aligned to original texts."
+                )
+            base_text_id = _coerce_custom_id(
+                row["base_text_id"], context=f"{score_path}:{row_no}:base_text_id"
+            )
+            target_layer = _coerce_custom_id(
+                row["target_layer"], context=f"{score_path}:{row_no}:target_layer"
+            )
+            score_value = row["score_value"]
+            if isinstance(score_value, bool) or not isinstance(score_value, numbers.Real):
+                raise ValueError(f"{score_path}:{row_no}: score_value must be numeric.")
+            if not math.isfinite(float(score_value)):
+                raise ValueError(f"{score_path}:{row_no}: score_value must be finite.")
+
+            key = (source_folder, base_text_id, target_layer)
+            score_dict = scores.setdefault(key, {})
+            if score_name in score_dict:
+                raise ValueError(
+                    f"Duplicate score {score_name!r} for {key} in {score_path}:{row_no}."
+                )
+            score_dict[score_name] = float(score_value)
+
+    return scores
+
+
+def scored_original_ids(
+    custom_dataset_name: str,
+    *,
+    layer_folders: set[str],
+    score_names: Optional[set[str]] = None,
+) -> set[int]:
+    """Return source IDs that have at least one requested usable score."""
+    external_scores = load_external_scores(custom_dataset_name)
+    return {
+        original_id
+        for (source_folder, original_id, _), score_dict in external_scores.items()
+        if source_folder in layer_folders
+        and (score_names is None or score_names & set(score_dict))
+    }
+
+
 # Historical generic formatter retained for callers outside the FE pipeline.
 def format_datasets(dss: list[dict[str]]):
     ds_items = []
@@ -137,6 +227,7 @@ def format_custom_dataset(
     """
     work_path = os.path.join("data", "custom_datasets", custom_dataset_name)
     originals_by_id = _read_originals_by_custom_id(custom_dataset_name)
+    external_scores = load_external_scores(custom_dataset_name)
     all_original_ids = set(originals_by_id)
 
     if original_id_filter is not None:
@@ -221,12 +312,20 @@ def format_custom_dataset(
                     continue
 
                 id_dict[head_id]["text_label_pairs"].append((row["text"], layer))
-                id_dict[head_id]["item_score_dicts"].append(
-                    _extract_numeric_scores(
-                        row,
-                        excluded_fields={"head_id", "text"},
-                    )
+                item_scores = _extract_numeric_scores(
+                    row,
+                    excluded_fields={"head_id", "text"},
                 )
+                score_key = (layer_dir, head_id, layer)
+                for score_name, score_value in external_scores.get(score_key, {}).items():
+                    if score_name in item_scores:
+                        raise ValueError(
+                            f"{custom_dataset_name}/{layer_dir}/{file_name}:{row_no} "
+                            f"contains score {score_name!r} both in the text row and "
+                            "the external score file."
+                        )
+                    item_scores[score_name] = score_value
+                id_dict[head_id]["item_score_dicts"].append(item_scores)
 
         if missing_head_ids:
             raise ValueError(

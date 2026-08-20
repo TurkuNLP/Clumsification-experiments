@@ -37,7 +37,7 @@ The critical boundary is the formatted Hugging Face dataset. Everything before i
 `scripts/create_fe_training_dataset.py` is the entry point. It calls:
 
 1. `data/splitting.py` to split original document IDs before examples are constructed, preventing document leakage.
-2. `data/format_dataset.py` to align each original with perturbation layers and optional numeric score fields.
+2. `data/format_dataset.py` to align each original with perturbation layers and external score JSONLs. Score rows are matched by source folder, original ID, and layer.
 3. `data/pairing.py` when random training pairs are requested.
 4. `data/hf_dataset.py` to produce and save a `DatasetDict` containing `train`, `dev`, and `test`.
 
@@ -53,13 +53,19 @@ original IDs first, then scores every perturbation belonging to each selected
 original.
 
 Successful score rows use the stable fields `base_text_id`, `source_layer`,
-`target_layer`, `score_name`, and `score_value`.  Originals are not self-scored
+`target_layer`, `score_name`, and `score_value`, plus `source_folder` to
+identify the perturbation folder. Originals are not self-scored
 and therefore have no score row.  Failures are written separately to
 `<score_name>.errors.jsonl`, while `<score_name>.metadata.json` records the
 model, direction/transform, seed, selected IDs, and library versions.  All
 stored score values use the convention **higher is better**: BERTScore F1 is
 stored directly using Hugging Face Evaluate's normal defaults, BLEURT is stored
 directly, while perplexity is transformed to `-log(perplexity)`.
+
+When only part of a custom dataset has a given score, pass `--score-names` to
+`scripts/create_fe_training_dataset.py`. The split is then made only over
+original IDs with at least one requested score in the selected perturbation
+folder(s), ensuring regression examples are distributed across train/dev/test.
 
 ### 2. Train an FE model
 

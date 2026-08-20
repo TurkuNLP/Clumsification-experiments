@@ -42,9 +42,19 @@ python scripts/score_custom_dataset.py \
 BLEURT defaults to its authors' recommended `BLEURT-20` checkpoint; override
 it with `--bleurt-checkpoint` when necessary.
 
-Each command creates `scores/<method>.jsonl`, an accompanying error JSONL, and
-a metadata file within the selected custom dataset.  Score JSONL contains only
+Each command creates `scores/<perturbation-folder>/<method>.jsonl`, an
+accompanying error JSONL, and a metadata file within the selected custom
+dataset. Score JSONL contains only
 successful candidate scores; originals are not self-scored.  Every stored value
 is higher-is-better: BERTScore is the Hugging Face Evaluate metric's raw F1
 using its normal defaults for the selected language, BLEURT is used directly,
 and perplexity is stored as `-log(perplexity)`.
+
+When creating a regression dataset from partial scores, identify the score that
+will be trained on so its source documents are split correctly:
+
+```bash
+python scripts/create_fe_training_dataset.py \
+  --custom-datasets <dataset> \
+  --score-names bleurt
+```

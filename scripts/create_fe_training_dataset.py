@@ -1,5 +1,12 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 import os
+from pathlib import Path
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from clumsification_code.fe.args import parse_ds_create_args
 from clumsification_code.fe.utils import configure_logging, logger
@@ -39,6 +46,7 @@ def main():
     logger.info(f"reuse_limit={args.reuse_limit}")
     logger.info(f"seed={args.seed}")
     logger.info(f"downsample_size={args.downsample_size}")
+    logger.info(f"score_names={args.score_names}")
 
     dataset_dict, split_metadata = create_formatted_dataset_dict(
         dataset_names=args.custom_datasets,
@@ -50,6 +58,7 @@ def main():
         downsample_size=args.downsample_size,
         heldout_ratio=args.heldout_ratio,
         test_ratio_within_heldout=args.test_ratio_within_heldout,
+        score_names=args.score_names,
         return_metadata=True,
     )
 
@@ -64,6 +73,7 @@ def main():
         "downsample_size": args.downsample_size,
         "heldout_ratio": args.heldout_ratio,
         "test_ratio_within_heldout": args.test_ratio_within_heldout,
+        "score_names": args.score_names,
         "num_train": len(dataset_dict["train"]),
         "num_dev": len(dataset_dict["dev"]),
         "num_test": len(dataset_dict["test"]),

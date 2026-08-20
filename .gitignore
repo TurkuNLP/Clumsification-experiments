@@ -23,6 +23,7 @@ figures*/
 *.patch
 *_mcq_*
 *(Copy)*
+test_folder*/
 
 edu_filtering.py
 extract_jsons_P.py
