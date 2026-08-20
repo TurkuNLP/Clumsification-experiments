@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from vllm import LLM, SamplingParams
 from vllm.config import ReasoningConfig
 import json

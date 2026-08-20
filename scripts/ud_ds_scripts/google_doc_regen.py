@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 import argparse
@@ -59,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--lan",
+        "--language",
         type=str,
         required=True,
         help="Target language code, e.g. en, fi, sv, es.",
@@ -172,7 +173,7 @@ def safe_filename_part(value: str) -> str:
 
 
 def input_path(args: argparse.Namespace) -> Path:
-    return args.base_folder / args.lan / "ud_data.jsonl"
+    return args.base_folder / args.language / "ud_data.jsonl"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -392,7 +393,7 @@ def make_batch_request(
 
     The key is critical for rejoining outputs to inputs.
     """
-    prompt = make_prompt(document, args.lan)
+    prompt = make_prompt(document, args.language)
     generation_config = make_generation_config(args)
 
     if args.json_key_style == "camel":
@@ -537,7 +538,7 @@ def submit_batch(args: argparse.Namespace) -> None:
         "batch_name": batch_job.name,
         "batch_state": get_state_name(batch_job),
         "model": args.model,
-        "language": args.lan,
+        "language": args.language,
         "source_path": str(source_path),
         "output_path": str(output_path),
         "batch_input_path": str(batch_input_path),

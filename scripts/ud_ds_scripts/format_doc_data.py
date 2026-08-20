@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 #Imports
 import os
 import argparse
@@ -256,9 +257,9 @@ def parse_conllu_en(folder_path: str):
 
 #Writer
 
-def write_jsonl(data: list, base_folder: str, lan: str, overwrite:bool=False):
+def write_jsonl(data: list, base_folder: str, language: str, overwrite:bool=False):
 
-    f_path = base_folder+lan+"/ud_data.jsonl"
+    f_path = base_folder+language+"/ud_data.jsonl"
 
     if not os.path.exists(f_path) or overwrite:
         with open(f_path, 'w') as writer:

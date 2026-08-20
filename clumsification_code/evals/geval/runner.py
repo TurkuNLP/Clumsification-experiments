@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 from typing import Any, Iterable, Optional

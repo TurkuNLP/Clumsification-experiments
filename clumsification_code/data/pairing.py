@@ -1,6 +1,7 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 import random
-from typing import Optional
 from collections import defaultdict
+from typing import Optional
 
 
 def generate_training_pairs_random(
@@ -9,24 +10,32 @@ def generate_training_pairs_random(
     n: int = 5,
 ):
     """
-    Construct random two-item training examples without materializing all
-    O(num_items^2) possible pairs.
+    Construct random two-item pairwise examples.
 
-    Each individual text may be reused at most n times.
-
-    The caller is responsible for passing only one train/dev/test split at a
-    time. create_formatted_dataset_dict() now does that.
+    Score dictionaries are retained and remain aligned with the two selected
+    texts. Pair selection itself still uses the existing perturbation-layer
+    labels, preserving current pairwise behaviour.
     """
     rng = random.Random(seed)
-
     items = []
 
     for entry in formatted_dataset:
         entry_id = entry["id"]
         source_original_ids = list(entry.get("source_original_ids", []))
         dataset_name = entry.get("dataset_name")
+        text_label_pairs = entry["text_label_pairs"]
+        item_score_dicts = entry.get(
+            "item_score_dicts",
+            [{} for _ in text_label_pairs],
+        )
 
-        for text, label in entry["text_label_pairs"]:
+        if len(text_label_pairs) != len(item_score_dicts):
+            raise ValueError(
+                f"Entry {entry_id!r} has misaligned text_label_pairs and "
+                "item_score_dicts."
+            )
+
+        for (text, label), score_dict in zip(text_label_pairs, item_score_dicts):
             items.append(
                 {
                     "source_id": entry_id,
@@ -34,6 +43,7 @@ def generate_training_pairs_random(
                     "source_original_ids": source_original_ids,
                     "text": text,
                     "label": label,
+                    "score_dict": score_dict,
                 }
             )
 
@@ -42,8 +52,8 @@ def generate_training_pairs_random(
 
     by_label = defaultdict(list)
 
-    for idx, item in enumerate(items):
-        by_label[item["label"]].append(idx)
+    for index, item in enumerate(items):
+        by_label[item["label"]].append(index)
 
     if len(by_label) < 2:
         return []
@@ -57,20 +67,19 @@ def generate_training_pairs_random(
     max_failed_attempts = max(1000, max_pairs * 50)
 
     def available_indices_for_label(label):
-        return [idx for idx in by_label[label] if usage[idx] < n]
+        return [index for index in by_label[label] if usage[index] < n]
 
     while len(result) < max_pairs and failed_attempts < max_failed_attempts:
         available_labels = [
             label
             for label in by_label
-            if len(available_indices_for_label(label)) > 0
+            if available_indices_for_label(label)
         ]
 
         if len(available_labels) < 2:
             break
 
         label_a, label_b = rng.sample(available_labels, 2)
-
         candidates_a = available_indices_for_label(label_a)
         candidates_b = available_indices_for_label(label_b)
 
@@ -78,14 +87,14 @@ def generate_training_pairs_random(
             failed_attempts += 1
             continue
 
-        i = rng.choice(candidates_a)
-        j = rng.choice(candidates_b)
+        index_a = rng.choice(candidates_a)
+        index_b = rng.choice(candidates_b)
 
-        if i == j:
+        if index_a == index_b:
             failed_attempts += 1
             continue
 
-        pair_key = tuple(sorted((i, j)))
+        pair_key = tuple(sorted((index_a, index_b)))
 
         if pair_key in seen_pairs:
             failed_attempts += 1
@@ -93,30 +102,32 @@ def generate_training_pairs_random(
 
         seen_pairs.add(pair_key)
 
-        item_i = items[i]
-        item_j = items[j]
-
-        usage[i] += 1
-        usage[j] += 1
-
-        combined_id = (
-            f"{item_i['source_id']}__{item_j['source_id']}__pair_{len(result)}"
-        )
+        item_a = items[index_a]
+        item_b = items[index_b]
+        usage[index_a] += 1
+        usage[index_b] += 1
 
         source_original_ids = sorted(
-            set(item_i["source_original_ids"])
-            | set(item_j["source_original_ids"])
+            set(item_a["source_original_ids"])
+            | set(item_b["source_original_ids"])
         )
 
         result.append(
             {
-                "id": combined_id,
-                "dataset_name": item_i.get("dataset_name"),
+                "id": (
+                    f"{item_a['source_id']}__{item_b['source_id']}__"
+                    f"pair_{len(result)}"
+                ),
+                "dataset_name": item_a.get("dataset_name"),
                 "source_original_ids": source_original_ids,
-                "source_example_ids": [item_i["source_id"], item_j["source_id"]],
+                "source_example_ids": [item_a["source_id"], item_b["source_id"]],
                 "text_label_pairs": [
-                    (item_i["text"], item_i["label"]),
-                    (item_j["text"], item_j["label"]),
+                    (item_a["text"], item_a["label"]),
+                    (item_b["text"], item_b["label"]),
+                ],
+                "item_score_dicts": [
+                    dict(item_a["score_dict"]),
+                    dict(item_b["score_dict"]),
                 ],
             }
         )

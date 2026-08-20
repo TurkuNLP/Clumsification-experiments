@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 #Testing code that has been used when playing around with some test datasets
 #Not used anywhere in the shared code
 import random
@@ -37,4 +38,3 @@ def sample_reference_corpus(dict_list, reference_name, reference_size):
                  d.get('under_collection_id') not in sampled_collection_ids]
     
     return sampled, remaining
-

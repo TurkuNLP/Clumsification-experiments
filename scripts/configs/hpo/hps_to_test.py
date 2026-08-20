@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 HPS_TO_TEST = [
     {
         "trial_id": 0,

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 import argparse
@@ -20,7 +21,7 @@ from clumsification_code.evals.run_benchmark import (
     add_gptscore_args,
     add_metricx_args,
     build_scorer,
-    info_ds_parser,
+    parse_evaluation_run_name,
 )
 
 
@@ -102,7 +103,7 @@ def maybe_set_prompt_context(
 ) -> None:
     """
     GPTScore/G-Eval-style scorers can optionally expose set_prompt_context().
-    LTR and MetricX simply ignore this.
+    FE and MetricX simply ignore this.
     """
     setter = getattr(model, "set_prompt_context", None)
     if callable(setter):
@@ -1303,14 +1304,14 @@ def attach_runtime_metadata(
     args.evaluator_model_name = args.model_name
     args.training_language = ""
 
-    if args.scorer == "ltr":
+    if args.scorer == "fe":
         try:
-            parsed_model_name, parsed_lan, pert_type, num_layers, training_ds_name = (
-                info_ds_parser(args.model_name)
+            parsed_model_name, parsed_language, pert_type, num_layers, training_ds_name = (
+                parse_evaluation_run_name(args.model_name)
             )
 
             args.evaluator_model_name = parsed_model_name
-            args.training_language = parsed_lan
+            args.training_language = parsed_language
 
             if not args.perturbation_type:
                 args.perturbation_type = pert_type
@@ -1326,8 +1327,8 @@ def attach_runtime_metadata(
 
         except Exception as exc:
             print(
-                f"Warning: could not parse LTR model name {args.model_name!r} "
-                f"with info_ds_parser: {exc}"
+                f"Warning: could not parse FE model name {args.model_name!r} "
+                f"with parse_evaluation_run_name: {exc}"
             )
 
     else:

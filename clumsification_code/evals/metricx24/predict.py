@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # coding=utf-8
 # Copyright 2024 Google LLC
 #
@@ -25,7 +26,7 @@ import transformers
 
 
 @dataclasses.dataclass
-class Arguments:
+class PredictionArguments:
   """Prediction command-line arguments."""
 
   tokenizer: str = dataclasses.field(
@@ -126,7 +127,7 @@ def get_dataset(
 
 
 def main() -> None:
-  parser = transformers.HfArgumentParser(Arguments)
+  parser = transformers.HfArgumentParser(PredictionArguments)
   (args,) = parser.parse_args_into_dataclasses()
 
   if torch.cuda.is_available():

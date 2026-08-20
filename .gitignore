@@ -22,6 +22,7 @@ clumsification_code/evals/sanity
 figures*/
 *.patch
 *_mcq_*
+*(Copy)*
 
 edu_filtering.py
 extract_jsons_P.py

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # coding=utf-8
 # Copyright 2024 Google LLC
 #
@@ -28,7 +29,7 @@ import transformers
 
 
 @dataclasses.dataclass
-class Arguments:
+class EvaluationArguments:
   dataset: str = dataclasses.field(metadata={"help": "The MTME dataset."})
 
   lp: str = dataclasses.field(metadata={"help": "The language pair."})
@@ -75,7 +76,7 @@ def _convert_to_matrices(
 
 
 def main() -> None:
-  parser = transformers.HfArgumentParser(Arguments)
+  parser = transformers.HfArgumentParser(EvaluationArguments)
   (args,) = parser.parse_args_into_dataclasses()
 
   # Download MTME data

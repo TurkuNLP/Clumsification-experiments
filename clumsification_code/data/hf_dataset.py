@@ -1,68 +1,77 @@
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
+import json
 import random
-from typing import Optional
-from clumsification_code.data.format_dataset import *
-from clumsification_code.data.splitting import *
 import shutil
+from typing import Optional
+import os
+
+from datasets import Dataset, DatasetDict, load_from_disk
+
+from clumsification_code.data.format_dataset import format_custom_dataset
+from clumsification_code.data.pairing import generate_training_pairs_random
+from clumsification_code.data.splitting import (
+    assert_no_original_id_leakage,
+    split_ids_to_metadata,
+    split_original_ids_by_dataset,
+)
 
 
 def shuffle_and_transform_formatted_dataset(
     formatted_dataset: list[dict],
+    score_names: list[str],
     seed: Optional[int] = None,
 ):
     """
-    Convert list records of this form:
+    Convert chain records into a Hugging Face Dataset.
 
-        {
-          "id": ...,
-          "source_original_ids": [...],
-          "text_label_pairs": [(text, label), ...],
-        }
+    The resulting rows retain the existing fields:
+      id, dataset_name, source_original_ids, texts, labels
 
-    into a Hugging Face Dataset with this form:
-
-        {
-          "id": ...,
-          "source_original_ids": [...],
-          "texts": [...],
-          "labels": [...],
-        }
+    Each discovered numeric score method is also stored as an aligned list:
+      method_1: [score_or_none, ...]
     """
     rng = random.Random(seed)
     rows = []
 
     for entry in formatted_dataset:
-        tl_list = list(entry.get("text_label_pairs", []))
-
-        if len(tl_list) < 2:
-            # Pairwise/listwise training needs at least two items.
-            continue
-
-        rng.shuffle(tl_list)
-
-        rows.append(
-            {
-                "id": str(entry["id"]),
-                "dataset_name": entry.get("dataset_name"),
-                "source_original_ids": list(entry.get("source_original_ids", [])),
-                "texts": [x[0] for x in tl_list],
-                "labels": [x[1] for x in tl_list],
-            }
+        text_label_pairs = list(entry.get("text_label_pairs", []))
+        item_score_dicts = list(
+            entry.get(
+                "item_score_dicts",
+                [{} for _ in text_label_pairs],
+            )
         )
 
+        if len(text_label_pairs) != len(item_score_dicts):
+            raise ValueError(
+                f"Entry {entry.get('id', '<unknown>')!r} has misaligned "
+                "text_label_pairs and item_score_dicts."
+            )
+
+        # Preserve one-item chains as regression may use a scored original.
+        if not text_label_pairs:
+            continue
+
+        items = list(zip(text_label_pairs, item_score_dicts))
+        rng.shuffle(items)
+
+        row = {
+            "id": str(entry["id"]),
+            "dataset_name": entry.get("dataset_name"),
+            "source_original_ids": list(entry.get("source_original_ids", [])),
+            "texts": [text_label[0] for text_label, _ in items],
+            "labels": [text_label[1] for text_label, _ in items],
+        }
+
+        for score_name in score_names:
+            row[score_name] = [
+                score_dict.get(score_name)
+                for _, score_dict in items
+            ]
+
+        rows.append(row)
+
     return Dataset.from_list(rows)
-
-        
-def _concat_nonempty_datasets(datasets: list[Dataset]) -> Dataset:
-    nonempty = [ds for ds in datasets if len(ds) > 0]
-
-    if not nonempty:
-        return Dataset.from_list([])
-
-    if len(nonempty) == 1:
-        return nonempty[0]
-
-    return concatenate_datasets(nonempty)
 
 
 def _downsample_dataset_dict(
@@ -79,16 +88,14 @@ def _downsample_dataset_dict(
         raise ValueError("downsample_size must be at least 3 to keep train/dev/test.")
 
     split_names = ("train", "dev", "test")
-
     quotas = {
         name: max(1, int(round(downsample_size * len(dataset_dict[name]) / total)))
         for name in split_names
     }
 
-    # Fix rounding while preserving at least one example per split.
     while sum(quotas.values()) > downsample_size:
         candidates = [name for name in split_names if quotas[name] > 1]
-        name = max(candidates, key=lambda n: quotas[n])
+        name = max(candidates, key=lambda candidate: quotas[candidate])
         quotas[name] -= 1
 
     while sum(quotas.values()) < downsample_size:
@@ -101,7 +108,10 @@ def _downsample_dataset_dict(
         if not candidates:
             break
 
-        name = max(candidates, key=lambda n: len(dataset_dict[n]) - quotas[n])
+        name = max(
+            candidates,
+            key=lambda candidate: len(dataset_dict[candidate]) - quotas[candidate],
+        )
         quotas[name] += 1
 
     return DatasetDict(
@@ -110,6 +120,17 @@ def _downsample_dataset_dict(
             for name in split_names
         }
     )
+
+
+def _collect_score_names(records_by_split: dict[str, list[dict]]) -> list[str]:
+    score_names = set()
+
+    for records in records_by_split.values():
+        for entry in records:
+            for score_dict in entry.get("item_score_dicts", []):
+                score_names.update(score_dict.keys())
+
+    return sorted(score_names)
 
 
 def create_formatted_dataset_dict(
@@ -125,11 +146,10 @@ def create_formatted_dataset_dict(
     return_metadata: bool = False,
 ):
     """
-    Build the final fixed train/dev/test DatasetDict.
+    Build one shared train/dev/test DatasetDict.
 
-    IMPORTANT: train/dev/test are split by stable original-document custom_id
-    before chains and random pairs are created. This prevents perturbations of
-    the same original text from crossing split boundaries.
+    Splitting occurs by original custom_id before chains and random pairs are
+    constructed. This prevents source-document leakage across splits.
     """
     if not dataset_names:
         raise ValueError("At least one dataset name must be supplied.")
@@ -140,53 +160,53 @@ def create_formatted_dataset_dict(
         test_ratio_within_heldout=test_ratio_within_heldout,
         seed=seed,
     )
-
     assert_no_original_id_leakage(split_ids)
 
-    final_splits: dict[str, Dataset] = {}
+    records_by_split: dict[str, list[dict]] = {
+        "train": [],
+        "dev": [],
+        "test": [],
+    }
 
     for split_name in ("train", "dev", "test"):
-        split_parts = []
-
-        for ds_name in dataset_names:
-            formatted = format_custom_dataset(
-                custom_dataset_name=ds_name,
+        for dataset_name in dataset_names:
+            records = format_custom_dataset(
+                custom_dataset_name=dataset_name,
                 max_layers=max_layers,
                 layer_type=layer_type,
                 seed=seed,
                 reuse_limit=reuse_limit,
-                original_id_filter=split_ids[split_name][ds_name],
+                original_id_filter=split_ids[split_name][dataset_name],
             )
 
-            # For layer_type="all", format_custom_dataset already creates the
-            # historical extra random pairs, but now only inside this split.
             if random_pairs and layer_type != "all":
-                formatted = generate_training_pairs_random(
-                    formatted_dataset=formatted,
+                records = generate_training_pairs_random(
+                    formatted_dataset=records,
                     seed=seed,
                     n=reuse_limit,
                 )
 
-            ds = shuffle_and_transform_formatted_dataset(
-                formatted_dataset=formatted,
-                seed=seed,
-            )
+            records_by_split[split_name].extend(records)
 
-            if len(ds) > 0:
-                split_parts.append(ds)
+    score_names = _collect_score_names(records_by_split)
 
-        split_dataset = _concat_nonempty_datasets(split_parts).shuffle(seed=seed)
-        final_splits[split_name] = split_dataset
+    final_splits = {
+        split_name: shuffle_and_transform_formatted_dataset(
+            formatted_dataset=records_by_split[split_name],
+            score_names=score_names,
+            seed=seed,
+        ).shuffle(seed=seed)
+        for split_name in ("train", "dev", "test")
+    }
 
     if any(len(final_splits[name]) == 0 for name in ("train", "dev", "test")):
         sizes = {
             name: len(final_splits[name])
             for name in ("train", "dev", "test")
         }
-
         raise ValueError(
             "At least one split has no usable formatted examples after "
-            f"chain/pair construction: {sizes}"
+            f"chain construction: {sizes}"
         )
 
     dataset_dict = DatasetDict(final_splits)
@@ -201,10 +221,11 @@ def create_formatted_dataset_dict(
     metadata = {
         "split_strategy": "original_custom_id_group_split_before_formatting",
         "split_original_ids": split_ids_to_metadata(split_ids),
+        "score_fields": score_names,
         "num_original_ids": {
             split_name: {
-                ds_name: len(ids)
-                for ds_name, ids in by_dataset.items()
+                dataset_name: len(ids)
+                for dataset_name, ids in by_dataset.items()
             }
             for split_name, by_dataset in split_ids.items()
         },
@@ -214,6 +235,7 @@ def create_formatted_dataset_dict(
         return dataset_dict, metadata
 
     return dataset_dict
+
 
 def save_formatted_dataset_dict(
     dataset_dict: DatasetDict,
@@ -225,20 +247,19 @@ def save_formatted_dataset_dict(
         if not overwrite:
             raise FileExistsError(
                 f"Formatted dataset already exists: {output_path}. "
-                f"Pass --overwrite to replace it."
+                "Pass --overwrite to replace it."
             )
 
         shutil.rmtree(output_path)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
     dataset_dict.save_to_disk(output_path)
 
     if metadata is not None:
         metadata_path = os.path.join(output_path, "metadata.json")
 
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
+        with open(metadata_path, "w", encoding="utf-8") as output_file:
+            json.dump(metadata, output_file, indent=2)
 
 
 def load_formatted_dataset_dict(path: str) -> DatasetDict:
@@ -246,7 +267,6 @@ def load_formatted_dataset_dict(path: str) -> DatasetDict:
 
     required_splits = {"train", "dev", "test"}
     actual_splits = set(dataset_dict.keys())
-
     missing = required_splits - actual_splits
 
     if missing:

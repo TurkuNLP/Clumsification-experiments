@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +28,7 @@ class GEvalScorer:
     No-reference / QE-style G-Eval scorer.
 
     This class exposes score_texts(...), matching the interface expected by the
-    benchmark runner and the existing LTR/MetricX/GPTScore adapters.
+    benchmark runner and the existing FE/MetricX/GPTScore adapters.
 
     Scores are higher-is-better, on the raw 1-5 G-Eval scale.
     """

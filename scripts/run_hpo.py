@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 
 import argparse
 import json
@@ -15,7 +16,7 @@ from scripts.configs.hpo.hps_to_test import HPS_TO_TEST
 
 MODEL_NAME = "intfloat/multilingual-e5-large"
 MAX_SEQ_LEN = 512
-DEFAULT_OBJECTIVE_KEY = "hpo_dev_win_rate"
+DEFAULT_OBJECTIVE_KEY = "hpo_dev_pairwise_accuracy"
 
 
 VALID_LOSSES = {
@@ -56,13 +57,13 @@ def pick_objective(
     Select objective value from hpo_dev_metrics.json.
 
     Current trainer.evaluate(..., metric_key_prefix="hpo_dev") returns keys like:
-      - hpo_dev_win_rate
+      - hpo_dev_pairwise_accuracy
       - hpo_dev_correct_points
       - hpo_dev_strict_correct_pairs
       - hpo_dev_score_tie_rate
       - hpo_dev_total_pairs
 
-    We maximize hpo_dev_win_rate by default.
+    We maximize hpo_dev_pairwise_accuracy by default.
     """
     if not metrics:
         return None
@@ -75,9 +76,9 @@ def pick_objective(
         [
             DEFAULT_OBJECTIVE_KEY,
             "hpo_dev_accuracy",
-            "hpo_dev_pair_accuracy",
+            "hpo_dev_pairwise_accuracy",
             "hpo_dev_acc",
-            "hpo_dev_mean_win_rate",
+            "hpo_dev_mean_pairwise_accuracy",
         ]
     )
 
@@ -189,7 +190,7 @@ def build_trial_command(
         str(nproc),
         args.train_script,
 
-        # Current ltr.args parser uses positional model_name and max_seq_len.
+        # Current fe.args parser uses positional model_name and max_seq_len.
         args.model_name,
         str(args.max_seq_len),
 
@@ -304,14 +305,14 @@ def selected_trials_from_args(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sequential HPO runner for siamese_ltr_model_training.py"
+        description="Sequential HPO runner for train_fe_model.py"
     )
 
     parser.add_argument(
         "--train_script",
         type=str,
-        default="scripts/siamese_ltr_model_training.py",
-        help="Path to siamese_ltr_model_training.py.",
+        default="scripts/train_fe_model.py",
+        help="Path to train_fe_model.py.",
     )
 
     parser.add_argument(

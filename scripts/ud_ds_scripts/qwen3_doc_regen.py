@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # Co-created with GPT5.5
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--lan",
+        "--language",
         type=str,
         required=True,
         help="Target language code, e.g. en, fi, sv, es.",
@@ -189,7 +190,7 @@ def safe_filename_part(value: str) -> str:
 
 
 def input_path(args: argparse.Namespace) -> Path:
-    return args.base_folder / args.lan / "ud_data.jsonl"
+    return args.base_folder / args.language / "ud_data.jsonl"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -379,7 +380,7 @@ def make_final_row(
         "id": original["id"],
         "model": args.model,
         "effort": "local-vllm",
-        "language": args.lan,
+        "language": args.language,
         "register": original["register"],
         "prompt_sentence": generated["prompt_sentence"],
         "text": generated["text"],
@@ -818,7 +819,7 @@ def run_generation(
     )
 
     message_batches = batched(
-        [make_chat_messages(document, args.lan) for document in documents],
+        [make_chat_messages(document, args.language) for document in documents],
         args.batch_size,
     )
 
@@ -919,7 +920,7 @@ def main() -> None:
 
             manifest = {
                 "model": args.model,
-                "language": args.lan,
+                "language": args.language,
                 "source_path": str(source_path),
                 "output_path": str(output_path),
                 "raw_output_path": str(raw_output_path),
@@ -952,7 +953,7 @@ def main() -> None:
 
     manifest = {
         "model": args.model,
-        "language": args.lan,
+        "language": args.language,
         "source_path": str(source_path),
         "output_path": str(output_path),
         "raw_output_path": str(raw_output_path),

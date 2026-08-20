@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # vibe coded
 
 import argparse
@@ -25,7 +26,7 @@ from transformers import (
 
 os.environ.setdefault("WANDB_MODE", "disabled")
 
-class ScoringHead(nn.Module):
+class EvaluationHead(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -76,17 +77,17 @@ def load_auto_model_with_dtype(
         )
 
 
-class CoheSentiaLTRModel(nn.Module):
+class CoheSentiaFEModel(nn.Module):
     """
-    Loads the encoder + scoring head saved by your LTR training code.
+    Loads the encoder + evaluation head saved by your FE training code.
 
     Expected model_dir contents:
       - config/tokenizer/model files from save_pretrained()
-      - ltr_head.pt with:
+      - fe_head.pt with:
           {
             "hidden_dim": ...,
             "dropout": ...,
-            "scorer": state_dict
+            "evaluation_head": state_dict
           }
     """
 
@@ -102,12 +103,11 @@ class CoheSentiaLTRModel(nn.Module):
         self.model_dir = model_dir
         self.dtype = dtype
 
-        head_path = os.path.join(model_dir, "ltr_head.pt")
+        head_path = os.path.join(model_dir, "fe_head.pt")
         if not os.path.exists(head_path):
-            raise FileNotFoundError(
-                f"Could not find scoring head at {head_path}. "
-                f"Pass the final directory produced by your trainer, e.g. output_dir/final."
-            )
+            from clumsification_code.compat.fe_checkpoints import find_legacy_head
+
+            head_path = find_legacy_head(model_dir)
 
         self.encoder = load_auto_model_with_dtype(
             model_dir=model_dir,
@@ -127,28 +127,33 @@ class CoheSentiaLTRModel(nn.Module):
         except TypeError:
             head_state = torch.load(head_path, map_location="cpu")
 
+        if "evaluation_head" not in head_state:
+            from clumsification_code.compat.fe_checkpoints import normalize_legacy_head_state
+
+            head_state = normalize_legacy_head_state(head_state)
+
         hidden_dim = head_state["hidden_dim"]
         dropout = head_state["dropout"]
-        scorer_state = head_state["scorer"]
+        evaluation_head_state = head_state["evaluation_head"]
 
-        # Compatible with either "net.0.weight" or "scorer.net.0.weight" keys.
-        scorer_state = {
-            k[len("scorer."):] if k.startswith("scorer.") else k: v
-            for k, v in scorer_state.items()
+        # Compatible with either "net.0.weight" or "evaluation_head.net.0.weight" keys.
+        evaluation_head_state = {
+            k[len("evaluation_head."):] if k.startswith("evaluation_head.") else k: v
+            for k, v in evaluation_head_state.items()
         }
 
         emb_dim = self.encoder.config.hidden_size
 
-        self.scorer = ScoringHead(
+        self.evaluation_head = EvaluationHead(
             input_dim=emb_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
         )
 
-        self.scorer.load_state_dict(scorer_state, strict=True)
+        self.evaluation_head.load_state_dict(evaluation_head_state, strict=True)
 
-        # Keep scorer in same dtype as encoder during fine-tuning.
-        self.scorer.to(dtype=dtype)
+        # Keep evaluation_head in same dtype as encoder during fine-tuning.
+        self.evaluation_head.to(dtype=dtype)
 
         self.hidden_dim = hidden_dim
         self.dropout = dropout
@@ -182,10 +187,10 @@ class CoheSentiaLTRModel(nn.Module):
 
         emb = self.mean_pool(out.last_hidden_state, attention_mask)
 
-        scorer_dtype = next(self.scorer.parameters()).dtype
-        emb = emb.to(dtype=scorer_dtype)
+        evaluation_head_dtype = next(self.evaluation_head.parameters()).dtype
+        emb = emb.to(dtype=evaluation_head_dtype)
 
-        scores = self.scorer(emb)
+        scores = self.evaluation_head(emb)
 
         return {
             "logits": scores,
@@ -486,7 +491,7 @@ def compute_scalar_metrics(eval_pred):
 # ---------------------------------------------------------------------
 
 
-def save_ltr_model_for_existing_eval(
+def save_fe_model(
     trainer: Trainer,
     tokenizer,
     output_dir: str,
@@ -498,7 +503,7 @@ def save_ltr_model_for_existing_eval(
           config.json
           model.safetensors / pytorch_model.bin
           tokenizer files
-          ltr_head.pt
+          fe_head.pt
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -512,18 +517,18 @@ def save_ltr_model_for_existing_eval(
     model.encoder.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
-    scorer_state = {
+    evaluation_head_state = {
         k: v.detach().cpu()
-        for k, v in model.scorer.state_dict().items()
+        for k, v in model.evaluation_head.state_dict().items()
     }
 
     head_payload = {
         "hidden_dim": model.hidden_dim,
         "dropout": model.dropout,
-        "scorer": scorer_state,
+        "evaluation_head": evaluation_head_state,
     }
 
-    torch.save(head_payload, os.path.join(output_dir, "ltr_head.pt"))
+    torch.save(head_payload, os.path.join(output_dir, "fe_head.pt"))
 
     print(f"Saved CoheSentia-fine-tuned model to: {output_dir}")
 
@@ -597,14 +602,14 @@ def build_training_args(args) -> TrainingArguments:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fine-tune an existing LTR model on CoheSentia scalar ratings."
+        description="Fine-tune an existing FE model on CoheSentia scalar ratings."
     )
 
     parser.add_argument(
         "--model_dir",
         type=str,
         required=True,
-        help="Existing trained final model dir containing encoder/tokenizer files and ltr_head.pt.",
+        help="Existing trained final model dir containing encoder/tokenizer files and fe_head.pt.",
     )
 
     parser.add_argument(
@@ -651,7 +656,7 @@ def parse_args():
     parser.add_argument(
         "--freeze_encoder",
         action="store_true",
-        help="Only train the scoring head. Useful as a safer final calibration step.",
+        help="Only train the evaluation head. Useful as a safer final calibration step.",
     )
 
     parser.add_argument("--num_train_epochs", type=float, default=1.0)
@@ -698,7 +703,7 @@ def main():
 
     dtype = parse_dtype(args.dtype)
 
-    print("===== CoheSentia LTR fine-tuning =====")
+    print("===== CoheSentia FE fine-tuning =====")
     print(f"Base model dir: {args.model_dir}")
     print(f"Train JSON:     {args.train_json}")
     print(f"Eval JSON:      {args.eval_json}")
@@ -714,7 +719,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = CoheSentiaLTRModel(
+    model = CoheSentiaFEModel(
         model_dir=args.model_dir,
         attn_implementation=args.attn_implementation,
         dtype=dtype,
@@ -770,7 +775,7 @@ def main():
 
     # Save only on main process.
     if trainer.is_world_process_zero():
-        save_ltr_model_for_existing_eval(
+        save_fe_model(
             trainer=trainer,
             tokenizer=tokenizer,
             output_dir=args.output_dir,

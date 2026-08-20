@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 import random
 from clumsification_code.data.format_dataset import _read_originals_by_custom_id
 

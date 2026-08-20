@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # imports
 import argparse
 import json
@@ -16,7 +17,7 @@ from transformers import AutoTokenizer
 import numpy as np
 
 import os
-from clumsification_code.perturbations.rule_based_evaleval import (
+from clumsification_code.perturbations.evaleval_perturbations import (
     RULE_BASED_MODEL_LABEL,
     RULE_BASED_OUTPUT_DIR,
     rule_based_perturbation,

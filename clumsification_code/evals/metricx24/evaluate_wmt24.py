@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 # coding=utf-8
 # Copyright 2024 Google LLC
 #
@@ -26,7 +27,7 @@ import transformers
 
 
 @dataclasses.dataclass
-class Arguments:
+class WMT24EvaluationArguments:
   en_de: str = dataclasses.field(metadata={"help": "The en-de input file."})
   en_es: str = dataclasses.field(metadata={"help": "The en-es input file."})
   ja_zh: str = dataclasses.field(metadata={"help": "The ja-zh input file."})
@@ -64,7 +65,7 @@ def _load_scores(
 
 
 def main() -> None:
-  parser = transformers.HfArgumentParser(Arguments)
+  parser = transformers.HfArgumentParser(WMT24EvaluationArguments)
   (args,) = parser.parse_args_into_dataclasses()
 
   # Download MTME data

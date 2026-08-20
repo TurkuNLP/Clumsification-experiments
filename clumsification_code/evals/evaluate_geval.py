@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 """
 Evaluate a G-Eval no-reference baseline on the same benchmark suite used by
 evaluate_model_on_benchmark.py, so results are directly comparable.
@@ -77,7 +78,7 @@ class GEvalQEInferenceModel:
 
     Why no-reference?
     -----------------
-    The original LTR benchmark code only passes a single string per candidate
+    The original FE benchmark code only passes a single string per candidate
     to getModelPreds(...). Therefore this adapter intentionally does not use
     task sources or references. This keeps the comparison fair against the
     custom QE model and the MetricX QE adapter.

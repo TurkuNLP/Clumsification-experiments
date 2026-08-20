@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 #Co-created with GPT5.5
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--lan",
+        "--language",
         type=str,
         required=True,
         help="Target language code, e.g. en, fi, sv, de.",
@@ -112,7 +113,7 @@ def safe_filename_part(value: str) -> str:
 
 
 def input_path(args: argparse.Namespace) -> Path:
-    return args.base_folder / args.lan / "ud_data.jsonl"
+    return args.base_folder / args.language / "ud_data.jsonl"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -337,7 +338,7 @@ def submit_batch(args: argparse.Namespace) -> None:
                 index=index,
                 model=args.model,
                 effort=args.effort,
-                language_code=args.lan,
+                language_code=args.language,
             )
             writer.write(json.dumps(request, ensure_ascii=False) + "\n")
 
@@ -358,7 +359,7 @@ def submit_batch(args: argparse.Namespace) -> None:
         "batch_status": batch.status,
         "model": args.model,
         "effort": args.effort,
-        "language": args.lan,
+        "language": args.language,
         "source_path": str(source_path),
         "output_path": str(output_path),
         "batch_input_path": str(batch_input_path),

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 import argparse
@@ -6,7 +7,7 @@ from typing import Optional
 import torch
 
 from clumsification_code.evals.benchmark_runner import run_standard_benchmark_suite
-from clumsification_code.evals.inference.ltr import load_ltr_inference_model
+from clumsification_code.evals.inference.fe import load_fe_inference_model
 from clumsification_code.evals.result_writer import EvalMetadata, write_results_jsonl
 
 _DTYPE_MAP = {
@@ -19,7 +20,7 @@ _DTYPE_MAP = {
 }
 
 #Parse information from the DS name
-def info_ds_parser(name:str):
+def parse_evaluation_run_name(name:str):
     num_layers = 5
     pert_type = "clumsy"
 
@@ -27,7 +28,7 @@ def info_ds_parser(name:str):
     model_name=name[:name.find('_')]
     name=name[name.find('_')+1:]
     #Parsing the language info
-    lan=name[:name.find('_')]
+    language=name[:name.find('_')]
     name=name[name.find('_')+1:]
     #Parsing num_layers and pert_type
     training_ds_name=name
@@ -36,14 +37,14 @@ def info_ds_parser(name:str):
         num_layers = name[name.rfind('_')+1:]
     else:
         pert_type = name
-    return model_name, lan, pert_type, num_layers, training_ds_name
+    return model_name, language, pert_type, num_layers, training_ds_name
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scorer",
         required=True,
-        choices=["ltr", "gptscore", "metricx", "geval"],
+        choices=["fe", "gptscore", "metricx", "geval"],
         help="Evaluation scorer backend.",
     )
     parser.add_argument("--model-name", required=True)
@@ -63,7 +64,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--attn-implementation",
         default="flash_attention_2",
-        help="Attention implementation for local LTR models.",
+        help="Attention implementation for local FE models.",
     )
 
 
@@ -87,10 +88,10 @@ def add_metricx_args(parser: argparse.ArgumentParser) -> None:
 def build_scorer(args: argparse.Namespace, device: torch.device):
     dtype = _DTYPE_MAP[args.dtype]
 
-    if args.scorer == "ltr":
+    if args.scorer == "fe":
         if not args.model_dir:
-            raise ValueError("--model-dir is required with --scorer ltr")
-        return load_ltr_inference_model(
+            raise ValueError("--model-dir is required with --scorer fe")
+        return load_fe_inference_model(
             model_dir=args.model_dir,
             device=device,
             attn_implementation=args.attn_implementation,
@@ -184,8 +185,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         or getattr(args, "metricx_model_name_or_path", "")
     )
 
-    if args.scorer == 'ltr':        
-        model_name, language, pert_type, num_layers, training_ds_name = info_ds_parser(args.model_name)
+    if args.scorer == "fe":
+        model_name, language, pert_type, num_layers, training_ds_name = parse_evaluation_run_name(args.model_name)
 
         metadata = EvalMetadata(
             model_name=model_name,

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -112,7 +113,7 @@ def run_standard_benchmark_suite(
     batch_size: int,
     max_length: int,
 ) -> Dict[str, Any]:
-    """Shared benchmark suite for LTR, GPTScore, MetricX, and G-Eval adapters."""
+    """Shared benchmark suite for FE, GPTScore, MetricX, and G-Eval adapters."""
 
     all_results: Dict[str, Any] = {}
 
