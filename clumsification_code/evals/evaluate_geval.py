@@ -31,6 +31,7 @@ Notes:
   score is returned directly.
 """
 
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 import argparse
 import hashlib
 import json
@@ -653,7 +654,7 @@ def parse_args():
 # ──────────────────────────────────────────────────────────────────────
 
 
-def main():
+def legacy_main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1031,6 +1032,24 @@ def main():
         model_dir=args.geval_model,
         results=all_results,
     )
+
+
+def main(argv=None):
+    """Compatibility entry point using the shared registry-backed runner.
+
+    The previous implementation remains available as ``legacy_main`` while
+    callers transition.  Keeping this wrapper preserves the familiar script
+    path but ensures G-Eval uses the same benchmark selection as FE, GPTScore,
+    and MetricX.
+    """
+    import sys
+
+    from clumsification_code.evals.run_benchmark import main as shared_main
+
+    forwarded = list(sys.argv[1:] if argv is None else argv)
+    if not any(argument == "--scorer" or argument.startswith("--scorer=") for argument in forwarded):
+        forwarded.insert(0, "--scorer=geval")
+    shared_main(forwarded)
 
 
 if __name__ == "__main__":

@@ -80,7 +80,6 @@ NLG_EVAL_FLUENCY_SPECS: Tuple[BenchmarkSpec, ...] = (
     _spec("summeval_op_coherence", "SummEval-OP", "Coherence", "summarization", "coherence"),
     _spec("asset_fluency", "ASSET", "Fluency", "simplification", "grammaticality"),
     _spec("human_likert_fluency", "Human-likert", "Fluency", "simplification", "grammaticality"),
-    _spec("lens_overall_quality", "LENS", "Overall Quality", "simplification", "grammaticality", notes="Contains fluency plus meaning preservation and simplification; review before primary inclusion."),
     _spec("metaeval_fluency", "metaeval", "Fluency", "simplification", "grammaticality", "naturalness"),
     _spec("protagolabs_simplification_fluency", "protagolabs", "Fluency", "simplification", "grammaticality", "clarity", task="Text Simplification", original_data="Newsela"),
     _spec("samsa_grammaticality", "SAMSA", "Grammaticality", "simplification", "grammaticality"),

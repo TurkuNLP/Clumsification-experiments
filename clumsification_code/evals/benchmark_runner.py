@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import datasets
 
 from clumsification_code.evals import benchmark_data as data
+from clumsification_code.evals.aggregation import aggregate_dimension_results
 from clumsification_code.evals.benchmark_registry import get_nlg_eval_specs
 from clumsification_code.evals.nlg_eval_loader import (
     DEFAULT_NLG_EVAL_PATH,
@@ -461,6 +462,7 @@ def run_standard_benchmark_suite(
     file to the selected dimensions.
     """
     all_results: Dict[str, Any] = {}
+    dimension_summaries: List[Dict[str, Any]] = []
     specs = get_nlg_eval_specs()
     spec_records: Dict[str, List[Dict[str, Any]]] = {spec.name: [] for spec in specs}
 
@@ -477,8 +479,7 @@ def run_standard_benchmark_suite(
         labels = [float(record["human_score"]) for record in records]
         texts = [str(record["text"]) for record in records]
         result_name = f"{spec.name}"
-        all_results.update(
-            score_scalar_aspect(
+        dimension_result = score_scalar_aspect(
                 model=model,
                 device=device,
                 texts=texts,
@@ -489,6 +490,15 @@ def run_standard_benchmark_suite(
                 batch_size=batch_size,
                 max_length=max_length,
             )
+        all_results.update(dimension_result)
+        dimension_summaries.append(
+            {
+                "name": result_name,
+                "task_family": spec.task_family,
+                "categories": spec.categories,
+                "spearman_rho": dimension_result.get(f"{result_name}_spearman_rho"),
+                "kendall_tau": dimension_result.get(f"{result_name}_kendall_tau"),
+            }
         )
 
     # These sources intentionally remain outside NLG-eval but expose the same
@@ -508,18 +518,28 @@ def run_standard_benchmark_suite(
     for group_name, records in grouped.items():
         labels = [float(record["human_score"]) for record in records]
         texts = [str(record["text"]) for record in records]
-        all_results.update(
-            score_scalar_aspect(
+        result_name = group_name
+        dimension_result = score_scalar_aspect(
                 model=model,
                 device=device,
                 texts=texts,
                 labels=labels,
                 task_name=str(records[0]["task_family"]),
                 aspect=str(records[0]["aspect"]),
-                result_name=group_name,
+                result_name=result_name,
                 batch_size=batch_size,
                 max_length=max_length,
             )
+        all_results.update(dimension_result)
+        dimension_summaries.append(
+            {
+                "name": result_name,
+                "task_family": records[0]["task_family"],
+                "categories": records[0]["fluency_categories"],
+                "spearman_rho": dimension_result.get(f"{result_name}_spearman_rho"),
+                "kendall_tau": dimension_result.get(f"{result_name}_kendall_tau"),
+            }
         )
 
+    all_results.update(aggregate_dimension_results(dimension_summaries))
     return all_results

@@ -7,7 +7,7 @@ import argparse
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict
 
 from .benchmark_registry import get_nlg_eval_specs
 from .nlg_eval_loader import (
@@ -22,6 +22,18 @@ from .standalone_benchmarks import (
     DEFAULT_COHESENTIA_PATH,
     DEFAULT_ELLIPSE_PATH,
 )
+
+
+DEFAULT_MANIFEST_PATH = Path("data/benchmarks/english_fluency_suite_manifest.json")
+
+# These are deliberate research exclusions, not loader failures. Keeping them
+# in the manifest makes it possible to audit why a benchmark is absent.
+EXCLUDED_BENCHMARKS = {
+    "FUDGE": "Excluded by the project scope.",
+    "dialogue_response": "Dialogue responses are a separate register and task.",
+    "LENS": "Overall Quality combines fluency with meaning preservation and simplification.",
+    "BAGEL/SFRES/SFHOT": "Excluded to preserve Themis as a possible direct baseline.",
+}
 
 
 def build_audit_report(
@@ -43,7 +55,7 @@ def build_audit_report(
     category_counts = Counter()
     task_counts = Counter()
     for record in iter_nlg_eval_records(nlg_eval_path, specs):
-        selected_counts[record["metadata_aspect"] + "::" + str(record["benchmark"])] += 1
+        selected_counts[str(record["spec_name"])] += 1
         for category in record["fluency_categories"]:
             category_counts[category] += 1
         task_counts[record["task_family"]] += 1
@@ -59,15 +71,47 @@ def build_audit_report(
             category_counts[category] += 1
         task_counts[record["task_family"]] += 1
 
+    included_specs = []
+    for spec in specs:
+        included_specs.append(
+            {
+                "name": spec.name,
+                "source": "nlg_eval",
+                "benchmark": spec.benchmark,
+                "aspect": spec.aspect,
+                "task_family": spec.task_family,
+                "fluency_categories": list(spec.categories),
+                "task_filter": spec.task,
+                "original_data_filter": spec.original_data,
+                "record_count": selected_counts.get(spec.name, 0),
+                "label_type": "scalar",
+            }
+        )
+
     return {
+        "manifest_version": 1,
+        "suite": "english_fluency",
+        "source_paths": {
+            "nlg_eval": str(nlg_eval_path),
+            "nlg_eval_metadata": str(metadata_path),
+            "ellipse": str(ellipse_path) if ellipse_path else None,
+            "argessay": str(argessay_path) if argessay_path else None,
+            "cohesentia": str(cohesentia_path) if cohesentia_path else None,
+        },
         "metadata_rows": len(metadata),
         "metadata_retained_records": sum(metadata_by_benchmark.values()),
         "registry_specs": len(specs),
         "nlg_eval_selected_records": sum(selected_counts.values()),
-        "nlg_eval_selected_by_dimension": dict(sorted(selected_counts.items())),
+        "included_nlg_eval_specs": included_specs,
         "standalone_records": dict(sorted(standalone_counts.items())),
         "category_records": dict(sorted(category_counts.items())),
         "task_family_records": dict(sorted(task_counts.items())),
+        "excluded_benchmarks": EXCLUDED_BENCHMARKS,
+        "preference_datasets": {
+            "JFLEG": "separate preference adapter",
+            "MultiBLiMP English": "separate preference adapter",
+            "Story Cloze": "secondary coherence diagnostic",
+        },
     }
 
 
@@ -78,7 +122,7 @@ def main() -> None:
     parser.add_argument("--ellipse-path", type=Path, default=DEFAULT_ELLIPSE_PATH)
     parser.add_argument("--argessay-path", type=Path, default=DEFAULT_ARGESSAY_PATH)
     parser.add_argument("--cohesentia-path", type=Path, default=DEFAULT_COHESENTIA_PATH)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output", type=Path, default=DEFAULT_MANIFEST_PATH)
     args = parser.parse_args()
     options = vars(args).copy()
     options.pop("output")
