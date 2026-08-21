@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+
+# Local living research plan and agent memory
+PROJECT_VISION.local.md
+
 data/*
 scripts/others*
 *.sh
