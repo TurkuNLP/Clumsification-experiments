@@ -132,6 +132,7 @@ def iter_nlg_eval_records(
                     "original_data": raw.get("original_data"),
                     "aspect": raw.get("aspect"),
                     "metadata_aspect": spec.aspect,
+                    "spec_name": spec.name,
                     "task_family": spec.task_family,
                     "fluency_categories": spec.categories,
                     "label_type": "scalar",

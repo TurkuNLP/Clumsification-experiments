@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Optional
 import datasets
 
 from clumsification_code.evals import benchmark_data as data
+from clumsification_code.evals.benchmark_registry import get_nlg_eval_specs
+from clumsification_code.evals.nlg_eval_loader import (
+    DEFAULT_NLG_EVAL_PATH,
+    iter_nlg_eval_records,
+)
+from clumsification_code.evals.standalone_benchmarks import (
+    DEFAULT_ARGESSAY_PATH,
+    DEFAULT_COHESENTIA_PATH,
+    DEFAULT_ELLIPSE_PATH,
+    iter_standalone_records,
+)
 from clumsification_code.evals.inference.base import TextScorer
 from clumsification_code.evals.metrics import (
     correlation_bundle,
@@ -106,7 +117,7 @@ def eval_pairwise_preference_dataset(
     return metrics
 
 
-def run_standard_benchmark_suite(
+def run_legacy_benchmark_suite(
     *,
     model: TextScorer,
     device,
@@ -428,5 +439,87 @@ def run_standard_benchmark_suite(
             max_length=max_length,
         )
     )
+
+    return all_results
+
+
+def run_standard_benchmark_suite(
+    *,
+    model: TextScorer,
+    device,
+    batch_size: int,
+    max_length: int,
+    nlg_eval_path=DEFAULT_NLG_EVAL_PATH,
+    ellipse_path=DEFAULT_ELLIPSE_PATH,
+    argessay_path=DEFAULT_ARGESSAY_PATH,
+    cohesentia_path=DEFAULT_COHESENTIA_PATH,
+) -> Dict[str, Any]:
+    """Run the registry-backed English scalar and preference suite.
+
+    Dataset selection is now defined by the benchmark registry.  Records are
+    materialized only after streaming filters have reduced the 3.3 GB NLG-eval
+    file to the selected dimensions.
+    """
+    all_results: Dict[str, Any] = {}
+    specs = get_nlg_eval_specs()
+    spec_records: Dict[str, List[Dict[str, Any]]] = {spec.name: [] for spec in specs}
+
+    # One pass over NLG-eval is substantially cheaper than rescanning the large
+    # JSONL file once for every benchmark/aspect specification.
+    for record in iter_nlg_eval_records(path=nlg_eval_path, specs=specs):
+        spec_records[str(record["spec_name"])].append(record)
+
+    for spec in specs:
+        records = spec_records[spec.name]
+        if not records:
+            print(f"{spec.name}: no valid records")
+            continue
+        labels = [float(record["human_score"]) for record in records]
+        texts = [str(record["text"]) for record in records]
+        result_name = f"{spec.name}"
+        all_results.update(
+            score_scalar_aspect(
+                model=model,
+                device=device,
+                texts=texts,
+                labels=labels,
+                task_name=spec.task_family,
+                aspect=spec.aspect,
+                result_name=result_name,
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+        )
+
+    # These sources intentionally remain outside NLG-eval but expose the same
+    # normalized record fields and therefore use the same scoring helper.
+    standalone_records = list(
+        iter_standalone_records(
+            ellipse_path=ellipse_path,
+            argessay_path=argessay_path,
+            cohesentia_path=cohesentia_path,
+        )
+    )
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for record in standalone_records:
+        key = f"{record['benchmark']}__{record['aspect']}"
+        grouped.setdefault(key, []).append(record)
+
+    for group_name, records in grouped.items():
+        labels = [float(record["human_score"]) for record in records]
+        texts = [str(record["text"]) for record in records]
+        all_results.update(
+            score_scalar_aspect(
+                model=model,
+                device=device,
+                texts=texts,
+                labels=labels,
+                task_name=str(records[0]["task_family"]),
+                aspect=str(records[0]["aspect"]),
+                result_name=group_name,
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+        )
 
     return all_results

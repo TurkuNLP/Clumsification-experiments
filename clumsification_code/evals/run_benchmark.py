@@ -8,7 +8,13 @@ import torch
 
 from clumsification_code.evals.benchmark_runner import run_standard_benchmark_suite
 from clumsification_code.evals.inference.fe import load_fe_inference_model
+from clumsification_code.evals.nlg_eval_loader import DEFAULT_NLG_EVAL_PATH
 from clumsification_code.evals.result_writer import EvalMetadata, write_results_jsonl
+from clumsification_code.evals.standalone_benchmarks import (
+    DEFAULT_ARGESSAY_PATH,
+    DEFAULT_COHESENTIA_PATH,
+    DEFAULT_ELLIPSE_PATH,
+)
 
 _DTYPE_MAP = {
     "float32": torch.float32,
@@ -66,6 +72,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="flash_attention_2",
         help="Attention implementation for local FE models.",
     )
+    # Keep benchmark paths configurable while making the repository defaults
+    # explicit for reproducible FE and direct-evaluator runs.
+    parser.add_argument("--nlg-eval-path", default=str(DEFAULT_NLG_EVAL_PATH))
+    parser.add_argument("--ellipse-path", default=str(DEFAULT_ELLIPSE_PATH))
+    parser.add_argument("--argessay-path", default=str(DEFAULT_ARGESSAY_PATH))
+    parser.add_argument("--cohesentia-path", default=str(DEFAULT_COHESENTIA_PATH))
 
 
 def add_gptscore_args(parser: argparse.ArgumentParser) -> None:
@@ -176,7 +188,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         model=model,
         device=device,
         batch_size=args.batch_size,
-        max_length=args.max_length
+        max_length=args.max_length,
+        nlg_eval_path=args.nlg_eval_path,
+        ellipse_path=args.ellipse_path,
+        argessay_path=args.argessay_path,
+        cohesentia_path=args.cohesentia_path,
     )
 
     model_dir = (
