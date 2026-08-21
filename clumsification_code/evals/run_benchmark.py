@@ -78,6 +78,17 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ellipse-path", default=str(DEFAULT_ELLIPSE_PATH))
     parser.add_argument("--argessay-path", default=str(DEFAULT_ARGESSAY_PATH))
     parser.add_argument("--cohesentia-path", default=str(DEFAULT_COHESENTIA_PATH))
+    parser.add_argument(
+        "--skip-preferences",
+        action="store_true",
+        help="Skip JFLEG, MultiBLiMP, and Story Cloze preference evaluation.",
+    )
+    parser.add_argument(
+        "--max-records-per-dimension",
+        type=int,
+        default=None,
+        help="Limit each filtered scalar dimension for a quick local test.",
+    )
 
 
 def add_gptscore_args(parser: argparse.ArgumentParser) -> None:
@@ -193,6 +204,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         ellipse_path=args.ellipse_path,
         argessay_path=args.argessay_path,
         cohesentia_path=args.cohesentia_path,
+        skip_preferences=args.skip_preferences,
+        max_records_per_dimension=args.max_records_per_dimension,
     )
 
     model_dir = (

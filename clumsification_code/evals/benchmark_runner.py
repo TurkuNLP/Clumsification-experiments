@@ -454,6 +454,8 @@ def run_standard_benchmark_suite(
     ellipse_path=DEFAULT_ELLIPSE_PATH,
     argessay_path=DEFAULT_ARGESSAY_PATH,
     cohesentia_path=DEFAULT_COHESENTIA_PATH,
+    skip_preferences: bool = False,
+    max_records_per_dimension: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run the registry-backed English scalar and preference suite.
 
@@ -461,15 +463,77 @@ def run_standard_benchmark_suite(
     materialized only after streaming filters have reduced the 3.3 GB NLG-eval
     file to the selected dimensions.
     """
+    if max_records_per_dimension is not None and max_records_per_dimension < 1:
+        raise ValueError("max_records_per_dimension must be positive when provided")
     all_results: Dict[str, Any] = {}
     dimension_summaries: List[Dict[str, Any]] = []
     specs = get_nlg_eval_specs()
     spec_records: Dict[str, List[Dict[str, Any]]] = {spec.name: [] for spec in specs}
 
+    # Preference benchmarks are intentionally kept outside scalar aggregation.
+    # They measure pairwise ordering and therefore report tie-aware and strict
+    # accuracy instead of Spearman/Kendall correlations.
+    def add_preference_result(name: str, metrics: Optional[Dict[str, Any]]) -> None:
+        if metrics is not None:
+            all_results.update(flatten_preference_metrics(name, metrics))
+
+    if not skip_preferences:
+        preferred, dispreferred = data.load_jfleg_preference_pairs(split="test")
+        add_preference_result(
+        "JFLEG_test_correction_preference",
+        eval_pairwise_preference_dataset(
+            name="JFLEG_test_correction_preference",
+            model=model,
+            device=device,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            task_name="jfleg",
+            aspect="grammar",
+            batch_size=batch_size,
+            max_length=max_length,
+        ),
+    )
+
+        preferred, dispreferred = data.load_multiblimp_english_preference_pairs()
+        add_preference_result(
+        "MultiBLiMP_eng_minimal_pair_preference",
+        eval_pairwise_preference_dataset(
+            name="MultiBLiMP_eng_minimal_pair_preference",
+            model=model,
+            device=device,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            task_name="multiblimp",
+            aspect="acceptability",
+            batch_size=batch_size,
+            max_length=max_length,
+        ),
+    )
+
+        # Story Cloze is retained as a secondary coherence diagnostic because its
+        # labels also depend on commonsense plausibility.
+        preferred, dispreferred = data.load_story_cloze_preference_pairs(split="eval")
+        add_preference_result(
+        "StoryCloze_eval_ending_preference",
+        eval_pairwise_preference_dataset(
+            name="StoryCloze_eval_ending_preference",
+            model=model,
+            device=device,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            task_name="story_cloze",
+            aspect="coherence",
+            batch_size=batch_size,
+            max_length=max_length,
+        ),
+    )
+
     # One pass over NLG-eval is substantially cheaper than rescanning the large
     # JSONL file once for every benchmark/aspect specification.
     for record in iter_nlg_eval_records(path=nlg_eval_path, specs=specs):
-        spec_records[str(record["spec_name"])].append(record)
+        records = spec_records[str(record["spec_name"])]
+        if max_records_per_dimension is None or len(records) < max_records_per_dimension:
+            records.append(record)
 
     for spec in specs:
         records = spec_records[spec.name]
@@ -513,7 +577,9 @@ def run_standard_benchmark_suite(
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for record in standalone_records:
         key = f"{record['benchmark']}__{record['aspect']}"
-        grouped.setdefault(key, []).append(record)
+        records = grouped.setdefault(key, [])
+        if max_records_per_dimension is None or len(records) < max_records_per_dimension:
+            records.append(record)
 
     for group_name, records in grouped.items():
         labels = [float(record["human_score"]) for record in records]

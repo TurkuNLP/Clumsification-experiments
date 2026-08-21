@@ -28,6 +28,7 @@ figures*/
 *_mcq_*
 *(Copy)*
 test_folder*/
+outputs*/
 
 edu_filtering.py
 extract_jsons_P.py
