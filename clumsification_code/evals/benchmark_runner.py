@@ -566,7 +566,8 @@ def run_standard_benchmark_suite(
         )
 
     # These sources intentionally remain outside NLG-eval but expose the same
-    # normalized record fields and therefore use the same scoring helper.
+    # normalized record fields and therefore use the same scoring helper. This
+    # includes original MTEB SummEval, which stays distinct from SummEval-OP.
     standalone_records = list(
         iter_standalone_records(
             ellipse_path=ellipse_path,

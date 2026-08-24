@@ -50,7 +50,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scorer",
         required=True,
-        choices=["fe", "gptscore", "metricx", "geval"],
+        choices=["fe", "gptscore", "metricx", "geval", "unieval", "ppl"],
         help="Evaluation scorer backend.",
     )
     parser.add_argument("--model-name", required=True)
@@ -106,6 +106,19 @@ def add_gptscore_args(parser: argparse.ArgumentParser) -> None:
 def add_metricx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metricx-model-name-or-path", default=None)
     parser.add_argument("--tokenizer", default="google/mt5-xl")
+
+
+def add_unieval_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--unieval-repo",
+        default=None,
+        help="Path to the official UniEval checkout containing metric/evaluator.py.",
+    )
+    parser.add_argument(
+        "--unieval-cache-dir",
+        default=None,
+        help="Optional cache directory for the UniEval Hugging Face checkpoint.",
+    )
 
 
 def build_scorer(args: argparse.Namespace, device: torch.device):
@@ -166,6 +179,30 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
 
         return GEvalScorer.from_args(args)
 
+    if args.scorer == "unieval":
+        from clumsification_code.evals.inference.unieval import load_unieval_fluency_model
+
+        return load_unieval_fluency_model(
+            repo_path=args.unieval_repo,
+            max_length=args.max_length,
+            device=device,
+            cache_dir=args.unieval_cache_dir,
+        )
+
+    if args.scorer == "ppl":
+        from clumsification_code.evals.inference.hf_ppl import load_hf_ppl_model
+
+        if not args.hf_model_name_or_path:
+            raise ValueError("--hf-model-name-or-path is required with --scorer ppl")
+        return load_hf_ppl_model(
+            model_name_or_path=args.hf_model_name_or_path,
+            tokenizer_name_or_path=args.tokenizer_name_or_path,
+            device=device,
+            dtype=dtype,
+            trust_remote_code=args.trust_remote_code,
+            device_map=args.device_map,
+        )
+
     raise ValueError(f"Unsupported scorer: {args.scorer}")
 
 
@@ -177,6 +214,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     add_common_args(parser)
     add_gptscore_args(parser)
     add_metricx_args(parser)
+    add_unieval_args(parser)
 
     # G-Eval parser can extend this if needed.
     try:
@@ -212,6 +250,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.model_dir
         or getattr(args, "hf_model_name_or_path", "")
         or getattr(args, "metricx_model_name_or_path", "")
+        or getattr(args, "unieval_repo", "")
     )
 
     if args.scorer == "fe":

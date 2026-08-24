@@ -32,7 +32,7 @@ def parse_score_args():
     parser.add_argument(
         "--language",
         type=str,
-        default="fi",
+        default="en",
         help="Text language passed to Hugging Face Evaluate BERTScore.",
     )
     parser.add_argument("--batch-size", type=int, default=8)

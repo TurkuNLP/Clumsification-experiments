@@ -16,6 +16,7 @@ from typing import Dict, Iterator, List, Mapping, Optional
 DEFAULT_ELLIPSE_PATH = Path("data/benchmarks/ELLIPSE.csv")
 DEFAULT_ARGESSAY_PATH = Path("data/benchmarks/arg-essay.csv")
 DEFAULT_COHESENTIA_PATH = Path("data/benchmarks/CohesentiaTestData.json")
+DEFAULT_MTEB_SUMMEVAL_DATASET = "mteb/summeval"
 
 
 def _number(value: object) -> Optional[float]:
@@ -134,11 +135,64 @@ def iter_cohesentia_records(path: Path) -> Iterator[Dict[str, object]]:
             }
 
 
+def iter_mteb_summeval_records(
+    dataset_name: str = DEFAULT_MTEB_SUMMEVAL_DATASET,
+) -> Iterator[Dict[str, object]]:
+    """Yield original SummEval records from its maintained MTEB dataset.
+
+    This is Fabbri et al.'s news-summarization SummEval benchmark used in the
+    UniEval paper.  It is intentionally distinct from NLG-eval's SummEval-OP,
+    an opinion-summarization benchmark.
+    """
+    try:
+        import datasets
+    except ImportError as exc:
+        raise ImportError(
+            "Original SummEval requires the `datasets` package. Install the "
+            "benchmark evaluation dependencies before running this suite."
+        ) from exc
+
+    split = datasets.load_dataset(dataset_name)["test"]
+    for document_index, row in enumerate(split):
+        summaries = row["machine_summaries"]
+        for aspect, category in (
+            ("fluency", "grammaticality"),
+            ("coherence", "coherence"),
+        ):
+            labels = row[aspect]
+            if len(summaries) != len(labels):
+                raise ValueError(
+                    f"{dataset_name} row {document_index}: {aspect} has "
+                    f"{len(labels)} labels for {len(summaries)} summaries."
+                )
+            for summary_index, (text, label) in enumerate(zip(summaries, labels)):
+                text = str(text).strip()
+                score = _number(label)
+                if not text or score is None:
+                    continue
+                yield {
+                    "id": f"mteb/summeval:{document_index}:{summary_index}:{aspect}",
+                    "source": None,
+                    "text": text,
+                    "human_scores": [score],
+                    "human_score": score,
+                    "benchmark": "SummEval",
+                    "aspect": aspect,
+                    "metadata_aspect": aspect,
+                    "task": "Summarization",
+                    "original_data": "mteb/summeval",
+                    "task_family": "summarization",
+                    "fluency_categories": (category,),
+                    "label_type": "scalar",
+                }
+
+
 def iter_standalone_records(
     *,
     ellipse_path: Optional[Path] = None,
     argessay_path: Optional[Path] = None,
     cohesentia_path: Optional[Path] = None,
+    include_mteb_summeval: bool = True,
 ) -> Iterator[Dict[str, object]]:
     """Yield records from whichever standalone sources were requested."""
     if ellipse_path is not None:
@@ -147,3 +201,5 @@ def iter_standalone_records(
         yield from iter_argessay_records(argessay_path)
     if cohesentia_path is not None:
         yield from iter_cohesentia_records(cohesentia_path)
+    if include_mteb_summeval:
+        yield from iter_mteb_summeval_records()

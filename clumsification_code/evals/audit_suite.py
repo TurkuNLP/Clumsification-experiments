@@ -21,6 +21,7 @@ from .standalone_benchmarks import (
     DEFAULT_ARGESSAY_PATH,
     DEFAULT_COHESENTIA_PATH,
     DEFAULT_ELLIPSE_PATH,
+    DEFAULT_MTEB_SUMMEVAL_DATASET,
 )
 
 
@@ -97,6 +98,7 @@ def build_audit_report(
             "ellipse": str(ellipse_path) if ellipse_path else None,
             "argessay": str(argessay_path) if argessay_path else None,
             "cohesentia": str(cohesentia_path) if cohesentia_path else None,
+            "mteb_summeval": DEFAULT_MTEB_SUMMEVAL_DATASET,
         },
         "metadata_rows": len(metadata),
         "metadata_retained_records": sum(metadata_by_benchmark.values()),
