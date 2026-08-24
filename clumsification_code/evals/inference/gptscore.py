@@ -24,6 +24,15 @@ _DTYPE_MAP = {
 }
 
 
+# Dedicated custom-dataset prompt. It is intentionally separate from the
+# candidate-only GPTSCORE_NOREF_PROMPTS below and is easy to replace for a
+# controlled prompt ablation.
+DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT = (
+    "Assess the fluency and grammaticality of the candidate given the "
+    "source text.\n\nSource text:\n{source}\n\nCandidate text:\n"
+)
+
+
 _ORIGINAL_PRINT = builtins.print
 _PRINT_PATCH_INSTALLED = False
 
@@ -460,9 +469,15 @@ class LocalHFGPTScoreInferenceModel:
 
     Public method:
       score_texts(texts, device=None, batch_size=..., max_length=...) -> np.ndarray
+      score_pairs(sources, candidates, batch_size=..., max_length=...) -> np.ndarray
 
     Returned scores are higher-is-better:
        -mean negative log-likelihood over candidate tokens.
+
+    ``score_texts`` is the direct candidate-only benchmark protocol.
+    ``score_pairs`` is the source-aware custom-dataset teacher protocol; it
+    conditions candidate likelihood on the source but never scores source
+    tokens.
 
     Multi-GPU behavior:
       - If launched with torchrun and tp_plan is enabled, this initializes
@@ -480,6 +495,7 @@ class LocalHFGPTScoreInferenceModel:
         aspect: str = "quality",
         prompt_table: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
         prompt_template: Optional[str] = None,
+        source_prompt_template: str = DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT,
         batch_size: int = 8,
         max_input_length: int = 1024,
         dtype: Union[str, torch.dtype] = "auto",
@@ -509,6 +525,10 @@ class LocalHFGPTScoreInferenceModel:
         self.aspect = aspect
         self.prompt_table = prompt_table or GPTSCORE_NOREF_PROMPTS
         self.prompt_template = prompt_template
+        # This is deliberately separate from the no-reference prompt table.
+        # It is the only prompt used by score_pairs(), and is easy to replace
+        # when comparing alternative source-aware GPTScore formulations.
+        self.source_prompt_template = source_prompt_template
 
         self.batch_size = batch_size
         self.max_input_length = max_input_length
@@ -702,6 +722,9 @@ class LocalHFGPTScoreInferenceModel:
 
         return source_side + prompt_text
 
+    def _render_source_prompt(self, source: str) -> str:
+        return self.source_prompt_template.format(source=self._clean_text(source))
+
     @staticmethod
     def _clean_text(text: Any) -> str:
         if text is None:
@@ -736,8 +759,9 @@ class LocalHFGPTScoreInferenceModel:
         self,
         text: str,
         max_length: int,
+        prompt: Optional[str] = None,
     ) -> Dict[str, List[int]]:
-        prompt = self._render_prompt()
+        prompt = self._render_prompt() if prompt is None else prompt
         candidate = self._clean_text(text)
 
         if not candidate:
@@ -802,8 +826,9 @@ class LocalHFGPTScoreInferenceModel:
         self,
         text: str,
         max_length: int,
+        prompt: Optional[str] = None,
     ) -> Dict[str, List[int]]:
-        prompt = self._render_prompt()
+        prompt = self._render_prompt() if prompt is None else prompt
         candidate = self._clean_text(text)
 
         prompt_ids = self.tokenizer(
@@ -852,11 +877,13 @@ class LocalHFGPTScoreInferenceModel:
             "labels": labels,
         }
 
-    def _encode_causal_one(self, text: str, max_length: int) -> Dict[str, List[int]]:
+    def _encode_causal_one(
+        self, text: str, max_length: int, prompt: Optional[str] = None
+    ) -> Dict[str, List[int]]:
         if self.original_causal_tokenization:
-            return self._encode_causal_one_original_style(text, max_length)
+            return self._encode_causal_one_original_style(text, max_length, prompt)
 
-        return self._encode_causal_one_separate_prompt_target(text, max_length)
+        return self._encode_causal_one_separate_prompt_target(text, max_length, prompt)
 
     def _collate_causal(
         self,
@@ -899,6 +926,7 @@ class LocalHFGPTScoreInferenceModel:
         texts: List[str],
         batch_size: int,
         max_length: int,
+        prompts: Optional[List[str]] = None,
     ) -> np.ndarray:
         if not texts:
             return np.asarray([], dtype=np.float64)
@@ -908,8 +936,12 @@ class LocalHFGPTScoreInferenceModel:
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start : start + batch_size]
             features = [
-                self._encode_causal_one(text=t, max_length=max_length)
-                for t in batch_texts
+                self._encode_causal_one(
+                    text=t,
+                    max_length=max_length,
+                    prompt=None if prompts is None else prompts[start + i],
+                )
+                for i, t in enumerate(batch_texts)
             ]
             batch = self._collate_causal(features)
 
@@ -965,9 +997,9 @@ class LocalHFGPTScoreInferenceModel:
         self,
         texts: List[str],
         max_length: int,
+        prompts: Optional[List[str]] = None,
     ) -> Dict[str, torch.Tensor]:
-        prompt = self._render_prompt()
-        sources = [prompt for _ in texts]
+        sources = [self._render_prompt() for _ in texts] if prompts is None else prompts
         targets = [self._clean_text(t) for t in texts]
 
         targets = [
@@ -1018,6 +1050,7 @@ class LocalHFGPTScoreInferenceModel:
         texts: List[str],
         batch_size: int,
         max_length: int,
+        prompts: Optional[List[str]] = None,
     ) -> np.ndarray:
         if not texts:
             return np.asarray([], dtype=np.float64)
@@ -1029,6 +1062,7 @@ class LocalHFGPTScoreInferenceModel:
             batch = self._encode_seq2seq_batch(
                 texts=batch_texts,
                 max_length=max_length,
+                prompts=None if prompts is None else prompts[start : start + batch_size],
             )
 
             outputs = self.model(
@@ -1128,4 +1162,46 @@ class LocalHFGPTScoreInferenceModel:
             texts=texts,
             batch_size=effective_batch_size,
             max_length=effective_max_length,
+        )
+
+    @torch.no_grad()
+    def score_pairs(
+        self,
+        sources: List[str],
+        candidates: List[str],
+        batch_size: int = 32,
+        max_length: int = 512,
+    ) -> np.ndarray:
+        """Score candidates conditioned on source text, without a reference.
+
+        Only candidate tokens contribute to likelihood. The source is prompt
+        context, so source length does not receive a score of its own.
+        """
+        if len(sources) != len(candidates):
+            raise ValueError("sources and candidates must have the same length.")
+        sources = [self._clean_text(value) for value in sources]
+        candidates = [self._clean_text(value) for value in candidates]
+        prompts = [self._render_source_prompt(source) for source in sources]
+        effective_batch_size = int(batch_size or self.batch_size)
+        effective_max_length = int(max_length or self.max_input_length)
+        if effective_batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be positive, got {effective_batch_size}."
+            )
+        if effective_max_length <= 0:
+            raise ValueError(
+                f"max_length must be positive, got {effective_max_length}."
+            )
+        if self.is_seq2seq:
+            return self._score_seq2seq_batch(
+                texts=candidates,
+                batch_size=effective_batch_size,
+                max_length=effective_max_length,
+                prompts=prompts,
+            )
+        return self._score_causal_batch(
+            texts=candidates,
+            batch_size=effective_batch_size,
+            max_length=effective_max_length,
+            prompts=prompts,
         )

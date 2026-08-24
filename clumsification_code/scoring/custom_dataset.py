@@ -27,6 +27,17 @@ from clumsification_code.data.candidate_identity import (
 
 DEFAULT_PPL_MODEL = "Qwen/Qwen3-8B-Base"
 DEFAULT_BLEURT_CHECKPOINT = "BLEURT-20"
+DEFAULT_METRICX_MODEL = "google/metricx-24-hybrid-xl-v2p6"
+DEFAULT_METRICX_TOKENIZER = "google/mt5-xl"
+SUPPORTED_SCORING_TYPES = frozenset(
+    {
+        "token_normalized_perplexity",
+        "bertscore_f1",
+        "bleurt",
+        "metricx24_source_qe",
+        "gptscore_source_fluency",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -441,19 +452,32 @@ def score_custom_dataset(
     batch_size: int,
     model_name: str | None,
     bleurt_checkpoint: str = DEFAULT_BLEURT_CHECKPOINT,
-    max_tokens: int,
-    device: str | None,
-    layer_directory: str,
-    overwrite: bool,
+    metricx_model_name: str = DEFAULT_METRICX_MODEL,
+    metricx_tokenizer_name: str = DEFAULT_METRICX_TOKENIZER,
+    metricx_max_input_length: int = 1536,
+    gptscore_model_name: str | None = None,
+    gptscore_tokenizer_name: str | None = None,
+    gptscore_model_type: str = "auto",
+    gptscore_source_prompt_template: str | None = None,
+    gptscore_device: str | None = None,
+    gptscore_device_map: str | None = None,
+    gptscore_dtype: str = "auto",
+    gptscore_tp_plan: str | None = "auto",
+    max_tokens: int = 8192,
+    device: str | None = None,
+    layer_directory: str = "perturbed_layers",
+    overwrite: bool = False,
     dataset_root: Path = Path("data/custom_datasets"),
 ) -> dict:
     """Score originals and perturbations and write reproducibility records."""
-    if scoring_type not in {"token_normalized_perplexity", "bertscore_f1", "bleurt"}:
+    if scoring_type not in SUPPORTED_SCORING_TYPES:
         raise ValueError(f"Unsupported scoring_type: {scoring_type!r}")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     if max_tokens < 2:
         raise ValueError("max_tokens must be at least 2.")
+    if metricx_max_input_length < 2:
+        raise ValueError("metricx_max_input_length must be at least 2.")
 
     dataset_dir = dataset_root / dataset_name
     perturbation_source = canonical_perturbation_source(layer_directory)
@@ -483,6 +507,85 @@ def score_custom_dataset(
             "checkpoint": bleurt_checkpoint,
         }
         direction_description = "Raw BLEURT score; higher is better; no transformation."
+    elif scoring_type == "metricx24_source_qe":
+        from clumsification_code.evals.inference.metricx import MetricX24QEInferenceModel
+
+        teacher = MetricX24QEInferenceModel(
+            model_name_or_path=metricx_model_name,
+            tokenizer_name=metricx_tokenizer_name,
+            batch_size=batch_size,
+            max_input_length=metricx_max_input_length,
+        )
+
+        def scorer(task_batch: Sequence[ScoreTask]) -> list[float]:
+            return teacher.score_pairs(
+                [task.source_text for task in task_batch],
+                [task.target_text for task in task_batch],
+            ).tolist()
+
+        scorer_config = {
+            "model_name": metricx_model_name,
+            "tokenizer_name": metricx_tokenizer_name,
+            "input_mode": "source_allowed",
+            "uses_reference": False,
+            "format": "source: <source> candidate: <candidate>",
+            "max_input_length": metricx_max_input_length,
+        }
+        direction_description = (
+            "MetricX-24 raw QE error is lower-is-better; stored value is its "
+            "negation, so higher is better."
+        )
+    elif scoring_type == "gptscore_source_fluency":
+        from clumsification_code.evals.inference.gptscore import (
+            DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT,
+            LocalHFGPTScoreInferenceModel,
+        )
+        import torch
+
+        if not gptscore_model_name:
+            raise ValueError(
+                "gptscore_source_fluency requires --gptscore-model-name."
+            )
+        teacher = LocalHFGPTScoreInferenceModel(
+            model_name_or_path=gptscore_model_name,
+            tokenizer_name_or_path=gptscore_tokenizer_name,
+            model_type=gptscore_model_type,
+            task_name="custom_dataset",
+            aspect="fluency",
+            batch_size=batch_size,
+            max_input_length=max_tokens,
+            dtype=gptscore_dtype,
+            device=None if gptscore_device is None else torch.device(gptscore_device),
+            device_map=gptscore_device_map,
+            tp_plan=gptscore_tp_plan,
+            source_prompt_template=(
+                gptscore_source_prompt_template
+                or DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT
+            ),
+        )
+
+        def scorer(task_batch: Sequence[ScoreTask]) -> list[float]:
+            return teacher.score_pairs(
+                [task.source_text for task in task_batch],
+                [task.target_text for task in task_batch],
+                batch_size=batch_size,
+                max_length=max_tokens,
+            ).tolist()
+
+        scorer_config = {
+            "model_name": gptscore_model_name,
+            "tokenizer_name": gptscore_tokenizer_name or gptscore_model_name,
+            "model_type": gptscore_model_type,
+            "input_mode": "source_allowed",
+            "uses_reference": False,
+            "source_prompt_template": teacher.source_prompt_template,
+            "length_normalization": "mean",
+            "max_input_length": max_tokens,
+        }
+        direction_description = (
+            "Negative mean candidate-token NLL conditioned on the source; "
+            "higher is better."
+        )
     else:
         scorer_config = {"model_name": model_name or DEFAULT_PPL_MODEL}
         local_scorer = TokenNormalizedPerplexityScorer(
@@ -569,6 +672,8 @@ def score_custom_dataset(
         "num_successful_scores": len(score_rows),
         "num_failures": len(error_rows),
         "language": language,
+        "teacher_input_mode": scorer_config.get("input_mode", "candidate_only"),
+        "uses_reference": scorer_config.get("uses_reference", False),
         "batch_size": batch_size,
         "max_tokens": max_tokens,
         "device": device,

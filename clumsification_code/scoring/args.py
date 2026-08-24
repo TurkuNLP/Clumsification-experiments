@@ -6,7 +6,10 @@ from pathlib import Path
 
 from clumsification_code.scoring.custom_dataset import (
     DEFAULT_BLEURT_CHECKPOINT,
+    DEFAULT_METRICX_MODEL,
+    DEFAULT_METRICX_TOKENIZER,
     DEFAULT_PPL_MODEL,
+    SUPPORTED_SCORING_TYPES,
 )
 
 
@@ -20,7 +23,7 @@ def parse_score_args():
         "--scoring-type",
         type=str,
         required=True,
-        choices=["token_normalized_perplexity", "bertscore_f1", "bleurt"],
+        choices=sorted(SUPPORTED_SCORING_TYPES),
     )
     parser.add_argument(
         "--sample-limit",
@@ -48,6 +51,29 @@ def parse_score_args():
         default=DEFAULT_BLEURT_CHECKPOINT,
         help="BLEURT checkpoint for BLEURT scoring; ignored by other methods.",
     )
+    parser.add_argument("--metricx-model-name", default=DEFAULT_METRICX_MODEL)
+    parser.add_argument("--metricx-tokenizer-name", default=DEFAULT_METRICX_TOKENIZER)
+    parser.add_argument("--metricx-max-input-length", type=int, default=1536)
+    parser.add_argument(
+        "--gptscore-model-name",
+        default=None,
+        help="Local/Hugging Face model for source-aware GPTScore supervision.",
+    )
+    parser.add_argument("--gptscore-tokenizer-name", default=None)
+    parser.add_argument(
+        "--gptscore-model-type",
+        choices=["auto", "causal", "seq2seq"],
+        default="auto",
+    )
+    parser.add_argument(
+        "--gptscore-source-prompt-template",
+        default=None,
+        help="Template containing {source}; candidate text is scored after it.",
+    )
+    parser.add_argument("--gptscore-device", default=None)
+    parser.add_argument("--gptscore-device-map", default=None)
+    parser.add_argument("--gptscore-dtype", default="auto")
+    parser.add_argument("--gptscore-tp-plan", default="auto")
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument(
         "--device",
@@ -75,4 +101,6 @@ def parse_score_args():
         parser.error("--batch-size must be positive.")
     if args.max_tokens < 2:
         parser.error("--max-tokens must be at least 2.")
+    if args.metricx_max_input_length < 2:
+        parser.error("--metricx-max-input-length must be at least 2.")
     return args

@@ -18,7 +18,8 @@ raw documents
                                      └─ clumsification_code/evals/  inference + benchmarks
 ```
 
-The critical boundary is the formatted Hugging Face dataset. Everything before it creates supervision; everything after it trains or evaluates a scorer.
+The formatted Hugging Face dataset is the key boundary: upstream code creates
+supervision, while downstream code trains or evaluates scorers.
 
 ## Main folders
 
@@ -47,10 +48,9 @@ A formatted row normally contains `texts` and aligned `labels`; named score list
 
 #### Candidate and score identity
 
-Every original or perturbation candidate has a stable `candidate_id`. This is
-distinct from the source-document identity used for leakage-safe splitting.
-The source identity answers “which original document does this belong to?”;
-the candidate identity answers “which exact text instance is this?”
+Every original or perturbation candidate has a stable `candidate_id`, separate
+from the source-document identity used for leakage-safe splitting. The source
+ID identifies the document; the candidate ID identifies the exact text.
 
 The canonical score-record identity is:
 
@@ -58,10 +58,10 @@ The canonical score-record identity is:
 (dataset_name, base_text_id, perturbation_source, candidate_id)
 ```
 
-`candidate_id` must distinguish candidates that share an original, perturbation
-source, and target layer. Layer is retained as descriptive metadata and for
-ordering, but it is not by itself a unique candidate key. Score records also
-retain `source_layer`, `target_layer`, `score_name`, and `score_value`.
+`candidate_id` distinguishes candidates that share an original, perturbation
+source, or target layer. Layer remains descriptive metadata and is not a
+unique key. Score records also retain `source_layer`, `target_layer`,
+`score_name`, and `score_value`.
 
 The canonical perturbation-source values are `LLM` and `trad`. New code should
 use `perturbation_source` rather than directory names. The raw input directory
@@ -69,8 +69,8 @@ is used only to select which perturbation files are scored; it is not written
 as the candidate's identity.
 
 Candidate IDs must survive formatting, shuffling, pairing, train/dev/test
-serialization, and score lookup. Parallel arrays such as `texts`, `labels`,
-and score lists must remain aligned with the corresponding `candidate_ids`.
+serialization, and score lookup. `texts`, `labels`, and score lists must stay
+aligned with their corresponding candidate IDs.
 
 There is intentionally no legacy score-file reader. Existing experimental
 score directories are disposable and should be removed before producing
@@ -78,30 +78,41 @@ canonical scores.
 
 ### 1a. Produce scalar supervision (before dataset formatting)
 
-`scripts/score_custom_dataset.py` scores candidate perturbations against their
-source original and writes one JSONL file per method under
-`data/custom_datasets/<dataset>/scores/`. It currently supports local
-token-normalized perplexity, BERTScore F1, and BLEURT. Sampling always selects
-original IDs first, then scores every perturbation belonging to each selected
-original.
+`scripts/score_custom_dataset.py` writes one JSONL file per scoring method
+under `data/custom_datasets/<dataset>/scores/`. It first samples original IDs,
+then scores every candidate belonging to each selected original. Originals are
+self-scored by default.
 
-Successful score rows use the stable fields `base_text_id`, `source_layer`,
-`target_layer`, `score_name`, and `score_value`, plus canonical
-`perturbation_source` and `candidate_id` fields. Both perturbation sources
-share one score file per scoring method. Originals are self-scored by default
-using an original-to-original comparison and use `perturbation_source` equal
-to `original`. Failures are written separately to
-`<score_name>.errors.jsonl`, while `<score_name>.<source>.metadata.json`
-records the model, direction/transform, seed, selected IDs, and library
-versions. All
-stored score values use the convention **higher is better**: BERTScore F1 is
-stored directly using Hugging Face Evaluate's normal defaults, BLEURT is stored
-directly, while perplexity is transformed to `-log(perplexity)`.
+The scoring methods use two deliberate input protocols:
 
-When only part of a custom dataset has a given score, pass `--score-names` to
-`scripts/create_fe_training_dataset.py`. The split is then made only over
-original IDs with at least one requested score in the selected perturbation
-folder(s), ensuring regression examples are distributed across train/dev/test.
+| Method | Input used for scoring | Stored direction |
+| --- | --- | --- |
+| Token-normalized perplexity | Candidate only | Negative mean token NLL; higher is better |
+| BERTScore F1 | Original as reference, candidate as prediction | Raw F1; higher is better |
+| BLEURT | Original as reference, candidate as prediction | Raw score; higher is better |
+| MetricX-24 QE | Original source plus candidate | Negated QE error; higher is better |
+| GPTScore fluency | Original in the prompt plus candidate tokens | Negative candidate-token NLL; higher is better |
+
+The source-aware MetricX and GPTScore methods are supervision teachers for
+custom datasets. Their `score_pairs(...)` entry points are separate from the
+candidate-only `score_texts(...)` paths used by direct benchmark evaluation.
+Neither source-aware method uses a reference. For self-scored originals,
+source and candidate are the same text, and the computed teacher score is
+stored rather than replaced with a perfect score.
+
+Successful score rows use `base_text_id`, `perturbation_source`,
+`candidate_id`, `source_layer`, `target_layer`, `score_name`, and
+`score_value`. Both perturbation sources share one score file per method.
+Failures are written to `<score_name>.errors.jsonl`; the accompanying metadata
+file records the model, input mode, score transformation, sampling settings,
+and library versions. Every stored score is higher-is-better. Perplexity is
+stored as `-log(perplexity)`; the other methods use the transformations shown
+above.
+
+When only some scores are available, pass `--score-names` to
+`scripts/create_fe_training_dataset.py`. Splitting then considers only
+original IDs with at least one requested score, so regression examples remain
+distributed across train/dev/test.
 
 ### 2. Train an FE model
 
@@ -124,6 +135,11 @@ Both paths use `fe/modeling.py::FEModel`: a Hugging Face encoder, mean pooling, 
 - `evals/geval/` for G-Eval.
 
 `evals/benchmark_runner.py` runs the datasets loaded by `benchmark_data.py`; `metrics.py` calculates correlations/preferences; `result_writer.py` records results. `evaluate_model_on_tdt_regens.py` is the larger specialized workflow for regenerated TDT/UD texts.
+
+Direct benchmark evaluation is candidate-only unless a benchmark adapter
+explicitly defines another protocol. The source-aware `score_pairs(...)`
+methods described above are used for custom-dataset supervision and are not
+called by the direct benchmark runner.
 
 ## Raw-data and perturbation conventions
 

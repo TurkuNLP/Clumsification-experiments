@@ -10,7 +10,15 @@ import transformers
 # metricx24 must be available in PYTHONPATH / environment
 from clumsification_code.evals.metricx24 import models
 
+
 class MetricX24QEInferenceModel:
+    """MetricX-24 QE adapter with explicit no-source and source-aware entry points.
+
+    ``score_texts`` preserves the direct benchmark protocol and supplies an
+    empty source. ``score_pairs`` is the custom-dataset teacher protocol and
+    supplies the original source plus candidate text. Keeping these methods
+    separate prevents an accidental change in benchmark semantics.
+    """
 
     def __init__(
         self,
@@ -61,8 +69,13 @@ class MetricX24QEInferenceModel:
         # MetricX-24 QE input format:
         #   source: <source> candidate: <hypothesis>
         # Here source is intentionally empty because this benchmark is no-source/no-reference.
-        candidate = "" if text is None else str(text)
-        inp = f"source:  candidate: {candidate}"
+        return self._prep_input(source="", candidate=text)
+
+    def _prep_input(self, source: str, candidate: str) -> Dict[str, List[int]]:
+        """Tokenize one MetricX-24 QE record and remove its terminal EOS."""
+        source = "" if source is None else str(source)
+        candidate = "" if candidate is None else str(candidate)
+        inp = f"source: {source} candidate: {candidate}"
 
         tok = self.tokenizer(
             inp,
@@ -78,6 +91,10 @@ class MetricX24QEInferenceModel:
 
         return tok
 
+    def _prep_pair(self, source: str, candidate: str) -> Dict[str, List[int]]:
+        """Prepare the official MetricX-24 QE source-plus-candidate format."""
+        return self._prep_input(source=source, candidate=candidate)
+
     @torch.no_grad()
     def raw_metricx_scores(self, texts: List[str]) -> np.ndarray:
         """
@@ -91,6 +108,29 @@ class MetricX24QEInferenceModel:
         preds, _, _ = self.trainer.predict(test_dataset=ds)
         preds = np.asarray(preds).reshape(-1).astype(np.float64)
         return preds
+
+    @torch.no_grad()
+    def raw_metricx_pair_scores(
+        self, sources: List[str], candidates: List[str]
+    ) -> np.ndarray:
+        """Return raw lower-is-better errors for source/candidate pairs."""
+        if len(sources) != len(candidates):
+            raise ValueError("sources and candidates must have the same length.")
+        feats = [
+            self._prep_pair(source, candidate)
+            for source, candidate in zip(sources, candidates)
+        ]
+        ds = datasets.Dataset.from_list(feats)
+        preds, _, _ = self.trainer.predict(test_dataset=ds)
+        return np.asarray(preds).reshape(-1).astype(np.float64)
+
+    @torch.no_grad()
+    def score_pairs(
+        self, sources: List[str], candidates: List[str]
+    ) -> np.ndarray:
+        """Return higher-is-better scores while retaining source context."""
+        scores = self.raw_metricx_pair_scores(sources, candidates)
+        return -scores if self.return_higher_is_better else scores
 
     @torch.no_grad()
     def score_texts(
