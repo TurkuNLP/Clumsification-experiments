@@ -22,6 +22,7 @@ from clumsification_code.perturbations.evaleval_perturbations import (
     RULE_BASED_OUTPUT_DIR,
     rule_based_perturbation,
 )
+from clumsification_code.data.candidate_identity import add_candidate_ids_to_rows
 
 VALID_PERTURBATION_TYPES = (
     "clumsification",
@@ -439,6 +440,11 @@ def main():
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, output_layer + ".jsonl")
             subset = [d for d in res_d if d["_source_ds"] == ds_name]
+            subset = add_candidate_ids_to_rows(
+                subset,
+                perturbation_source="trad",
+                target_layer=int(output_layer),
+            )
             with open(out_path, "w", encoding="UTF-8") as writer:
                 for d in subset:
                     row = {k: v for k, v in d.items() if k != "_source_ds"}
@@ -597,6 +603,11 @@ def main():
     for ds_name in DS_NAMES:
         out_path = ds_folders[ds_name] + "perturbed_layers/" + output_layer + ".jsonl"
         subset = [d for d in res_d if d["_source_ds"] == ds_name]
+        subset = add_candidate_ids_to_rows(
+            subset,
+            perturbation_source="LLM",
+            target_layer=int(output_layer),
+        )
         with open(out_path, "w", encoding="UTF-8") as writer:
             for d in subset:
                 row = {k: v for k, v in d.items() if k != "_source_ds"}

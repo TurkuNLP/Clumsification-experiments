@@ -12,6 +12,7 @@ from pprint import pprint
 import multiprocessing as mp
 from tqdm import tqdm
 import clumsification_code.perturbations.OpenAI_lib as ol
+from clumsification_code.data.candidate_identity import add_candidate_ids_to_rows
 import time
 from openai.lib._parsing._responses import type_to_text_format_param
 from openai.types.responses import Response
@@ -165,6 +166,11 @@ def main(cmd_args):
             file_response = client.files.content(result_file_id)
 
             completions = read_batch_response_contents(file_response.read().splitlines(), model_name, perturbation_type)
+            completions = add_candidate_ids_to_rows(
+                completions,
+                perturbation_source="LLM",
+                target_layer=perturbation_layer + 1,
+            )
             
             result_file_name = custom_ds_folder+output_name
 
@@ -194,6 +200,11 @@ def main(cmd_args):
         result_file_id = batch_job.output_file_id
         file_response = client.files.content(result_file_id)
         completions = read_batch_response_contents(file_response.read().splitlines(), model_name, perturbation_type)
+        completions = add_candidate_ids_to_rows(
+            completions,
+            perturbation_source="LLM",
+            target_layer=perturbation_layer + 1,
+        )
         result_file_name = custom_ds_folder+output_name
 
         with open(result_file_name, 'a') as file:

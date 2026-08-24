@@ -4,6 +4,53 @@ from collections import defaultdict
 from typing import Optional
 
 
+def get_aligned_candidate_items(entry: dict) -> list[dict]:
+    """Return one readable record per aligned candidate in a chain."""
+    entry_id = entry["id"]
+    text_label_pairs = list(entry["text_label_pairs"])
+    if "candidate_ids" not in entry:
+        raise ValueError(f"Entry {entry_id!r} is missing candidate_ids.")
+    if "perturbation_sources" not in entry:
+        raise ValueError(f"Entry {entry_id!r} is missing perturbation_sources.")
+
+    candidate_ids = list(entry["candidate_ids"])
+    perturbation_sources = list(entry["perturbation_sources"])
+    item_score_dicts = list(
+        entry.get("item_score_dicts", [{} for _ in text_label_pairs])
+    )
+
+    fields = {
+        "text_label_pairs": text_label_pairs,
+        "candidate_ids": candidate_ids,
+        "perturbation_sources": perturbation_sources,
+        "item_score_dicts": item_score_dicts,
+    }
+    lengths = {name: len(values) for name, values in fields.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Entry {entry_id!r} has misaligned candidate fields: {lengths}.")
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError(f"Entry {entry_id!r} contains duplicate candidate_ids.")
+
+    return [
+        {
+            "source_id": entry_id,
+            "dataset_name": entry.get("dataset_name"),
+            "source_original_ids": list(entry.get("source_original_ids", [])),
+            "text": text,
+            "label": label,
+            "candidate_id": candidate_id,
+            "perturbation_source": perturbation_source,
+            "score_dict": score_dict,
+        }
+        for (text, label), candidate_id, perturbation_source, score_dict in zip(
+            text_label_pairs,
+            candidate_ids,
+            perturbation_sources,
+            item_score_dicts,
+        )
+    ]
+
+
 def generate_training_pairs_random(
     formatted_dataset: list[dict],
     seed: Optional[int] = None,
@@ -20,32 +67,7 @@ def generate_training_pairs_random(
     items = []
 
     for entry in formatted_dataset:
-        entry_id = entry["id"]
-        source_original_ids = list(entry.get("source_original_ids", []))
-        dataset_name = entry.get("dataset_name")
-        text_label_pairs = entry["text_label_pairs"]
-        item_score_dicts = entry.get(
-            "item_score_dicts",
-            [{} for _ in text_label_pairs],
-        )
-
-        if len(text_label_pairs) != len(item_score_dicts):
-            raise ValueError(
-                f"Entry {entry_id!r} has misaligned text_label_pairs and "
-                "item_score_dicts."
-            )
-
-        for (text, label), score_dict in zip(text_label_pairs, item_score_dicts):
-            items.append(
-                {
-                    "source_id": entry_id,
-                    "dataset_name": dataset_name,
-                    "source_original_ids": source_original_ids,
-                    "text": text,
-                    "label": label,
-                    "score_dict": score_dict,
-                }
-            )
+        items.extend(get_aligned_candidate_items(entry))
 
     if len(items) < 2:
         return []
@@ -124,6 +146,11 @@ def generate_training_pairs_random(
                 "text_label_pairs": [
                     (item_a["text"], item_a["label"]),
                     (item_b["text"], item_b["label"]),
+                ],
+                "candidate_ids": [item_a["candidate_id"], item_b["candidate_id"]],
+                "perturbation_sources": [
+                    item_a["perturbation_source"],
+                    item_b["perturbation_source"],
                 ],
                 "item_score_dicts": [
                     dict(item_a["score_dict"]),

@@ -19,6 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+from clumsification_code.data.candidate_identity import (
+    candidate_id_from_raw_row,
+    canonical_perturbation_source,
+)
 
 DEFAULT_PPL_MODEL = "Qwen/Qwen3-8B-Base"
 DEFAULT_BLEURT_CHECKPOINT = "BLEURT-20"
@@ -62,40 +66,47 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _merge_source_rows(
+    path: Path,
+    new_rows: list[dict],
+    *,
+    perturbation_source: str,
+    overwrite: bool,
+) -> list[dict]:
+    """Replace one source's rows while preserving the other source."""
+    if not path.exists():
+        return new_rows
+
+    existing_rows = _read_jsonl(path)
+    for row_number, row in enumerate(existing_rows, start=1):
+        missing = {"perturbation_source", "candidate_id"} - row.keys()
+        if missing:
+            raise ValueError(
+                f"{path}:{row_number} is not a canonical score record; "
+                f"missing {sorted(missing)}. Remove the old score file "
+                "before running the new scorer."
+            )
+
+    existing_sources = {row["perturbation_source"] for row in existing_rows}
+    if perturbation_source in existing_sources and not overwrite:
+        raise FileExistsError(
+            f"{path} already contains {perturbation_source!r} records. "
+            "Pass --overwrite to replace them."
+        )
+
+    retained_rows = [
+        row
+        for row in existing_rows
+        if row["perturbation_source"] != perturbation_source
+    ]
+    return retained_rows + new_rows
+
+
 def _as_int(value: object, *, context: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Expected an integer {context}, got {value!r}.") from exc
-
-
-def _canonical_perturbation_source(layer_directory: str) -> str:
-    """Map one raw perturbation directory to its canonical source label."""
-    source_by_directory = {
-        "perturbed_layers": "LLM",
-        "trad_perturbed_layers": "trad",
-    }
-    try:
-        return source_by_directory[layer_directory]
-    except KeyError as exc:
-        raise ValueError(
-            "layer_directory must be 'perturbed_layers' or "
-            f"'trad_perturbed_layers', got {layer_directory!r}."
-        ) from exc
-
-
-def _make_candidate_id(
-    *,
-    perturbation_source: str,
-    base_text_id: int,
-    target_layer: int,
-    candidate_index: int,
-) -> str:
-    """Create a readable and deterministic ID for one candidate text."""
-    return (
-        f"{perturbation_source}__base_{base_text_id}__layer_{target_layer}__"
-        f"candidate_{candidate_index:06d}"
-    )
 
 
 def select_original_ids(
@@ -121,7 +132,7 @@ def load_score_tasks(
     seed: int,
 ) -> tuple[list[ScoreTask], list[int]]:
     """Load all candidates for a sampled set of original document IDs."""
-    perturbation_source = _canonical_perturbation_source(layer_directory)
+    perturbation_source = canonical_perturbation_source(layer_directory)
     original_path = dataset_dir / "original.jsonl"
     if not original_path.is_file():
         raise FileNotFoundError(f"Missing original dataset file: {original_path}")
@@ -176,7 +187,8 @@ def load_score_tasks(
                 ScoreTask(
                     base_text_id=original_id,
                     perturbation_source=perturbation_source,
-                    candidate_id=_make_candidate_id(
+                    candidate_id=candidate_id_from_raw_row(
+                        row,
                         perturbation_source=perturbation_source,
                         base_text_id=original_id,
                         target_layer=target_layer,
@@ -423,7 +435,7 @@ def score_custom_dataset(
         raise ValueError("max_tokens must be at least 2.")
 
     dataset_dir = dataset_root / dataset_name
-    perturbation_source = _canonical_perturbation_source(layer_directory)
+    perturbation_source = canonical_perturbation_source(layer_directory)
     tasks, selected_ids = load_score_tasks(
         dataset_dir=dataset_dir,
         layer_directory=layer_directory,
@@ -491,46 +503,24 @@ def score_custom_dataset(
         }
         for failure in failures
     ]
-    def merge_source_rows(path: Path, new_rows: list[dict]) -> list[dict]:
-        """Store both sources in one file while replacing only this source."""
-        if not path.exists():
-            return new_rows
-
-        existing_rows = _read_jsonl(path)
-        for row_number, row in enumerate(existing_rows, start=1):
-            missing = {
-                "perturbation_source",
-                "candidate_id",
-            } - row.keys()
-            if missing:
-                raise ValueError(
-                    f"{path}:{row_number} is not a canonical score record; "
-                    f"missing {sorted(missing)}. Remove the old score file "
-                    "before running the new scorer."
-                )
-        existing_sources = {
-            row.get("perturbation_source") for row in existing_rows
-        }
-        if perturbation_source in existing_sources and not overwrite:
-            raise FileExistsError(
-                f"{path} already contains {perturbation_source!r} records. "
-                "Pass --overwrite to replace them."
-            )
-        retained_rows = [
-            row
-            for row in existing_rows
-            if row.get("perturbation_source") != perturbation_source
-        ]
-        return retained_rows + new_rows
-
     _write_jsonl_atomically(
         score_path,
-        merge_source_rows(score_path, score_rows),
+        _merge_source_rows(
+            score_path,
+            score_rows,
+            perturbation_source=perturbation_source,
+            overwrite=overwrite,
+        ),
         overwrite=True,
     )
     _write_jsonl_atomically(
         error_path,
-        merge_source_rows(error_path, error_rows),
+        _merge_source_rows(
+            error_path,
+            error_rows,
+            perturbation_source=perturbation_source,
+            overwrite=overwrite,
+        ),
         overwrite=True,
     )
     metadata = {

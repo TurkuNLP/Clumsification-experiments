@@ -9,6 +9,11 @@ from typing import Optional
 
 from clumsification_code.data.io import read_ds
 from clumsification_code.data.pairing import generate_training_pairs_random
+from clumsification_code.data.candidate_identity import (
+    candidate_id_from_raw_row,
+    canonical_perturbation_source,
+    make_original_candidate_id,
+)
 
 
 def _coerce_custom_id(value, *, context: str) -> int:
@@ -79,27 +84,22 @@ def _read_originals_by_custom_id(custom_dataset_name: str) -> dict[int, dict]:
 
 def load_external_scores(
     custom_dataset_name: str,
-) -> dict[tuple[str, int, int], dict[str, float]]:
-    """Read successful score JSONL files keyed by source folder, ID, and layer.
-
-    Score files are intentionally separate from raw texts.  ``source_folder``
-    makes scores for ``perturbed_layers`` and ``trad_perturbed_layers``
-    unambiguous even when they share the same original ID and numeric layer.
-    Error files are never read as supervision.
-    """
+) -> dict[tuple[str, int, str], dict[str, float]]:
+    """Read canonical score files keyed by source, original, and candidate ID."""
     score_root = Path("data") / "custom_datasets" / custom_dataset_name / "scores"
     if not score_root.is_dir():
         return {}
 
-    scores: dict[tuple[str, int, int], dict[str, float]] = {}
-    for score_path in sorted(score_root.rglob("*.jsonl")):
+    scores: dict[tuple[str, int, str], dict[str, float]] = {}
+    for score_path in sorted(score_root.glob("*.jsonl")):
         if score_path.name.endswith(".errors.jsonl"):
             continue
 
         for row_no, row in enumerate(read_ds(str(score_path)), start=1):
             required_fields = {
                 "base_text_id",
-                "source_folder",
+                "perturbation_source",
+                "candidate_id",
                 "source_layer",
                 "target_layer",
                 "score_name",
@@ -113,10 +113,15 @@ def load_external_scores(
                     "current score schema."
                 )
 
-            source_folder = row["source_folder"]
+            perturbation_source = row["perturbation_source"]
+            candidate_id = row["candidate_id"]
             score_name = row["score_name"]
-            if not isinstance(source_folder, str) or not source_folder:
-                raise ValueError(f"{score_path}:{row_no}: source_folder must be a string.")
+            if perturbation_source not in {"LLM", "trad"}:
+                raise ValueError(
+                    f"{score_path}:{row_no}: perturbation_source must be 'LLM' or 'trad'."
+                )
+            if not isinstance(candidate_id, str) or not candidate_id:
+                raise ValueError(f"{score_path}:{row_no}: candidate_id must be a string.")
             if not isinstance(score_name, str) or not score_name:
                 raise ValueError(f"{score_path}:{row_no}: score_name must be a string.")
             source_layer = _coerce_custom_id(
@@ -139,7 +144,7 @@ def load_external_scores(
             if not math.isfinite(float(score_value)):
                 raise ValueError(f"{score_path}:{row_no}: score_value must be finite.")
 
-            key = (source_folder, base_text_id, target_layer)
+            key = (perturbation_source, base_text_id, candidate_id)
             score_dict = scores.setdefault(key, {})
             if score_name in score_dict:
                 raise ValueError(
@@ -158,10 +163,13 @@ def scored_original_ids(
 ) -> set[int]:
     """Return source IDs that have at least one requested usable score."""
     external_scores = load_external_scores(custom_dataset_name)
+    requested_sources = {
+        canonical_perturbation_source(folder) for folder in layer_folders
+    }
     return {
         original_id
-        for (source_folder, original_id, _), score_dict in external_scores.items()
-        if source_folder in layer_folders
+        for (perturbation_source, original_id, _), score_dict in external_scores.items()
+        if perturbation_source in requested_sources
         and (score_names is None or score_names & set(score_dict))
     }
 
@@ -220,6 +228,8 @@ def format_custom_dataset(
     Each resulting record has aligned lists:
       - text_label_pairs: [(text, perturbation_layer), ...]
       - item_score_dicts: [{score_name: score_or_none, ...}, ...]
+      - candidate_ids: [stable candidate ID, ...]
+      - perturbation_sources: [source label, ...]
 
     The first item is the original text with layer label 0. It is retained even
     when it has no score. Regression later selects only items whose chosen
@@ -251,6 +261,13 @@ def format_custom_dataset(
             "dataset_name": custom_dataset_name,
             "source_original_ids": [original_id],
             "text_label_pairs": [(original["text"], 0)],
+            "candidate_ids": [
+                make_original_candidate_id(
+                    dataset_name=custom_dataset_name,
+                    base_text_id=original_id,
+                )
+            ],
+            "perturbation_sources": ["original"],
             "item_score_dicts": [
                 _extract_numeric_scores(
                     original,
@@ -279,7 +296,10 @@ def format_custom_dataset(
 
         missing_head_ids: set[int] = set()
 
-        for file_name in os.listdir(layer_path):
+        perturbation_source = canonical_perturbation_source(layer_dir)
+        candidate_indices: dict[tuple[int, int], int] = {}
+
+        for file_name in sorted(os.listdir(layer_path)):
             if not file_name.endswith(".jsonl"):
                 continue
 
@@ -311,12 +331,24 @@ def format_custom_dataset(
                 if head_id not in id_dict:
                     continue
 
+                candidate_key = (head_id, layer)
+                candidate_index = candidate_indices.get(candidate_key, 0)
+                candidate_indices[candidate_key] = candidate_index + 1
+                candidate_id = candidate_id_from_raw_row(
+                    row,
+                    perturbation_source=perturbation_source,
+                    base_text_id=head_id,
+                    target_layer=layer,
+                    candidate_index=candidate_index,
+                )
                 id_dict[head_id]["text_label_pairs"].append((row["text"], layer))
+                id_dict[head_id]["candidate_ids"].append(candidate_id)
+                id_dict[head_id]["perturbation_sources"].append(perturbation_source)
                 item_scores = _extract_numeric_scores(
                     row,
                     excluded_fields={"head_id", "text"},
                 )
-                score_key = (layer_dir, head_id, layer)
+                score_key = (perturbation_source, head_id, candidate_id)
                 for score_name, score_value in external_scores.get(score_key, {}).items():
                     if score_name in item_scores:
                         raise ValueError(

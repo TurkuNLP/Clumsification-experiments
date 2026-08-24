@@ -11,7 +11,10 @@ from clumsification_code.data.format_dataset import (
     format_custom_dataset,
     scored_original_ids,
 )
-from clumsification_code.data.pairing import generate_training_pairs_random
+from clumsification_code.data.pairing import (
+    generate_training_pairs_random,
+    get_aligned_candidate_items,
+)
 from clumsification_code.data.splitting import (
     assert_no_original_id_leakage,
     split_ids_to_metadata,
@@ -27,8 +30,9 @@ def shuffle_and_transform_formatted_dataset(
     """
     Convert chain records into a Hugging Face Dataset.
 
-    The resulting rows retain the existing fields:
-      id, dataset_name, source_original_ids, texts, labels
+    The resulting rows retain the existing fields plus aligned identity fields:
+      id, dataset_name, source_original_ids, texts, labels, candidate_ids,
+      perturbation_sources
 
     Each discovered numeric score method is also stored as an aligned list:
       method_1: [score_or_none, ...]
@@ -37,39 +41,27 @@ def shuffle_and_transform_formatted_dataset(
     rows = []
 
     for entry in formatted_dataset:
-        text_label_pairs = list(entry.get("text_label_pairs", []))
-        item_score_dicts = list(
-            entry.get(
-                "item_score_dicts",
-                [{} for _ in text_label_pairs],
-            )
-        )
-
-        if len(text_label_pairs) != len(item_score_dicts):
-            raise ValueError(
-                f"Entry {entry.get('id', '<unknown>')!r} has misaligned "
-                "text_label_pairs and item_score_dicts."
-            )
+        items = get_aligned_candidate_items(entry)
 
         # Preserve one-item chains as regression may use a scored original.
-        if not text_label_pairs:
+        if not items:
             continue
 
-        items = list(zip(text_label_pairs, item_score_dicts))
         rng.shuffle(items)
 
         row = {
             "id": str(entry["id"]),
             "dataset_name": entry.get("dataset_name"),
             "source_original_ids": list(entry.get("source_original_ids", [])),
-            "texts": [text_label[0] for text_label, _ in items],
-            "labels": [text_label[1] for text_label, _ in items],
+            "texts": [item["text"] for item in items],
+            "labels": [item["label"] for item in items],
+            "candidate_ids": [item["candidate_id"] for item in items],
+            "perturbation_sources": [item["perturbation_source"] for item in items],
         }
 
         for score_name in score_names:
             row[score_name] = [
-                score_dict.get(score_name)
-                for _, score_dict in items
+                item["score_dict"].get(score_name) for item in items
             ]
 
         rows.append(row)
