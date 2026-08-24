@@ -1,3 +1,5 @@
+> This document has been co-created, refactored, and cleaned using GPT 5.6.
+
 # Repository architecture
 
 This project builds and evaluates **FE models**: encoder-based models that assign a scalar quality score to text. The same model supports pairwise ranking and scalar regression.
@@ -37,24 +39,56 @@ The critical boundary is the formatted Hugging Face dataset. Everything before i
 `scripts/create_fe_training_dataset.py` is the entry point. It calls:
 
 1. `data/splitting.py` to split original document IDs before examples are constructed, preventing document leakage.
-2. `data/format_dataset.py` to align each original with perturbation layers and external score JSONLs. Score rows are matched by source folder, original ID, and layer.
+2. `data/format_dataset.py` to align each original with perturbation layers and external score JSONLs. Score rows are matched by canonical perturbation source, original ID, and candidate ID.
 3. `data/pairing.py` when random training pairs are requested.
 4. `data/hf_dataset.py` to produce and save a `DatasetDict` containing `train`, `dev`, and `test`.
 
 A formatted row normally contains `texts` and aligned `labels`; named score lists may also be present for regression.
 
+#### Candidate and score identity
+
+Every original or perturbation candidate has a stable `candidate_id`. This is
+distinct from the source-document identity used for leakage-safe splitting.
+The source identity answers “which original document does this belong to?”;
+the candidate identity answers “which exact text instance is this?”
+
+The canonical score-record identity is:
+
+```text
+(dataset_name, base_text_id, perturbation_source, candidate_id)
+```
+
+`candidate_id` must distinguish candidates that share an original, perturbation
+source, and target layer. Layer is retained as descriptive metadata and for
+ordering, but it is not by itself a unique candidate key. Score records also
+retain `source_layer`, `target_layer`, `score_name`, and `score_value`.
+
+The canonical perturbation-source values are `LLM` and `trad`. New code should
+use `perturbation_source` rather than directory names. The raw input directory
+is used only to select which perturbation files are scored; it is not written
+as the candidate's identity.
+
+Candidate IDs must survive formatting, shuffling, pairing, train/dev/test
+serialization, and score lookup. Parallel arrays such as `texts`, `labels`,
+and score lists must remain aligned with the corresponding `candidate_ids`.
+
+There is intentionally no legacy score-file reader. Existing experimental
+score directories are disposable and should be removed before producing
+canonical scores.
+
 ### 1a. Produce scalar supervision (before dataset formatting)
 
 `scripts/score_custom_dataset.py` scores candidate perturbations against their
 source original and writes one JSONL file per method under
-`data/custom_datasets/<dataset>/scores/`.  It currently supports local
+`data/custom_datasets/<dataset>/scores/`. It currently supports local
 token-normalized perplexity, BERTScore F1, and BLEURT. Sampling always selects
 original IDs first, then scores every perturbation belonging to each selected
 original.
 
 Successful score rows use the stable fields `base_text_id`, `source_layer`,
-`target_layer`, `score_name`, and `score_value`, plus `source_folder` to
-identify the perturbation folder. Originals are not self-scored
+`target_layer`, `score_name`, and `score_value`, plus canonical
+`perturbation_source` and `candidate_id` fields. Both perturbation sources
+share one score file per scoring method. Originals are not self-scored
 and therefore have no score row.  Failures are written separately to
 `<score_name>.errors.jsonl`, while `<score_name>.metadata.json` records the
 model, direction/transform, seed, selected IDs, and library versions.  All

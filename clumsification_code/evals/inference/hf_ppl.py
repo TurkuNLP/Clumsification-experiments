@@ -86,7 +86,11 @@ class HFCausalLMPerplexityInferenceModel(TextScorer):
             token_log_probs = log_probs.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)
             token_log_probs = token_log_probs.masked_fill(~target_mask, 0.0)
             token_counts = target_mask.sum(dim=1).clamp_min(1)
-            scores.append((token_log_probs.sum(dim=1) / token_counts).cpu())
+            # NumPy cannot convert a CPU bfloat16 tensor directly.  Keep the
+            # model in its requested dtype, but materialize output scores as
+            # float32 for the shared metrics and JSONL writer.
+            batch_scores = token_log_probs.sum(dim=1) / token_counts
+            scores.append(batch_scores.float().cpu())
 
         result = torch.cat(scores).numpy().astype(np.float32)
         if not np.isfinite(result).all():

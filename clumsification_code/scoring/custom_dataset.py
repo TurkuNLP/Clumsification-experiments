@@ -29,6 +29,8 @@ class ScoreTask:
     """One original/candidate comparison to be scored."""
 
     base_text_id: int
+    perturbation_source: str
+    candidate_id: str
     source_layer: int
     target_layer: int
     source_text: str
@@ -67,6 +69,35 @@ def _as_int(value: object, *, context: str) -> int:
         raise ValueError(f"Expected an integer {context}, got {value!r}.") from exc
 
 
+def _canonical_perturbation_source(layer_directory: str) -> str:
+    """Map one raw perturbation directory to its canonical source label."""
+    source_by_directory = {
+        "perturbed_layers": "LLM",
+        "trad_perturbed_layers": "trad",
+    }
+    try:
+        return source_by_directory[layer_directory]
+    except KeyError as exc:
+        raise ValueError(
+            "layer_directory must be 'perturbed_layers' or "
+            f"'trad_perturbed_layers', got {layer_directory!r}."
+        ) from exc
+
+
+def _make_candidate_id(
+    *,
+    perturbation_source: str,
+    base_text_id: int,
+    target_layer: int,
+    candidate_index: int,
+) -> str:
+    """Create a readable and deterministic ID for one candidate text."""
+    return (
+        f"{perturbation_source}__base_{base_text_id}__layer_{target_layer}__"
+        f"candidate_{candidate_index:06d}"
+    )
+
+
 def select_original_ids(
     original_ids: Iterable[int],
     *,
@@ -90,6 +121,7 @@ def load_score_tasks(
     seed: int,
 ) -> tuple[list[ScoreTask], list[int]]:
     """Load all candidates for a sampled set of original document IDs."""
+    perturbation_source = _canonical_perturbation_source(layer_directory)
     original_path = dataset_dir / "original.jsonl"
     if not original_path.is_file():
         raise FileNotFoundError(f"Missing original dataset file: {original_path}")
@@ -118,6 +150,7 @@ def load_score_tasks(
         raise FileNotFoundError(f"Missing perturbation layer directory: {layer_dir}")
 
     tasks: list[ScoreTask] = []
+    candidate_indices: dict[tuple[int, int], int] = {}
     for layer_path in sorted(layer_dir.glob("*.jsonl"), key=lambda path: path.name):
         try:
             target_layer = int(layer_path.stem)
@@ -136,9 +169,19 @@ def load_score_tasks(
                 continue
             if not isinstance(row["text"], str):
                 raise ValueError(f"{layer_path}:{row_no}: text must be a string.")
+            candidate_key = (original_id, target_layer)
+            candidate_index = candidate_indices.get(candidate_key, 0)
+            candidate_indices[candidate_key] = candidate_index + 1
             tasks.append(
                 ScoreTask(
                     base_text_id=original_id,
+                    perturbation_source=perturbation_source,
+                    candidate_id=_make_candidate_id(
+                        perturbation_source=perturbation_source,
+                        base_text_id=original_id,
+                        target_layer=target_layer,
+                        candidate_index=candidate_index,
+                    ),
                     source_layer=0,
                     target_layer=target_layer,
                     source_text=originals[original_id],
@@ -380,6 +423,7 @@ def score_custom_dataset(
         raise ValueError("max_tokens must be at least 2.")
 
     dataset_dir = dataset_root / dataset_name
+    perturbation_source = _canonical_perturbation_source(layer_directory)
     tasks, selected_ids = load_score_tasks(
         dataset_dir=dataset_dir,
         layer_directory=layer_directory,
@@ -387,15 +431,9 @@ def score_custom_dataset(
         seed=seed,
     )
     score_dir = dataset_dir / "scores"
-    # Keep scores from the two perturbation sources separate.  The same method
-    # can therefore be run for both folders without overwriting either result.
-    score_dir = score_dir / layer_directory
     score_path = score_dir / f"{scoring_type}.jsonl"
     error_path = score_dir / f"{scoring_type}.errors.jsonl"
-    metadata_path = score_dir / f"{scoring_type}.metadata.json"
-    for path in (score_path, error_path, metadata_path):
-        if path.exists() and not overwrite:
-            raise FileExistsError(f"Output already exists: {path}. Pass --overwrite to replace it.")
+    metadata_path = score_dir / f"{scoring_type}.{perturbation_source}.metadata.json"
 
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
@@ -430,7 +468,8 @@ def score_custom_dataset(
     score_rows = [
         {
             "base_text_id": task.base_text_id,
-            "source_folder": layer_directory,
+            "perturbation_source": task.perturbation_source,
+            "candidate_id": task.candidate_id,
             "source_layer": task.source_layer,
             "target_layer": task.target_layer,
             "score_name": scoring_type,
@@ -442,7 +481,8 @@ def score_custom_dataset(
     error_rows = [
         {
             "base_text_id": failure.task.base_text_id,
-            "source_folder": layer_directory,
+            "perturbation_source": failure.task.perturbation_source,
+            "candidate_id": failure.task.candidate_id,
             "source_layer": failure.task.source_layer,
             "target_layer": failure.task.target_layer,
             "score_name": scoring_type,
@@ -451,13 +491,57 @@ def score_custom_dataset(
         }
         for failure in failures
     ]
-    _write_jsonl_atomically(score_path, score_rows, overwrite=overwrite)
-    _write_jsonl_atomically(error_path, error_rows, overwrite=overwrite)
+    def merge_source_rows(path: Path, new_rows: list[dict]) -> list[dict]:
+        """Store both sources in one file while replacing only this source."""
+        if not path.exists():
+            return new_rows
+
+        existing_rows = _read_jsonl(path)
+        for row_number, row in enumerate(existing_rows, start=1):
+            missing = {
+                "perturbation_source",
+                "candidate_id",
+            } - row.keys()
+            if missing:
+                raise ValueError(
+                    f"{path}:{row_number} is not a canonical score record; "
+                    f"missing {sorted(missing)}. Remove the old score file "
+                    "before running the new scorer."
+                )
+        existing_sources = {
+            row.get("perturbation_source") for row in existing_rows
+        }
+        if perturbation_source in existing_sources and not overwrite:
+            raise FileExistsError(
+                f"{path} already contains {perturbation_source!r} records. "
+                "Pass --overwrite to replace them."
+            )
+        retained_rows = [
+            row
+            for row in existing_rows
+            if row.get("perturbation_source") != perturbation_source
+        ]
+        return retained_rows + new_rows
+
+    _write_jsonl_atomically(
+        score_path,
+        merge_source_rows(score_path, score_rows),
+        overwrite=True,
+    )
+    _write_jsonl_atomically(
+        error_path,
+        merge_source_rows(error_path, error_rows),
+        overwrite=True,
+    )
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset_name": dataset_name,
-        "layer_directory": layer_directory,
+        "input_layer_directory": layer_directory,
+        "perturbation_source": perturbation_source,
+        "candidate_id_schema": (
+            "{source}__base_{base_id}__layer_{target_layer}__candidate_{index}"
+        ),
         "scoring_type": scoring_type,
         "score_direction": "higher_is_better",
         "score_transform": direction_description,
