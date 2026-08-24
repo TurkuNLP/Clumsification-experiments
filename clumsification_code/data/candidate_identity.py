@@ -6,6 +6,7 @@ SOURCE_BY_LAYER_DIRECTORY = {
     "perturbed_layers": "LLM",
     "trad_perturbed_layers": "trad",
 }
+VALID_PERTURBATION_SOURCES = {"LLM", "trad", "original"}
 
 
 def canonical_perturbation_source(layer_directory: str) -> str:

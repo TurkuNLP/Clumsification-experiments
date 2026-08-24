@@ -48,12 +48,20 @@ def flatten_regression_split(
         texts = chain["texts"]
         labels = chain["labels"]
         scores = chain[score_name]
+        candidate_ids = chain.get("candidate_ids", [])
+        perturbation_sources = chain.get("perturbation_sources", [])
 
-        if len(texts) != len(labels) or len(texts) != len(scores):
+        if (
+            len(texts) != len(labels)
+            or len(texts) != len(scores)
+            or len(texts) != len(candidate_ids)
+            or len(texts) != len(perturbation_sources)
+        ):
             raise ValueError(
                 f"Misaligned fields in chain {chain.get('id', '<unknown>')!r}: "
                 f"texts={len(texts)}, labels={len(labels)}, "
-                f"{score_name}={len(scores)}."
+                f"{score_name}={len(scores)}, candidate_ids={len(candidate_ids)}, "
+                f"perturbation_sources={len(perturbation_sources)}."
             )
 
         for item_index, (text, layer, raw_score) in enumerate(
@@ -75,6 +83,8 @@ def flatten_regression_split(
                     "dataset_name": chain.get("dataset_name"),
                     "source_original_ids": chain.get("source_original_ids", []),
                     "layer": int(layer),
+                    "candidate_id": candidate_ids[item_index],
+                    "perturbation_source": perturbation_sources[item_index],
                     "item_index_in_chain": item_index,
                 }
             )

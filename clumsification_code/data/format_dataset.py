@@ -13,6 +13,7 @@ from clumsification_code.data.candidate_identity import (
     candidate_id_from_raw_row,
     canonical_perturbation_source,
     make_original_candidate_id,
+    VALID_PERTURBATION_SOURCES,
 )
 
 
@@ -116,9 +117,11 @@ def load_external_scores(
             perturbation_source = row["perturbation_source"]
             candidate_id = row["candidate_id"]
             score_name = row["score_name"]
-            if perturbation_source not in {"LLM", "trad"}:
+            if perturbation_source not in VALID_PERTURBATION_SOURCES:
                 raise ValueError(
-                    f"{score_path}:{row_no}: perturbation_source must be 'LLM' or 'trad'."
+                    f"{score_path}:{row_no}: invalid perturbation_source "
+                    f"{perturbation_source!r}; expected one of "
+                    f"{sorted(VALID_PERTURBATION_SOURCES)}."
                 )
             if not isinstance(candidate_id, str) or not candidate_id:
                 raise ValueError(f"{score_path}:{row_no}: candidate_id must be a string.")
@@ -166,6 +169,7 @@ def scored_original_ids(
     requested_sources = {
         canonical_perturbation_source(folder) for folder in layer_folders
     }
+    requested_sources.add("original")
     return {
         original_id
         for (perturbation_source, original_id, _), score_dict in external_scores.items()
@@ -255,6 +259,23 @@ def format_custom_dataset(
 
     def _base_record(original_id: int) -> dict:
         original = originals_by_id[original_id]
+        original_candidate_id = make_original_candidate_id(
+            dataset_name=custom_dataset_name,
+            base_text_id=original_id,
+        )
+        original_scores = _extract_numeric_scores(
+            original,
+            excluded_fields={"custom_id", "text"},
+        )
+        for score_name, score_value in external_scores.get(
+            ("original", original_id, original_candidate_id), {}
+        ).items():
+            if score_name in original_scores:
+                raise ValueError(
+                    f"{custom_dataset_name}/original.jsonl contains score "
+                    f"{score_name!r} both inline and in the external score file."
+                )
+            original_scores[score_name] = score_value
 
         return {
             "id": f"{custom_dataset_name}__orig__{original_id}",
@@ -262,18 +283,10 @@ def format_custom_dataset(
             "source_original_ids": [original_id],
             "text_label_pairs": [(original["text"], 0)],
             "candidate_ids": [
-                make_original_candidate_id(
-                    dataset_name=custom_dataset_name,
-                    base_text_id=original_id,
-                )
+                original_candidate_id
             ],
             "perturbation_sources": ["original"],
-            "item_score_dicts": [
-                _extract_numeric_scores(
-                    original,
-                    excluded_fields={"custom_id", "text"},
-                )
-            ],
+            "item_score_dicts": [original_scores],
         }
 
     def _build_id_dict(

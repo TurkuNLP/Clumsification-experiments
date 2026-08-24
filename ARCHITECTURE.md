@@ -88,10 +88,12 @@ original.
 Successful score rows use the stable fields `base_text_id`, `source_layer`,
 `target_layer`, `score_name`, and `score_value`, plus canonical
 `perturbation_source` and `candidate_id` fields. Both perturbation sources
-share one score file per scoring method. Originals are not self-scored
-and therefore have no score row.  Failures are written separately to
-`<score_name>.errors.jsonl`, while `<score_name>.metadata.json` records the
-model, direction/transform, seed, selected IDs, and library versions.  All
+share one score file per scoring method. Originals are self-scored by default
+using an original-to-original comparison and use `perturbation_source` equal
+to `original`. Failures are written separately to
+`<score_name>.errors.jsonl`, while `<score_name>.<source>.metadata.json`
+records the model, direction/transform, seed, selected IDs, and library
+versions. All
 stored score values use the convention **higher is better**: BERTScore F1 is
 stored directly using Hugging Face Evaluate's normal defaults, BLEURT is stored
 directly, while perplexity is transformed to `-log(perplexity)`.

@@ -2,9 +2,9 @@
 """Score perturbations in a custom dataset against their original texts.
 
 The public entry point is :func:`score_custom_dataset`; command-line parsing
-lives in ``scripts/score_custom_dataset.py``.  Score records deliberately only
-contain successful candidate scores.  Originals have no record because they
-are not self-scored, and failures live in a separate error JSONL file.
+lives in ``scripts/score_custom_dataset.py``. Score records deliberately only
+contain successful scores; originals are self-scored by default. Failures live
+in a separate error JSONL file.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import Callable, Iterable, Sequence
 from clumsification_code.data.candidate_identity import (
     candidate_id_from_raw_row,
     canonical_perturbation_source,
+    make_original_candidate_id,
 )
 
 DEFAULT_PPL_MODEL = "Qwen/Qwen3-8B-Base"
@@ -161,6 +162,26 @@ def load_score_tasks(
         raise FileNotFoundError(f"Missing perturbation layer directory: {layer_dir}")
 
     tasks: list[ScoreTask] = []
+    dataset_name = dataset_dir.name
+
+    # Score clean originals by default. Reference-based scorers compare the
+    # original with itself; candidate-only scorers score the original directly.
+    for original_id in selected_ids:
+        tasks.append(
+            ScoreTask(
+                base_text_id=original_id,
+                perturbation_source="original",
+                candidate_id=make_original_candidate_id(
+                    dataset_name=dataset_name,
+                    base_text_id=original_id,
+                ),
+                source_layer=0,
+                target_layer=0,
+                source_text=originals[original_id],
+                target_text=originals[original_id],
+            )
+        )
+
     candidate_indices: dict[tuple[int, int], int] = {}
     for layer_path in sorted(layer_dir.glob("*.jsonl"), key=lambda path: path.name):
         try:
@@ -426,7 +447,7 @@ def score_custom_dataset(
     overwrite: bool,
     dataset_root: Path = Path("data/custom_datasets"),
 ) -> dict:
-    """Score one method and write score, error, and reproducibility records."""
+    """Score originals and perturbations and write reproducibility records."""
     if scoring_type not in {"token_normalized_perplexity", "bertscore_f1", "bleurt"}:
         raise ValueError(f"Unsupported scoring_type: {scoring_type!r}")
     if batch_size <= 0:
@@ -535,8 +556,10 @@ def score_custom_dataset(
         "scoring_type": scoring_type,
         "score_direction": "higher_is_better",
         "score_transform": direction_description,
-        "scored_against": "original_only",
-        "original_self_scores": "not_written",
+        "scored_against": "original_and_candidate",
+        "original_self_scores": "written_by_default",
+        "num_original_tasks": len(selected_ids),
+        "num_perturbation_tasks": len(tasks) - len(selected_ids),
         "failures": "written_to_errors_jsonl; no null or NaN score values are written",
         "sample_limit": sample_limit,
         "seed": seed,
