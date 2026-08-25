@@ -13,7 +13,11 @@ from clumsification_code.evals.geval.parser import parse_score_response
 from clumsification_code.prompts import load_prompt_data, load_prompt_spec
 
 
-_RESULT_RE = re.compile(r"\[RESULT\]\s*([1-5])\b")
+_RESULT_RE = re.compile(
+    r"(?:\[\s*RESULT\s*\]|\bRESULT\b)\s*:?\s*([1-5])\b",
+    flags=re.IGNORECASE,
+)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 
 
 class VLLMTextScorer:
@@ -27,6 +31,7 @@ class VLLMTextScorer:
         max_model_len: Optional[int] = None,
         max_tokens: int = 512,
         temperature: float = 0.0,
+        enable_thinking: bool = False,
         gpu_memory_utilization: float = 0.9,
         trust_remote_code: bool = False,
         protocol: str = "prometheus_direct_assessment.json",
@@ -48,6 +53,7 @@ class VLLMTextScorer:
         self.output_parser = self.protocol_spec.metadata.get(
             "output_parser", "prometheus_result"
         )
+        self.enable_thinking = enable_thinking
         self.sampling_params = SamplingParams(
             temperature=temperature,
             max_tokens=max_tokens,
@@ -84,7 +90,8 @@ class VLLMTextScorer:
 
     @staticmethod
     def _parse_score(text: str) -> float:
-        match = _RESULT_RE.search(text or "")
+        visible_text = _THINK_BLOCK_RE.sub("", text or "")
+        match = _RESULT_RE.search(visible_text)
         if match is None:
             raise ValueError(f"Could not find [RESULT] score in vLLM output: {text[:300]!r}")
         return float(match.group(1))
@@ -98,7 +105,11 @@ class VLLMTextScorer:
     ) -> np.ndarray:
         del device, batch_size, max_length
         prompts = [self._messages(text) for text in texts]
-        outputs = self.llm.chat(prompts, sampling_params=self.sampling_params)
+        outputs = self.llm.chat(
+            prompts,
+            sampling_params=self.sampling_params,
+            chat_template_kwargs={"enable_thinking": self.enable_thinking},
+        )
         return np.asarray(
             [self._parse_output(output.outputs[0].text) for output in outputs],
             dtype=np.float32,
@@ -106,7 +117,8 @@ class VLLMTextScorer:
 
     def _parse_output(self, text: str) -> float:
         if self.output_parser == "json_score":
-            return parse_score_response(text).score
+            visible_text = _THINK_BLOCK_RE.sub("", text or "").strip()
+            return parse_score_response(visible_text).score
         return self._parse_score(text)
 
 

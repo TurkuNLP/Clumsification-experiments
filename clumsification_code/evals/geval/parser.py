@@ -28,6 +28,11 @@ _CODE_FENCE_RE = re.compile(
     r"```(?:json)?\s*(.*?)\s*```",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_LABELED_SCORE_RE = re.compile(
+    r"(?:\"?score\"?|\bScore\b)\s*[:=]\s*\"?(-?\d+(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 
 
 def _strip_code_fence(raw: str) -> str:
@@ -50,6 +55,7 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
         raise RetryableParseError("Empty response content")
 
     raw = _strip_code_fence(str(raw).strip())
+    raw = _THINK_BLOCK_RE.sub("", raw).strip()
 
     if not raw:
         raise RetryableParseError("Empty response content")
@@ -66,7 +72,9 @@ def extract_json_object(raw: str) -> Dict[str, Any]:
     last = raw.rfind("}")
 
     if first >= 0 and last > first:
-        candidate = raw[first : last + 1]
+        #Adding some manual regex/replacements to ease parsing
+        #We only care about the score tbh, but since the prompts have other stuff then those are used as well
+        candidate = raw[first : last + 1].replace('\n', '')
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError as exc:
@@ -92,7 +100,21 @@ def parse_score_response(
     if score_min >= score_max:
         raise ValueError(f"score_min must be < score_max, got {score_min} >= {score_max}")
 
-    obj = extract_json_object(raw_content)
+    try:
+        obj = extract_json_object(raw_content)
+    except RetryableParseError as json_error:
+        # The score is the only value needed by the evaluator.  Models
+        # occasionally emit invalid JSON because their explanation contains
+        # unescaped quotation marks.  Recover an explicitly labelled score
+        # without trying to guess or repair the rest of the explanation.
+        visible_content = _THINK_BLOCK_RE.sub("", str(raw_content or ""))
+        match = _LABELED_SCORE_RE.search(visible_content)
+        if match is None:
+            raise json_error
+        obj = {
+            "score": match.group(1),
+            "_parser_fallback": "labeled_score_regex",
+        }
 
     if "score" not in obj:
         raise RetryableParseError(f"G-Eval response missing 'score': {obj}")

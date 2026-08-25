@@ -127,6 +127,7 @@ def add_prometheus_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--vllm-max-tokens", type=int, default=512)
     parser.add_argument("--vllm-temperature", type=float, default=0.0)
+    parser.add_argument("--vllm-enable-thinking", action="store_true")
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--vllm-trust-remote-code", action="store_true")
     parser.add_argument("--vllm-protocol", default="prometheus_direct_assessment.json")
@@ -203,6 +204,7 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
             max_model_len=args.vllm_max_model_len,
             max_tokens=args.vllm_max_tokens,
             temperature=args.vllm_temperature,
+            enable_thinking=args.vllm_enable_thinking,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
             trust_remote_code=args.vllm_trust_remote_code,
             protocol=args.vllm_protocol,

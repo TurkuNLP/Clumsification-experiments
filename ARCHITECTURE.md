@@ -134,6 +134,7 @@ Both paths use `fe/modeling.py::FEModel`: a Hugging Face encoder, mean pooling, 
 - `evals/inference/gptscore.py` for GPTScore;
 - `evals/inference/metricx.py` and `evals/metricx24/` for MetricX;
 - `evals/geval/` for G-Eval.
+- `evals/inference/vllm_scorer.py` for generic vLLM-backed judges.
 
 `evals/benchmark_runner.py` runs the datasets loaded by `benchmark_data.py`; `metrics.py` calculates correlations/preferences; `result_writer.py` records results. `evaluate_model_on_tdt_regens.py` is the larger specialized workflow for regenerated TDT/UD texts.
 
@@ -141,6 +142,27 @@ Direct benchmark evaluation is candidate-only unless a benchmark adapter
 explicitly defines another protocol. The source-aware `score_pairs(...)`
 methods described above are used for custom-dataset supervision and are not
 called by the direct benchmark runner.
+
+### vLLM-backed judges
+
+The vLLM scorer separates the model, evaluation protocol, and rubric:
+
+```text
+--scorer vllm
+  --vllm-model-name-or-path <model>
+  --vllm-protocol <file under data/prompts/evaluation/protocols/>
+  --vllm-rubric <file under data/prompts/evaluation/rubrics/>
+```
+
+The current examples combine Qwen3-32B or M-Prometheus with either the
+Prometheus absolute-assessment protocol and MENLO fluency rubric, or the
+adapted G-Eval JSON protocol and corrected G-Eval fluency rubric. Protocol
+metadata selects the output parser, while rubric files provide the evaluation
+criteria. Tensor parallelism is controlled with `--vllm-tensor-parallel-size`.
+Thinking is disabled by default; `--vllm-enable-thinking` can be used for
+models or experiments that require it. Keep `--vllm-max-model-len` large
+enough for the combined prompt and output, and use `--vllm-max-tokens` to
+control the generation budget.
 
 ## Raw-data and perturbation conventions
 

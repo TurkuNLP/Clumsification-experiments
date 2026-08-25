@@ -44,8 +44,8 @@ it with `--bleurt-checkpoint` when necessary.
 
 ## Running a vLLM evaluation baseline
 
-The Prometheus scorer uses vLLM and supports tensor parallel execution. For
-example, to use M-Prometheus-14B across four GPUs:
+The generic vLLM scorer supports tensor parallel execution. For example, to
+use M-Prometheus-14B across four GPUs with the MENLO fluency rubric:
 
 ```bash
 python -m clumsification_code.evals.run_benchmark \
@@ -61,6 +61,12 @@ The protocol and rubric are independently selectable. Ready-to-run examples
 are provided as `scripts/run_qwen3_menlo_vllm.sh` and
 `scripts/run_qwen3_geval_vllm.sh`. Set `VLLM_TENSOR_PARALLEL_SIZE` when the
 number of GPUs differs from the default of four.
+
+Qwen3 thinking is disabled by default so the model reserves its output for the
+evaluation result. Enable it explicitly with `--vllm-enable-thinking` if
+needed. `--vllm-max-model-len` limits the combined prompt and generated output;
+`--vllm-max-tokens` limits generated output and should be increased if a model
+uses long reasoning before returning a score.
 
 Each command creates `scores/<perturbation-folder>/<method>.jsonl`, an
 accompanying error JSONL, and a metadata file within the selected custom
