@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "geval.no_reference.json",
+  "version": "geval_qe_no_reference_v1",
+  "description": "G-Eval no-reference chat protocol with a JSON response.",
+  "required_variables": ["candidate_text", "rubric"],
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an expert evaluator of natural language generation quality. You must provide calibrated, reproducible, no-reference quality judgments for standalone text. You do not know the original task, source document, reference answer, or user prompt. Therefore, do not judge factual accuracy against missing context. Judge only what can be assessed from the candidate text itself."
+    },
+    {
+      "role": "user",
+      "content": "Evaluate the following candidate text using a G-Eval-style rubric.\n\nEvaluation criteria:\n{rubric}\n\nImportant constraints:\n- This is a no-reference quality-estimation setting.\n- Do not penalize the text for missing facts that require external context.\n- Do not reward unsupported factual claims beyond their writing quality.\n- Prefer concise but well-formed text over verbose incoherent text.\n- Use the full score range when appropriate.\n- Return JSON only.\n\nScore scale:\n1 = very poor quality; many severe errors; hard to understand.\n2 = poor quality; noticeable errors or awkwardness; weak coherence.\n3 = acceptable quality; understandable but with flaws.\n4 = good quality; mostly fluent, clear, and coherent.\n5 = excellent quality; highly fluent, natural, clear, and coherent.\n\nReturn exactly this JSON shape:\n{{\n  \"score\": number,\n  \"reasoning\": string\n}}\n\nCandidate text:\n<candidate>\n{candidate_text}\n</candidate>"
+    }
+  ],
+  "metadata": {"method": "geval", "assessment": "no_reference"}
+}

@@ -29,6 +29,7 @@ supervision, while downstream code trains or evaluates scorers.
 | `clumsification_code/fe/` | Canonical FE implementation: shared encoder, evaluation head, ranking and regression objectives, trainers, evaluation, and checkpoints. |
 | `clumsification_code/evals/` | Common benchmark runner, scorer adapters, benchmark loaders, metrics, and result writing. |
 | `clumsification_code/perturbations/` | LLM-based and rule-based ways to create degraded or altered texts. |
+| `clumsification_code/prompts/`, `data/prompts/` | Validates and renders versioned prompt specifications stored independently from model transports and scorer code. |
 | `scripts/` | User-facing workflows: dataset creation, training, HPO, calibration, scoring, and UD-document generation. |
 | `filter_scripts/` | Standalone vLLM filters for deciding which generated texts to retain. |
 | `clumsification_code/compat/`, `clumsification_code/ltr/` | Removable compatibility layer for old LTR names and checkpoint files. New code must not depend on these. |

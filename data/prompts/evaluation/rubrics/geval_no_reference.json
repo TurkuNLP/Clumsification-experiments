@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "id": "geval.no_reference",
+  "version": "geval_qe_no_reference_v1",
+  "description": "G-Eval no-reference rubric collection and task/aspect mappings.",
+  "default": [
+    ["Fluency", "Grammar, spelling, punctuation, sentence structure, and readability."],
+    ["Naturalness", "Whether the text sounds like coherent human-written English."],
+    ["Coherence", "Logical flow, consistency, and absence of contradictions within the text."],
+    ["Clarity", "Whether the meaning is understandable and not unnecessarily confusing."],
+    ["Lexical and syntactic quality", "Appropriate word choice and sentence variety."],
+    ["Overall standalone quality", "Holistic quality given no source, reference, or user prompt."]
+  ],
+  "aspects": {
+    "fluency": [
+      ["Fluency", "Grammar, spelling, punctuation, sentence structure, and readability."],
+      ["Naturalness", "Whether the text sounds like coherent human-written English."],
+      ["Surface correctness", "Absence of awkward, ungrammatical, malformed, or hard-to-read language."]
+    ],
+    "coherence": [
+      ["Coherence", "Logical flow, consistency, topic continuity, and absence of self-contradictions."],
+      ["Clarity", "Whether the text is understandable as standalone writing."]
+    ],
+    "consistency": [
+      ["Internal consistency", "Whether the text contradicts itself internally."],
+      ["Caution about missing context", "Do not judge factual consistency against a source, reference, or prompt that is not provided."]
+    ],
+    "naturalness": [
+      ["Naturalness", "Whether the text sounds like plausible human-written English."],
+      ["Idiomaticity", "Appropriate word choice, phrasing, and sentence rhythm."]
+    ]
+  },
+  "aspect_aliases": {
+    "overall": "default",
+    "quality": "default"
+  },
+  "task_aspect_mapping": {
+    "summeval": {"fluency": "fluency", "coherence": "coherence", "consistency": "consistency"},
+    "ellipse": {"overall": "overall", "cohesion": "coherence"},
+    "usr": {"overall": "overall", "natural": "naturalness"},
+    "openmeva": {"overall": "overall"},
+    "webnlg": {"fluency": "fluency"},
+    "hanna": {"coherence": "coherence", "complexity": "quality"},
+    "argessay": {"language_mastery": "fluency", "complexity": "quality", "vocabulary": "quality", "language_constructs": "fluency"},
+    "humanratings": {"quality": "quality", "naturalness": "naturalness"},
+    "fed": {"fluent": "fluency", "overall": "overall"},
+    "e2e": {"naturalness": "naturalness", "quality": "quality"}
+  }
+}

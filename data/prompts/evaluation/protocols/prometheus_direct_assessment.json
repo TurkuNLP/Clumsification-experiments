@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "prometheus.direct_assessment.no_reference",
+  "version": "1",
+  "description": "Prometheus-style direct assessment of a candidate without a reference answer.",
+  "required_variables": [
+    "candidate_text",
+    "rubric"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "###Task Description: A response to evaluate and a score rubric representing the evaluation criteria are given.\n1. Write detailed feedback that assesses the quality of the response strictly based on the given score rubric, not evaluating it in general.\n2. After writing the feedback, write a score that is an integer between 1 and 5. You should refer to the score rubric.\n3. The output format should look as follows: \"Feedback: (write feedback for the criterion) [RESULT] (an integer number between 1 and 5)\"\n4. Please do not generate any other opening, closing, or explanations.\n\n###Response to evaluate:\n{candidate_text}\n\n###Score Rubric:\n{rubric}\n\n###Feedback:"
+    }
+  ],
+  "metadata": {
+    "method": "prometheus",
+    "assessment": "direct",
+    "reference_mode": "none"
+  }
+}

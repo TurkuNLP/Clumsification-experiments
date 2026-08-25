@@ -7,6 +7,8 @@ __pycache__/
 PROJECT_VISION.local.md
 
 data/*
+!data/prompts/
+!data/prompts/**
 scripts/others*
 *.sh
 st-deps
@@ -29,6 +31,7 @@ figures*/
 *(Copy)*
 test_folder*/
 outputs*/
+tests*/
 
 edu_filtering.py
 extract_jsons_P.py

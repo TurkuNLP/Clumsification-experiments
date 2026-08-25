@@ -4,10 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence
 
+from clumsification_code.prompts import load_prompt_data, load_prompt_spec
 
-GEVAL_QE_PROMPT_VERSION = "geval_qe_no_reference_v1"
 
 Message = Dict[str, str]
+
+_RUBRIC_DATA = load_prompt_data("evaluation/rubrics/geval_no_reference.json")
+_PROMPT_SPEC = load_prompt_spec("evaluation/protocols/geval_json.json")
+
+GEVAL_QE_PROMPT_VERSION = _PROMPT_SPEC.version
 
 
 @dataclass(frozen=True)
@@ -16,142 +21,31 @@ class RubricCriterion:
     description: str
 
 
-DEFAULT_QE_RUBRIC: Sequence[RubricCriterion] = (
-    RubricCriterion(
-        "Fluency",
-        "Grammar, spelling, punctuation, sentence structure, and readability.",
-    ),
-    RubricCriterion(
-        "Naturalness",
-        "Whether the text sounds like coherent human-written English.",
-    ),
-    RubricCriterion(
-        "Coherence",
-        "Logical flow, consistency, and absence of contradictions within the text.",
-    ),
-    RubricCriterion(
-        "Clarity",
-        "Whether the meaning is understandable and not unnecessarily confusing.",
-    ),
-    RubricCriterion(
-        "Lexical and syntactic quality",
-        "Appropriate word choice and sentence variety.",
-    ),
-    RubricCriterion(
-        "Overall standalone quality",
-        "Holistic quality given no source, reference, or user prompt.",
-    ),
-)
+def _criteria(rows: Sequence[Sequence[str]]) -> tuple[RubricCriterion, ...]:
+    return tuple(RubricCriterion(name=row[0], description=row[1]) for row in rows)
 
+
+DEFAULT_QE_RUBRIC: Sequence[RubricCriterion] = _criteria(_RUBRIC_DATA["default"])
 
 ASPECT_RUBRICS: Mapping[str, Sequence[RubricCriterion]] = {
-    "fluency": (
-        RubricCriterion(
-            "Fluency",
-            "Grammar, spelling, punctuation, sentence structure, and readability.",
-        ),
-        RubricCriterion(
-            "Naturalness",
-            "Whether the text sounds like coherent human-written English.",
-        ),
-        RubricCriterion(
-            "Surface correctness",
-            "Absence of awkward, ungrammatical, malformed, or hard-to-read language.",
-        ),
-    ),
-    "coherence": (
-        RubricCriterion(
-            "Coherence",
-            "Logical flow, consistency, topic continuity, and absence of self-contradictions.",
-        ),
-        RubricCriterion(
-            "Clarity",
-            "Whether the text is understandable as standalone writing.",
-        ),
-    ),
-    "consistency": (
-        RubricCriterion(
-            "Internal consistency",
-            "Whether the text contradicts itself internally.",
-        ),
-        RubricCriterion(
-            "Caution about missing context",
-            "Do not judge factual consistency against a source, reference, or prompt that is not provided.",
-        ),
-    ),
-    "naturalness": (
-        RubricCriterion(
-            "Naturalness",
-            "Whether the text sounds like plausible human-written English.",
-        ),
-        RubricCriterion(
-            "Idiomaticity",
-            "Appropriate word choice, phrasing, and sentence rhythm.",
-        ),
-    ),
-    "overall": DEFAULT_QE_RUBRIC,
-    "quality": DEFAULT_QE_RUBRIC,
+    name: _criteria(rows) for name, rows in _RUBRIC_DATA["aspects"].items()
 }
+for _alias, _target in _RUBRIC_DATA["aspect_aliases"].items():
+    ASPECT_RUBRICS[_alias] = (
+        DEFAULT_QE_RUBRIC if _target == "default" else ASPECT_RUBRICS[_target]
+    )
 
-
-# Optional task/aspect mapping. The current benchmark runner only passes raw text
-# into score_texts(...), so GEvalScorer normally uses the default no-reference
-# rubric. These mappings are here for future runner variants that may pass task
-# or aspect metadata.
-TASK_ASPECT_MAPPING: Mapping[str, Mapping[str, str]] = {
-    "summeval": {
-        "fluency": "fluency",
-        "coherence": "coherence",
-        "consistency": "consistency",
-    },
-    "ellipse": {
-        "overall": "overall",
-        "cohesion": "coherence",
-    },
-    "usr": {
-        "overall": "overall",
-        "natural": "naturalness",
-    },
-    "openmeva": {
-        "overall": "overall",
-    },
-    "webnlg": {
-        "fluency": "fluency",
-    },
-    "hanna": {
-        "coherence": "coherence",
-        "complexity": "quality",
-    },
-    "argessay": {
-        "language_mastery": "fluency",
-        "complexity": "quality",
-        "vocabulary": "quality",
-        "language_constructs": "fluency",
-    },
-    "humanratings": {
-        "quality": "quality",
-        "naturalness": "naturalness",
-    },
-    "fed": {
-        "fluent": "fluency",
-        "overall": "overall",
-    },
-    "e2e": {
-        "naturalness": "naturalness",
-        "quality": "quality",
-    },
-}
+TASK_ASPECT_MAPPING: Mapping[str, Mapping[str, str]] = _RUBRIC_DATA[
+    "task_aspect_mapping"
+]
 
 
 def truncate_text(text: object, max_input_chars: int) -> str:
     text = "" if text is None else str(text)
-
     if max_input_chars is None or max_input_chars <= 0:
         return text
-
     if len(text) <= max_input_chars:
         return text
-
     return text[:max_input_chars] + "\n\n[TRUNCATED]"
 
 
@@ -189,14 +83,7 @@ def render_rubric(criteria: Sequence[RubricCriterion]) -> str:
 
 
 def build_system_prompt() -> str:
-    return (
-        "You are an expert evaluator of natural language generation quality. "
-        "You must provide calibrated, reproducible, no-reference quality judgments "
-        "for standalone text. You do not know the original task, source document, "
-        "reference answer, or user prompt. Therefore, do not judge factual accuracy "
-        "against missing context. Judge only what can be assessed from the candidate "
-        "text itself."
-    )
+    return _PROMPT_SPEC.messages[0].content
 
 
 def build_user_prompt(
@@ -206,41 +93,12 @@ def build_user_prompt(
     task: Optional[str] = None,
     aspect: Optional[str] = None,
 ) -> str:
-    text = truncate_text(text, max_input_chars=max_input_chars)
-    rubric = render_rubric(rubric_for(task=task, aspect=aspect))
-
-    return f"""
-Evaluate the following candidate text using a G-Eval-style rubric.
-
-Evaluation criteria:
-{rubric}
-
-Important constraints:
-- This is a no-reference quality-estimation setting.
-- Do not penalize the text for missing facts that require external context.
-- Do not reward unsupported factual claims beyond their writing quality.
-- Prefer concise but well-formed text over verbose incoherent text.
-- Use the full score range when appropriate.
-- Return JSON only.
-
-Score scale:
-1 = very poor quality; many severe errors; hard to understand.
-2 = poor quality; noticeable errors or awkwardness; weak coherence.
-3 = acceptable quality; understandable but with flaws.
-4 = good quality; mostly fluent, clear, and coherent.
-5 = excellent quality; highly fluent, natural, clear, and coherent.
-
-Return exactly this JSON shape:
-{{
-  "score": number,
-  "reasoning": string
-}}
-
-Candidate text:
-<candidate>
-{text}
-</candidate>
-""".strip()
+    return _render_messages(
+        text,
+        max_input_chars=max_input_chars,
+        task=task,
+        aspect=aspect,
+    )[1]["content"]
 
 
 def build_messages(
@@ -250,18 +108,26 @@ def build_messages(
     task: Optional[str] = None,
     aspect: Optional[str] = None,
 ) -> List[Message]:
-    return [
-        {"role": "system", "content": build_system_prompt()},
-        {
-            "role": "user",
-            "content": build_user_prompt(
-                text,
-                max_input_chars=max_input_chars,
-                task=task,
-                aspect=aspect,
-            ),
-        },
-    ]
+    return _render_messages(
+        text,
+        max_input_chars=max_input_chars,
+        task=task,
+        aspect=aspect,
+    )
+
+
+def _render_messages(
+    text: object,
+    *,
+    max_input_chars: int,
+    task: Optional[str],
+    aspect: Optional[str],
+) -> List[Message]:
+    candidate_text = truncate_text(text, max_input_chars=max_input_chars)
+    rubric = render_rubric(rubric_for(task=task, aspect=aspect))
+    return _PROMPT_SPEC.render_messages(
+        {"candidate_text": candidate_text, "rubric": rubric}
+    )
 
 
 def build_response_format_json_schema() -> Dict[str, object]:
