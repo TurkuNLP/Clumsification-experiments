@@ -6,6 +6,9 @@ This directory is the canonical home for version-controlled prompt text. Prompt
 files are UTF-8 JSON and are loaded through `clumsification_code.prompts` so
 their paths do not depend on the process working directory.
 
+Each externally sourced prompt or rubric carries a short source citation in
+the same file as its wording.
+
 The initial schema describes an ordered chat prompt:
 
 ```json

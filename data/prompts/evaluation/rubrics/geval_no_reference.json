@@ -1,8 +1,13 @@
 {
   "schema_version": 1,
   "id": "geval.no_reference",
-  "version": "geval_qe_no_reference_v1",
+  "version": "geval_qe_no_reference_v2",
   "description": "G-Eval no-reference rubric collection and task/aspect mappings.",
+  "source": {
+    "url": "https://aclanthology.org/2023.findings-emnlp.599.pdf",
+    "citation": "Chiang and Lee (2023), Appendix F.1.2",
+    "note": "The fluency criterion uses Chiang and Lee's corrected 1-5 SummEval wording. Other criteria are project-specific."
+  },
   "default": [
     ["Fluency", "Grammar, spelling, punctuation, sentence structure, and readability."],
     ["Naturalness", "Whether the text sounds like coherent human-written English."],
@@ -13,9 +18,7 @@
   ],
   "aspects": {
     "fluency": [
-      ["Fluency", "Grammar, spelling, punctuation, sentence structure, and readability."],
-      ["Naturalness", "Whether the text sounds like coherent human-written English."],
-      ["Surface correctness", "Absence of awkward, ungrammatical, malformed, or hard-to-read language."]
+      ["Fluency (1-5)", "This rating measures the quality of individual sentences, are they well-written and grammatically correct. Consider the quality of individual sentences."]
     ],
     "coherence": [
       ["Coherence", "Logical flow, consistency, topic continuity, and absence of self-contradictions."],

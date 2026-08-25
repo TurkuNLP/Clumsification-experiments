@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "gptscore.source_aware_fluency",
+  "version": "1",
+  "description": "GPTScore source-aware fluency prompt used for custom-dataset supervision.",
+  "source": {
+    "status": "project_original",
+    "based_on": "https://arxiv.org/abs/2302.04166",
+    "note": "Written for this repository's source-aware supervision protocol; not taken verbatim from GPTScore."
+  },
+  "template": "Assess the fluency and grammaticality of the candidate given the source text.\n\nSource text:\n{source}\n\nCandidate text:\n"
+}

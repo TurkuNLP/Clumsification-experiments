@@ -12,6 +12,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
 
+from clumsification_code.prompts import load_prompt_data
+
 
 _DTYPE_MAP = {
     "auto": "auto",
@@ -24,13 +26,10 @@ _DTYPE_MAP = {
 }
 
 
-# Dedicated custom-dataset prompt. It is intentionally separate from the
-# candidate-only GPTSCORE_NOREF_PROMPTS below and is easy to replace for a
-# controlled prompt ablation.
-DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT = (
-    "Assess the fluency and grammaticality of the candidate given the "
-    "source text.\n\nSource text:\n{source}\n\nCandidate text:\n"
+_SOURCE_PROMPT_DATA = load_prompt_data(
+    "evaluation/gptscore/source_aware_fluency.json"
 )
+DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT = _SOURCE_PROMPT_DATA["template"]
 
 
 _ORIGINAL_PRINT = builtins.print
@@ -205,212 +204,9 @@ def build_prompt_table(prompt_config_json=None):
     return merge_prompt_overrides(GPTSCORE_NOREF_PROMPTS, overrides)
 
 
-SUMMEVAL_ASPECTS = {
-    "coherence": {
-        "abbr": "COH",
-        "instruction_prefix": "Generate a coherent summary for the following text: ",
-    },
-    "consistency": {
-        "abbr": "CON",
-        "instruction_prefix": "Generate factually consistent summary for the following text: ",
-    },
-    "fluency": {
-        "abbr": "FLU",
-        "instruction_prefix": "Generate a fluent and grammatical summary for the following text: ",
-    },
-    "relevance": {
-        "abbr": "REL",
-        "instruction_prefix": "Generate a relevant summary with consistent details for the following text: ",
-    },
-}
-
-
-DEFAULT_NOREF_PROMPT = {
-    "instruction_prefix": "Generate a fluent, coherent, grammatical, high-quality English text: ",
-    "prompt_text": "",
-}
-
-
-GPTSCORE_NOREF_PROMPTS: Dict[str, Dict[str, Dict[str, str]]] = {
-    "default": {
-        "quality": DEFAULT_NOREF_PROMPT,
-        "overall": DEFAULT_NOREF_PROMPT,
-        "fluency": {
-            "instruction_prefix": "Generate a fluent and grammatical English text: ",
-            "prompt_text": "",
-        },
-        "coherence": {
-            "instruction_prefix": "Generate a coherent English text: ",
-            "prompt_text": "",
-        },
-        "consistency": {
-            "instruction_prefix": "Generate a factually consistent English text: ",
-            "prompt_text": "",
-        },
-        "naturalness": {
-            "instruction_prefix": "Generate a natural English text: ",
-            "prompt_text": "",
-        },
-        "complexity": {
-            "instruction_prefix": "Generate a complex and well-written English text: ",
-            "prompt_text": "",
-        },
-    },
-    "summeval": {
-        "coherence": {
-            "instruction_prefix": SUMMEVAL_ASPECTS["coherence"]["instruction_prefix"],
-            "prompt_text": "\n\nTl;dr",
-        },
-        "consistency": {
-            "instruction_prefix": SUMMEVAL_ASPECTS["consistency"]["instruction_prefix"],
-            "prompt_text": "\n\nTl;dr",
-        },
-        "fluency": {
-            "instruction_prefix": SUMMEVAL_ASPECTS["fluency"]["instruction_prefix"],
-            "prompt_text": "\n\nTl;dr",
-        },
-        "relevance": {
-            "instruction_prefix": SUMMEVAL_ASPECTS["relevance"]["instruction_prefix"],
-            "prompt_text": "\n\nTl;dr",
-        },
-        "vanilla": {
-            "instruction_prefix": "",
-            "prompt_text": "\n\nTl;dr",
-        },
-    },
-    "jfleg": {
-        "fluency": {
-            "instruction_prefix": "Generate a fluent and grammatical sentence: ",
-            "prompt_text": "",
-        },
-        "grammar": {
-            "instruction_prefix": "Generate a fluent and grammatical sentence: ",
-            "prompt_text": "",
-        },
-    },
-    "multiblimp": {
-        "grammar": {
-            "instruction_prefix": "Generate a fluent and grammatical sentence: ",
-            "prompt_text": "",
-        },
-        "acceptability": {
-            "instruction_prefix": "Generate an acceptable English sentence: ",
-            "prompt_text": "",
-        },
-    },
-    "story_cloze": {
-        "coherence": {
-            "instruction_prefix": "Generate a coherent and sensible story ending: ",
-            "prompt_text": "",
-        },
-    },
-    "ellipse": {
-        "overall": {
-            "instruction_prefix": "Generate a high-quality student essay: ",
-            "prompt_text": "",
-        },
-        "cohesion": {
-            "instruction_prefix": "Generate a cohesive student essay: ",
-            "prompt_text": "",
-        },
-    },
-    "argessay": {
-        "language_mastery": {
-            "instruction_prefix": "Generate an essay with strong language mastery: ",
-            "prompt_text": "",
-        },
-        "complexity": {
-            "instruction_prefix": "Generate a complex and well-written essay: ",
-            "prompt_text": "",
-        },
-        "vocabulary": {
-            "instruction_prefix": "Generate an essay with strong vocabulary usage: ",
-            "prompt_text": "",
-        },
-        "language_constructs": {
-            "instruction_prefix": "Generate an essay with strong language constructs: ",
-            "prompt_text": "",
-        },
-    },
-    "topicalchat": {
-        "overall": {
-            "instruction_prefix": "Generate a high-quality dialogue response: ",
-            "prompt_text": "",
-        },
-        "natural": {
-            "instruction_prefix": "Generate a natural dialogue response: ",
-            "prompt_text": "",
-        },
-    },
-    "personachat": {
-        "overall": {
-            "instruction_prefix": "Generate a high-quality dialogue response: ",
-            "prompt_text": "",
-        },
-        "natural": {
-            "instruction_prefix": "Generate a natural dialogue response: ",
-            "prompt_text": "",
-        },
-    },
-    "fed_turn": {
-        "fluency": {
-            "instruction_prefix": "Generate a fluent dialogue response: ",
-            "prompt_text": "",
-        },
-        "overall": {
-            "instruction_prefix": "Generate a high-quality dialogue response: ",
-            "prompt_text": "",
-        },
-    },
-    "fed_whole": {
-        "overall": {
-            "instruction_prefix": "Generate a high-quality dialogue: ",
-            "prompt_text": "",
-        },
-    },
-    "webnlg": {
-        "fluency": {
-            "instruction_prefix": "Generate a fluent and grammatical data-to-text description: ",
-            "prompt_text": "",
-        },
-    },
-    "e2e": {
-        "naturalness": {
-            "instruction_prefix": "Generate a natural restaurant description: ",
-            "prompt_text": "",
-        },
-        "quality": {
-            "instruction_prefix": "Generate a high-quality restaurant description: ",
-            "prompt_text": "",
-        },
-    },
-    "humanratings": {
-        "quality": {
-            "instruction_prefix": "Generate a high-quality natural language generation output: ",
-            "prompt_text": "",
-        },
-        "naturalness": {
-            "instruction_prefix": "Generate a natural language generation output: ",
-            "prompt_text": "",
-        },
-    },
-    "openmeva": {
-        "overall": {
-            "instruction_prefix": "Generate a high-quality story continuation: ",
-            "prompt_text": "",
-        },
-    },
-    "hanna": {
-        "coherence": {
-            "instruction_prefix": "Generate a coherent story: ",
-            "prompt_text": "",
-        },
-        "complexity": {
-            "instruction_prefix": "Generate a complex and well-written story: ",
-            "prompt_text": "",
-        },
-    },
-}
+_PROMPT_DATA = load_prompt_data("evaluation/gptscore/no_reference.json")
+DEFAULT_NOREF_PROMPT = _PROMPT_DATA["default_prompt"]
+GPTSCORE_NOREF_PROMPTS: Dict[str, Dict[str, Dict[str, str]]] = _PROMPT_DATA["prompts"]
 
 
 def load_prompt_overrides(path: Optional[str]) -> Dict[str, Dict[str, Dict[str, str]]]:

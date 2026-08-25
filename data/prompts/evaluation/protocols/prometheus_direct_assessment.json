@@ -1,21 +1,32 @@
 {
   "schema_version": 1,
-  "id": "prometheus.direct_assessment.no_reference",
+  "id": "prometheus.absolute_grading.no_reference",
   "version": "1",
-  "description": "Prometheus-style direct assessment of a candidate without a reference answer.",
+  "description": "Official Prometheus absolute-grading protocol without a reference answer.",
   "required_variables": [
     "candidate_text",
+    "instruction",
     "rubric"
   ],
   "messages": [
     {
+      "role": "system",
+      "content": "You are a fair judge assistant tasked with providing clear, objective feedback based on specific criteria, ensuring each assessment reflects the absolute standards set for performance."
+    },
+    {
       "role": "user",
-      "content": "###Task Description: A response to evaluate and a score rubric representing the evaluation criteria are given.\n1. Write detailed feedback that assesses the quality of the response strictly based on the given score rubric, not evaluating it in general.\n2. After writing the feedback, write a score that is an integer between 1 and 5. You should refer to the score rubric.\n3. The output format should look as follows: \"Feedback: (write feedback for the criterion) [RESULT] (an integer number between 1 and 5)\"\n4. Please do not generate any other opening, closing, or explanations.\n\n###Response to evaluate:\n{candidate_text}\n\n###Score Rubric:\n{rubric}\n\n###Feedback:"
+      "content": "###Task Description:\n\nAn instruction (might include an Input inside it), a response to evaluate, and a score rubric representing a evaluation criteria are given.\n\n1. Write a detailed feedback that assess the quality of the response strictly based on the given score rubric, not evaluating in general.\n\n2. After writing a feedback, write a score that is an integer between 1 and 5. You should refer to the score rubric.\n\n3. The output format should look as follows: \"(write a feedback for criteria) [RESULT] (an integer number between 1 and 5)\"\n\n4. Please do not generate any other opening, closing, and explanations.\n\n###The instruction to evaluate:\n\n{instruction}\n\n###Response to evaluate:\n\n{candidate_text}\n\n###Score Rubrics:\n\n{rubric}\n\n###Feedback: "
     }
   ],
   "metadata": {
     "method": "prometheus",
     "assessment": "direct",
-    "reference_mode": "none"
+    "reference_mode": "none",
+    "source_status": "exact",
+    "source_url": "https://github.com/prometheus-eval/prometheus-eval/blob/main/libs/prometheus-eval/prometheus_eval/prompts.py",
+    "source_symbols": [
+      "ABS_SYSTEM_PROMPT",
+      "ABSOLUTE_PROMPT_WO_REF"
+    ]
   }
 }

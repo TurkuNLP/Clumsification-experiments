@@ -3,6 +3,12 @@
   "id": "menlo.fluency",
   "version": "1",
   "description": "MENLO's five-point fluency grading rubric.",
+  "source": {
+    "status": "exact",
+    "url": "https://arxiv.org/abs/2509.26601",
+    "location": "Appendix, Figure 6: Example of 5-Point Grading Rubrics for Fluency",
+    "note": "Wording is reproduced verbatim; line wrapping is normalized for JSON storage."
+  },
   "criterion": "Fluency",
   "score_min": 1,
   "score_max": 5,
