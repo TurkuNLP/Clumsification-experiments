@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "id": "geval.no_reference.json",
-  "version": "geval_qe_no_reference_v1",
+  "id": "geval.no_reference",
+  "version": "geval_qe_no_reference_v2",
   "description": "G-Eval no-reference chat protocol with a JSON response.",
   "required_variables": ["candidate_text", "rubric"],
   "messages": [
@@ -17,6 +17,7 @@
   "metadata": {
     "method": "geval",
     "assessment": "no_reference",
+    "output_parser": "json_score",
     "source_status": "adapted",
     "based_on": "https://github.com/nlpyang/geval",
     "note": "Project-specific candidate-only 1-5 JSON adaptation; not a verbatim G-Eval paper prompt."

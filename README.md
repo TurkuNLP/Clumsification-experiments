@@ -42,6 +42,26 @@ python scripts/score_custom_dataset.py \
 BLEURT defaults to its authors' recommended `BLEURT-20` checkpoint; override
 it with `--bleurt-checkpoint` when necessary.
 
+## Running a vLLM evaluation baseline
+
+The Prometheus scorer uses vLLM and supports tensor parallel execution. For
+example, to use M-Prometheus-14B across four GPUs:
+
+```bash
+python -m clumsification_code.evals.run_benchmark \
+  --scorer vllm \
+  --model-name M-Prometheus-14B \
+  --vllm-model-name-or-path Unbabel/M-Prometheus-14B \
+  --vllm-tensor-parallel-size 4 \
+  --vllm-protocol prometheus_direct_assessment.json \
+  --vllm-rubric menlo_fluency.json
+```
+
+The protocol and rubric are independently selectable. Ready-to-run examples
+are provided as `scripts/run_qwen3_menlo_vllm.sh` and
+`scripts/run_qwen3_geval_vllm.sh`. Set `VLLM_TENSOR_PARALLEL_SIZE` when the
+number of GPUs differs from the default of four.
+
 Each command creates `scores/<perturbation-folder>/<method>.jsonl`, an
 accompanying error JSONL, and a metadata file within the selected custom
 dataset. Score JSONL contains only

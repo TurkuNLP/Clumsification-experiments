@@ -21,6 +21,7 @@
   "metadata": {
     "method": "prometheus",
     "assessment": "direct",
+    "output_parser": "prometheus_result",
     "reference_mode": "none",
     "source_status": "exact",
     "source_url": "https://github.com/prometheus-eval/prometheus-eval/blob/main/libs/prometheus-eval/prometheus_eval/prompts.py",

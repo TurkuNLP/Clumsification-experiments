@@ -50,7 +50,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scorer",
         required=True,
-        choices=["fe", "gptscore", "metricx", "geval", "unieval", "ppl"],
+        choices=["fe", "gptscore", "metricx", "geval", "vllm", "unieval", "ppl"],
         help="Evaluation scorer backend.",
     )
     parser.add_argument("--model-name", required=True)
@@ -121,6 +121,18 @@ def add_unieval_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_prometheus_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--vllm-model-name-or-path", default=None)
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument("--vllm-max-tokens", type=int, default=512)
+    parser.add_argument("--vllm-temperature", type=float, default=0.0)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--vllm-trust-remote-code", action="store_true")
+    parser.add_argument("--vllm-protocol", default="prometheus_direct_assessment.json")
+    parser.add_argument("--vllm-rubric", default="menlo_fluency.json")
+
+
 def build_scorer(args: argparse.Namespace, device: torch.device):
     dtype = _DTYPE_MAP[args.dtype]
 
@@ -179,6 +191,26 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
 
         return GEvalScorer.from_args(args)
 
+    if args.scorer == "vllm":
+        from clumsification_code.evals.inference.vllm_scorer import VLLMTextScorer
+
+        model_path = args.vllm_model_name_or_path or args.model_dir
+        if not model_path:
+            raise ValueError("--vllm-model-name-or-path or --model-dir is required with --scorer vllm")
+        return VLLMTextScorer(
+            model_path,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            max_model_len=args.vllm_max_model_len,
+            max_tokens=args.vllm_max_tokens,
+            temperature=args.vllm_temperature,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            trust_remote_code=args.vllm_trust_remote_code,
+            protocol=args.vllm_protocol,
+            rubric=args.vllm_rubric,
+            task="fluency",
+            aspect="fluency",
+        )
+
     if args.scorer == "unieval":
         from clumsification_code.evals.inference.unieval import load_unieval_fluency_model
 
@@ -215,6 +247,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     add_gptscore_args(parser)
     add_metricx_args(parser)
     add_unieval_args(parser)
+    add_prometheus_args(parser)
 
     # G-Eval parser can extend this if needed.
     try:
@@ -250,6 +283,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         args.model_dir
         or getattr(args, "hf_model_name_or_path", "")
         or getattr(args, "metricx_model_name_or_path", "")
+        or getattr(args, "vllm_model_name_or_path", "")
         or getattr(args, "unieval_repo", "")
     )
 
@@ -267,6 +301,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
 
     else:
+        protocol = getattr(model, "protocol", "") if args.scorer == "vllm" else ""
+        rubric = getattr(model, "rubric", "") if args.scorer == "vllm" else ""
         metadata = EvalMetadata(
             model_name=args.model_name,
             model_dir=model_dir,
@@ -275,6 +311,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             perturbation_type="none",
             num_layers=0,
             context_length=args.context_length,
+            protocol=protocol,
+            rubric=rubric,
         )
 
     write_results_jsonl(metadata=metadata, results=results)

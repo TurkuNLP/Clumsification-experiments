@@ -21,6 +21,8 @@ class EvalMetadata:
     perturbation_type: str = ""
     num_layers: int = -1
     context_length: int = -1
+    protocol: str = ""
+    rubric: str = ""
 
 
 def json_sanitize(x: Any) -> Any:

@@ -52,14 +52,16 @@ from tqdm.auto import tqdm
 
 # Reuse your existing benchmark loaders/metrics/writer.
 import clumsification_code.evals.evaluate_model_on_benchmark as bench
+from clumsification_code.evals.geval.prompts import (
+    GEVAL_QE_PROMPT_VERSION,
+    build_messages,
+    build_response_format_json_schema,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  G-Eval no-reference / QE adapter
 # ──────────────────────────────────────────────────────────────────────
-
-
-GEVAL_QE_PROMPT_VERSION = "geval_qe_no_reference_v1"
 
 
 class GEvalQEInferenceModel:
@@ -196,58 +198,11 @@ class GEvalQEInferenceModel:
         return text[: self.max_input_chars] + "\n\n[TRUNCATED]"
 
     def _build_messages(self, text: str) -> List[Dict[str, str]]:
-        """
-        Build a no-reference G-Eval prompt.
-
-        The prompt intentionally asks for one scalar quality score rather than
-        benchmark-specific dimensions. This matches the original learned QE
-        model interface, which emits a single general quality score per text.
-        """
-        text = self._truncate_text(text)
-
-        system_prompt = (
-            "You are an expert evaluator of natural language generation quality. "
-            "You must provide calibrated, reproducible, no-reference quality "
-            "judgments for standalone text. You do not know the original task, "
-            "source document, reference answer, or user prompt. Therefore, do not "
-            "judge factual accuracy against missing context. Judge only what can "
-            "be assessed from the candidate text itself."
+        return build_messages(
+            text,
+            max_input_chars=self.max_input_chars,
+            aspect="fluency",
         )
-
-        user_prompt = f"""
-Evaluate the following candidate text using a G-Eval-style rubric.
-
-Evaluation criteria:
-1. Fluency: grammar, spelling, punctuation, sentence structure, and readability.
-2. Naturalness: whether the text sounds like coherent human-written English.
-3. Coherence: logical flow, consistency, and absence of contradictions within the text.
-4. Clarity: whether the meaning is understandable and not unnecessarily confusing.
-5. Lexical and syntactic quality: appropriate word choice and sentence variety.
-6. Overall standalone quality: holistic quality given no source or reference.
-
-Important constraints:
-- This is a no-reference quality-estimation setting.
-- Do not penalize the text for missing facts that require external context.
-- Do not reward unsupported factual claims beyond their writing quality.
-- Prefer concise but well-formed text over verbose incoherent text.
-- Use the full score range when appropriate.
-- Return JSON only.
-
-Score scale:
-1 = very poor quality; many severe errors; hard to understand.
-2 = poor quality; noticeable errors or awkwardness; weak coherence.
-3 = acceptable quality; understandable but with flaws.
-4 = good quality; mostly fluent, clear, and coherent.
-5 = excellent quality; highly fluent, natural, clear, and coherent.
-
-Candidate text:
-{text}
-""".strip()
-
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
 
     @staticmethod
     def _extract_json_object(raw: str) -> Dict[str, Any]:
@@ -290,28 +245,7 @@ Candidate text:
     async def _score_one_uncached_async(self, text: str) -> Dict[str, Any]:
         messages = self._build_messages(text)
 
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "geval_quality_score",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "score": {
-                            "type": "number",
-                            "description": "A no-reference quality score from 1 to 5.",
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Brief rationale for the score. Keep concise.",
-                        },
-                    },
-                    "required": ["score", "reasoning"],
-                },
-            },
-        }
+        response_format = build_response_format_json_schema()
 
         scores: List[float] = []
         raw_responses: List[str] = []
@@ -368,30 +302,7 @@ Candidate text:
     def _score_one_uncached(self, text: str) -> Dict[str, Any]:
         messages = self._build_messages(text)
 
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "geval_quality_score",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "score": {
-                            "type": "number",
-                            "description": "A no-reference quality score from 1 to 5.",
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": (
-                                "Brief rationale for the score. Keep concise."
-                            ),
-                        },
-                    },
-                    "required": ["score", "reasoning"],
-                },
-            },
-        }
+        response_format = build_response_format_json_schema()
 
         scores: List[float] = []
         raw_responses: List[str] = []
