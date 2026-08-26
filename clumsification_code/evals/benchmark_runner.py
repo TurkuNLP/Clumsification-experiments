@@ -19,6 +19,10 @@ from clumsification_code.evals.standalone_benchmarks import (
     iter_standalone_records,
 )
 from clumsification_code.evals.inference.base import TextScorer
+from clumsification_code.evals.multilingual_benchmarks import (
+    iter_basse_records,
+    iter_norwegian_preference_records,
+)
 from clumsification_code.evals.metrics import (
     correlation_bundle,
     flatten_preference_metrics,
@@ -67,12 +71,15 @@ def eval_pairwise_preference_dataset(
     aspect: str,
     batch_size: int,
     max_length: int,
+    human_ties: Optional[List[bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     if len(preferred_texts) != len(dispreferred_texts):
         raise ValueError(
             f"{name}: preferred/dispreferred length mismatch: "
             f"{len(preferred_texts)} vs {len(dispreferred_texts)}"
         )
+    if human_ties is not None and len(human_ties) != len(preferred_texts):
+        raise ValueError(f"{name}: human tie mask length mismatch")
 
     clean_text = getattr(data, "clean_text", None)
     if not callable(clean_text):
@@ -105,6 +112,7 @@ def eval_pairwise_preference_dataset(
     metrics = preference_metrics(
         preferred_scores=all_scores[:n],
         dispreferred_scores=all_scores[n:],
+        human_ties=human_ties,
         name=name,
     )
 
@@ -456,6 +464,7 @@ def run_standard_benchmark_suite(
     cohesentia_path=DEFAULT_COHESENTIA_PATH,
     skip_preferences: bool = False,
     max_records_per_dimension: Optional[int] = None,
+    include_multilingual: bool = True,
 ) -> Dict[str, Any]:
     """Run the registry-backed English scalar and preference suite.
 
@@ -607,6 +616,62 @@ def run_standard_benchmark_suite(
                 "kendall_tau": dimension_result.get(f"{result_name}_kendall_tau"),
             }
         )
+
+    multilingual_summaries: List[Dict[str, Any]] = []
+    if include_multilingual:
+        for language_code in ("eu", "es"):
+            records = list(iter_basse_records(language=language_code))
+            if max_records_per_dimension is not None:
+                records = records[:max_records_per_dimension]
+            if not records:
+                continue
+            language_name = str(records[0]["language"]).lower()
+            result_name = f"multilingual__basse__{language_name}__grammaticality"
+            dimension_result = score_scalar_aspect(
+                model=model,
+                device=device,
+                texts=[str(record["text"]) for record in records],
+                labels=[float(record["human_score"]) for record in records],
+                task_name="summarization",
+                aspect="fluency",
+                result_name=result_name,
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+            all_results.update(dimension_result)
+            multilingual_summaries.append({
+                "name": result_name,
+                "task_family": "summarization",
+                "categories": ("grammaticality",),
+                "language": language_name,
+                "track": "multilingual",
+                "spearman_rho": dimension_result.get(f"{result_name}_spearman_rho"),
+                "kendall_tau": dimension_result.get(f"{result_name}_kendall_tau"),
+            })
+
+        norwegian = list(iter_norwegian_preference_records())
+        if max_records_per_dimension is not None:
+            norwegian = norwegian[:max_records_per_dimension]
+        if norwegian:
+            result_name = "multilingual__norwegian__holistic_fluency_preference"
+            metrics = eval_pairwise_preference_dataset(
+                name=result_name,
+                model=model,
+                device=device,
+                preferred_texts=[str(record["preferred_text"]) for record in norwegian],
+                dispreferred_texts=[str(record["dispreferred_text"]) for record in norwegian],
+                human_ties=[bool(record["tie"]) for record in norwegian],
+                task_name="general_text_generation",
+                aspect="fluency",
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+            add_preference_result(result_name, metrics)
+
+        all_results.update(aggregate_dimension_results(
+            multilingual_summaries,
+            prefix="aggregate__multilingual",
+        ))
 
     all_results.update(aggregate_dimension_results(dimension_summaries))
     return all_results

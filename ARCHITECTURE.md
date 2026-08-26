@@ -136,7 +136,7 @@ Both paths use `fe/modeling.py::FEModel`: a Hugging Face encoder, mean pooling, 
 - `evals/geval/` for G-Eval.
 - `evals/inference/vllm_scorer.py` for generic vLLM-backed judges.
 
-`evals/benchmark_runner.py` runs the datasets loaded by `benchmark_data.py`; `metrics.py` calculates correlations/preferences; `result_writer.py` records results. `evaluate_model_on_tdt_regens.py` is the larger specialized workflow for regenerated TDT/UD texts.
+`evals/benchmark_runner.py` runs the datasets loaded by `benchmark_data.py`; `multilingual_benchmarks.py` provides normalized BASSE and Norwegian human-evaluation records; `metrics.py` calculates correlations/preferences; `result_writer.py` records results. `evaluate_model_on_tdt_regens.py` is the larger specialized workflow for regenerated TDT/UD texts.
 
 Direct benchmark evaluation is candidate-only unless a benchmark adapter
 explicitly defines another protocol. The source-aware `score_pairs(...)`

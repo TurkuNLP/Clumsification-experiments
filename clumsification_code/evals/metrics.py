@@ -64,6 +64,7 @@ def correlation_bundle(labels, preds, name: str = "metric") -> Dict[str, float]:
 def preference_metrics(
     preferred_scores,
     dispreferred_scores,
+    human_ties=None,
     name: str = "preference",
 ) -> Dict[str, Any]:
     preferred_scores = np.asarray(preferred_scores, dtype=np.float64)
@@ -90,8 +91,14 @@ def preference_metrics(
         }
 
     deltas = preferred_scores - dispreferred_scores
-    wins = deltas > 0
-    ties = deltas == 0
+    if human_ties is None:
+        human_ties = np.zeros(len(deltas), dtype=bool)
+    else:
+        human_ties = np.asarray(human_ties, dtype=bool)
+        if human_ties.shape != deltas.shape:
+            raise ValueError(f"{name}: human tie mask shape mismatch")
+    wins = (deltas > 0) & ~human_ties
+    ties = human_ties | ((deltas == 0) & ~human_ties)
 
     return {
         "n": int(len(deltas)),

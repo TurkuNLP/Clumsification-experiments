@@ -84,6 +84,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Skip JFLEG, MultiBLiMP, and Story Cloze preference evaluation.",
     )
     parser.add_argument(
+        "--skip-multilingual",
+        action="store_true",
+        help="Skip BASSE and Norwegian multilingual evaluation.",
+    )
+    parser.add_argument(
         "--max-records-per-dimension",
         type=int,
         default=None,
@@ -279,6 +284,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         cohesentia_path=args.cohesentia_path,
         skip_preferences=args.skip_preferences,
         max_records_per_dimension=args.max_records_per_dimension,
+        include_multilingual=not args.skip_multilingual,
     )
 
     model_dir = (
@@ -300,6 +306,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             perturbation_type=pert_type,
             num_layers=num_layers,
             context_length=args.context_length,
+            evaluation_tracks="english" if args.skip_multilingual else "english,multilingual",
         )
 
     else:
@@ -315,6 +322,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             context_length=args.context_length,
             protocol=protocol,
             rubric=rubric,
+            evaluation_tracks="english" if args.skip_multilingual else "english,multilingual",
         )
 
     write_results_jsonl(metadata=metadata, results=results)

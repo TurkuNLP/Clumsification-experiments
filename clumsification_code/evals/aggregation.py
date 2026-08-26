@@ -40,6 +40,7 @@ def _add_group_result(
 
 def aggregate_dimension_results(
     summaries: Iterable[Mapping[str, Any]],
+    prefix: str = "aggregate",
 ) -> Dict[str, Any]:
     """Macro-average dimensions by task family, category, and overall.
 
@@ -59,21 +60,20 @@ def aggregate_dimension_results(
             by_category[str(category)].append(item)
 
     for task_family, group in sorted(by_task.items()):
-        _add_group_result(output, "aggregate__task_family", task_family, group)
+        _add_group_result(output, f"{prefix}__task_family", task_family, group)
     for category, group in sorted(by_category.items()):
-        _add_group_result(output, "aggregate__category", category, group)
+        _add_group_result(output, f"{prefix}__category", category, group)
 
     category_spearman = [
-        output[f"aggregate__category__{category.replace(' ', '_')}__spearman_rho"]
+        output[f"{prefix}__category__{category.replace(' ', '_')}__spearman_rho"]
         for category in sorted(by_category)
     ]
     category_kendall = [
-        output[f"aggregate__category__{category.replace(' ', '_')}__kendall_tau"]
+        output[f"{prefix}__category__{category.replace(' ', '_')}__kendall_tau"]
         for category in sorted(by_category)
     ]
-    output["aggregate__overall__spearman_rho"] = _finite_mean(category_spearman)
-    output["aggregate__overall__kendall_tau"] = _finite_mean(category_kendall)
-    output["aggregate__overall__n_categories"] = len(by_category)
-    output["aggregate__overall__n_dimensions"] = len(items)
+    output[f"{prefix}__overall__spearman_rho"] = _finite_mean(category_spearman)
+    output[f"{prefix}__overall__kendall_tau"] = _finite_mean(category_kendall)
+    output[f"{prefix}__overall__n_categories"] = len(by_category)
+    output[f"{prefix}__overall__n_dimensions"] = len(items)
     return output
-
