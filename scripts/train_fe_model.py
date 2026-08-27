@@ -67,23 +67,30 @@ def build_training_arguments(
         disable_tqdm=False,
     )
 
-    # Regression selects the best checkpoint using validation Spearman
-    # correlation. args.py validates matching save/evaluation strategies.
-    if args.training_method == "regression":
+    # Loading the best model requires evaluation and checkpoint saving to use
+    # compatible strategies. Pairwise runs may deliberately evaluate during
+    # training without saving intermediate checkpoints: save_final_model()
+    # persists the final model after trainer.train() in that workflow.
+    load_best_model_at_end = args.save_strategy != "no"
+    training_kwargs["load_best_model_at_end"] = load_best_model_at_end
+
+    if load_best_model_at_end:
         training_kwargs.update(
             {
-                "load_best_model_at_end": True,
-                "metric_for_best_model": "spearman",
+                "metric_for_best_model": (
+                    "spearman"
+                    if args.training_method == "regression"
+                    else "pairwise_accuracy"
+                ),
                 "greater_is_better": True,
             }
         )
-    else:
-        training_kwargs.update(
-            {
-                "load_best_model_at_end": True,
-                "metric_for_best_model": "pairwise_accuracy",
-                "greater_is_better": True,
-            }
+    elif args.eval_strategy != "no" and args.save_strategy == "no":
+        logger.info(
+            "Intermediate checkpoint saving is disabled; validation will run "
+            "with eval_strategy=%s, and the final model will be saved without "
+            "best-checkpoint reloading.",
+            args.eval_strategy,
         )
 
     use_fsdp = use_cuda

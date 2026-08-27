@@ -62,15 +62,40 @@ def _read_originals_by_custom_id(custom_dataset_name: str) -> dict[int, dict]:
     originals_by_id: dict[int, dict] = {}
 
     for row_no, row in enumerate(read_ds(original_path), start=1):
-        if "custom_id" not in row:
-            raise ValueError(f"{original_path}:{row_no} is missing custom_id")
+        # Older custom datasets used head_id for originals as well as their
+        # perturbations. Accept that schema without rewriting the source data.
+        # New data should continue to use custom_id.
+        if "custom_id" in row and "head_id" in row:
+            custom_id = _coerce_custom_id(
+                row["custom_id"],
+                context=f"{original_path}:{row_no}:custom_id",
+            )
+            legacy_head_id = _coerce_custom_id(
+                row["head_id"],
+                context=f"{original_path}:{row_no}:head_id",
+            )
+            if custom_id != legacy_head_id:
+                raise ValueError(
+                    f"{original_path}:{row_no} has conflicting custom_id="
+                    f"{custom_id} and head_id={legacy_head_id}"
+                )
+        elif "custom_id" in row:
+            custom_id = _coerce_custom_id(
+                row["custom_id"],
+                context=f"{original_path}:{row_no}:custom_id",
+            )
+        elif "head_id" in row:
+            custom_id = _coerce_custom_id(
+                row["head_id"],
+                context=f"{original_path}:{row_no}:head_id",
+            )
+        else:
+            raise ValueError(
+                f"{original_path}:{row_no} is missing custom_id "
+                "(legacy head_id is also accepted)"
+            )
         if "text" not in row:
             raise ValueError(f"{original_path}:{row_no} is missing text")
-
-        custom_id = _coerce_custom_id(
-            row["custom_id"],
-            context=f"{original_path}:{row_no}:custom_id",
-        )
 
         if custom_id in originals_by_id:
             raise ValueError(
@@ -265,7 +290,7 @@ def format_custom_dataset(
         )
         original_scores = _extract_numeric_scores(
             original,
-            excluded_fields={"custom_id", "text"},
+            excluded_fields={"custom_id", "head_id", "text"},
         )
         for score_name, score_value in external_scores.get(
             ("original", original_id, original_candidate_id), {}
