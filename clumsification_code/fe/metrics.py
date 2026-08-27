@@ -1,5 +1,11 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
-"""Pure metrics for flattened FE training rows. Replaces the old per-training method metris implementation."""
+"""Pure metrics for flattened FE training rows.
+
+The functions accept Hugging Face ``EvalPrediction`` objects (or any object
+with matching ``predictions``/``label_ids`` attributes) and return JSON-safe
+scalar values. Pairwise predictions are the chosen-minus-rejected score
+difference produced by :class:`FEModel`.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +47,7 @@ def _correlation(left: torch.Tensor, right: torch.Tensor) -> float:
 
 
 def regression_metrics(eval_prediction: Any) -> dict[str, float]:
+    """Return error and rank-correlation metrics for scalar predictions."""
     predictions = _as_vector(eval_prediction.predictions)
     targets = _as_vector(eval_prediction.label_ids)
     if predictions.numel() != targets.numel():
@@ -57,11 +64,25 @@ def regression_metrics(eval_prediction: Any) -> dict[str, float]:
 
 
 def pairwise_metrics(eval_prediction: Any) -> dict[str, float]:
+    """Return tie-aware accuracy from chosen-minus-rejected score differences.
+
+    A positive difference is correct, a negative difference is incorrect, and
+    a numerical tie contributes half a point. ``label_ids`` is intentionally
+    unused because pairwise flattening always orders the lower-quality item as
+    rejected and the model output already encodes that target direction.
+    """
     differences = _as_vector(eval_prediction.predictions)
     if not differences.numel():
         return {"pairwise_accuracy": 0.0, "score_tie_rate": 0.0}
-    ties = torch.isclose(differences, torch.zeros_like(differences), atol=1e-6, rtol=0.0)
+    ties = torch.isclose(
+        differences, torch.zeros_like(differences), atol=1e-6, rtol=0.0
+    )
+    points = torch.where(
+        ties,
+        torch.full_like(differences, 0.5),
+        (differences > 0).float(),
+    )
     return {
-        "pairwise_accuracy": float((differences > 0).float().mean().item()),
+        "pairwise_accuracy": float(points.mean().item()),
         "score_tie_rate": float(ties.float().mean().item()),
     }
