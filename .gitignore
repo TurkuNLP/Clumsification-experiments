@@ -24,6 +24,7 @@ TQ_ranker*
 *.out
 *.err
 clumsification_code/evals/sanity
+clumsification_code/.archive/
 *.csv
 figures*/
 *.patch

@@ -6,44 +6,6 @@ import torch
 
 
 @dataclass
-class GroupedRankingCollator:
-    """Existing collator for grouped pairwise ranking training."""
-
-    tokenizer: Any
-    max_length: int
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        flat_texts = []
-        group_sizes = []
-        max_group_size = max(len(feature["texts"]) for feature in features)
-        padded_labels = []
-
-        for feature in features:
-            texts = feature["texts"]
-            labels = feature["labels"]
-            group_sizes.append(len(texts))
-            flat_texts.extend(texts)
-            padded_labels.append(
-                list(labels) + [-100] * (max_group_size - len(labels))
-            )
-
-        tokenized = self.tokenizer(
-            flat_texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-            pad_to_multiple_of=8,
-        )
-        return {
-            "input_ids": tokenized["input_ids"],
-            "attention_mask": tokenized["attention_mask"],
-            "group_sizes": torch.tensor(group_sizes, dtype=torch.long),
-            "labels": torch.tensor(padded_labels, dtype=torch.float32),
-        }
-
-
-@dataclass
 class RegressionCollator:
     """Tokenize independent text/target regression examples."""
 
@@ -65,6 +27,38 @@ class RegressionCollator:
             "attention_mask": tokenized["attention_mask"],
             "labels": torch.tensor(
                 [feature["target"] for feature in features],
+                dtype=torch.float32,
+            ),
+        }
+
+
+@dataclass
+class PairwiseCollator:
+    """Tokenize explicit chosen/rejected rows for independent scoring."""
+
+    tokenizer: Any
+    max_length: int
+    text_prefix: str = ""
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        chosen = self.tokenizer(
+            [f"{self.text_prefix}{feature['chosen_text']}" for feature in features],
+            padding=True, truncation=True, max_length=self.max_length,
+            return_tensors="pt", pad_to_multiple_of=8,
+        )
+        rejected = self.tokenizer(
+            [f"{self.text_prefix}{feature['rejected_text']}" for feature in features],
+            padding=True, truncation=True, max_length=self.max_length,
+            return_tensors="pt", pad_to_multiple_of=8,
+        )
+        return {
+            "chosen_input_ids": chosen["input_ids"],
+            "chosen_attention_mask": chosen["attention_mask"],
+            "rejected_input_ids": rejected["input_ids"],
+            "rejected_attention_mask": rejected["attention_mask"],
+            "labels": torch.ones(len(features), dtype=torch.float32),
+            "weights": torch.tensor(
+                [feature.get("weight", 1.0) for feature in features],
                 dtype=torch.float32,
             ),
         }

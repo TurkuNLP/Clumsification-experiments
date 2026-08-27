@@ -11,12 +11,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from scripts.configs.hpo.hps_to_test import HPS_TO_TEST
-
-
 MODEL_NAME = "intfloat/multilingual-e5-large"
 MAX_SEQ_LEN = 512
-DEFAULT_OBJECTIVE_KEY = "hpo_dev_pairwise_accuracy"
+DEFAULT_OBJECTIVE_KEYS = {
+    "pairwise": "hpo_dev_pairwise_accuracy",
+    "regression": "hpo_dev_spearman",
+}
 
 
 VALID_LOSSES = {
@@ -29,7 +29,6 @@ VALID_LOSSES = {
     "weighted-logistic",
 }
 
-VALID_LOSS_NORMALIZATIONS = {"pairs", "items"}
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -74,9 +73,10 @@ def pick_objective(
 
     keys_to_try.extend(
         [
-            DEFAULT_OBJECTIVE_KEY,
+            DEFAULT_OBJECTIVE_KEYS.get("pairwise", "hpo_dev_pairwise_accuracy"),
             "hpo_dev_accuracy",
             "hpo_dev_pairwise_accuracy",
+            "hpo_dev_spearman",
             "hpo_dev_acc",
             "hpo_dev_mean_pairwise_accuracy",
         ]
@@ -118,24 +118,10 @@ def normalize_trial(trial: Dict[str, Any]) -> Dict[str, Any]:
         loss = "hinge"
     t["loss"] = loss
 
-    loss_normalization = str(t.get("loss_normalization", "items"))
-    if loss_normalization == "batch":
-        # Old "batch" most closely corresponds to normalizing by valid pairs
-        # rather than number of chains/items.
-        loss_normalization = "pairs"
-    t["loss_normalization"] = loss_normalization
-
     if t["loss"] not in VALID_LOSSES:
         raise ValueError(
             f"Invalid loss in trial {t.get('trial_id')}: {t['loss']!r}. "
             f"Valid losses: {sorted(VALID_LOSSES)}"
-        )
-
-    if t["loss_normalization"] not in VALID_LOSS_NORMALIZATIONS:
-        raise ValueError(
-            f"Invalid loss_normalization in trial {t.get('trial_id')}: "
-            f"{t['loss_normalization']!r}. "
-            f"Valid values: {sorted(VALID_LOSS_NORMALIZATIONS)}"
         )
 
     return t
@@ -151,7 +137,6 @@ def require_trial_keys(trial: Dict[str, Any]) -> None:
         "learning_rate",
         "warmup_ratio",
         "weight_decay",
-        "loss_normalization",
         "num_train_epochs",
         "per_device_train_batch_size",
         "gradient_accumulation_steps",
@@ -196,6 +181,9 @@ def build_trial_command(
 
         *build_dataset_args(args),
 
+        "--training-method",
+        args.training_method,
+
         "--output-dir",
         str(output_dir),
 
@@ -219,9 +207,6 @@ def build_trial_command(
 
         "--weight_decay",
         str(trial["weight_decay"]),
-
-        "--loss_normalization",
-        str(trial["loss_normalization"]),
 
         "--num_train_epochs",
         str(trial["num_train_epochs"]),
@@ -266,17 +251,6 @@ def build_trial_command(
     if args.fsdp_layer_cls:
         cmd.extend(["--fsdp_layer_cls", args.fsdp_layer_cls])
 
-    if args.hidden_dim is not None:
-        cmd.extend(["--hidden_dim", str(args.hidden_dim)])
-
-    if args.dropout is not None:
-        cmd.extend(["--dropout", str(args.dropout)])
-
-    if args.length_diagnostics:
-        cmd.append("--length_diagnostics")
-        cmd.extend(["--length_plot_num_bins", str(args.length_plot_num_bins)])
-        cmd.extend(["--length_plot_max_pairs", str(args.length_plot_max_pairs)])
-
     if args.extra_args:
         cmd.extend(args.extra_args)
 
@@ -286,7 +260,13 @@ def build_trial_command(
 def selected_trials_from_args(args: argparse.Namespace) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
 
-    for raw_trial in HPS_TO_TEST:
+    if args.trials_file is None:
+        raise ValueError("--trials_file is required; the old trial table is archived")
+    trial_payload = load_json(Path(args.trials_file))
+    if not isinstance(trial_payload, list):
+        raise ValueError("--trials_file must contain a JSON list of trial objects")
+
+    for raw_trial in trial_payload:
         require_trial_keys(raw_trial)
         trial = normalize_trial(raw_trial)
 
@@ -320,6 +300,10 @@ def main() -> None:
         type=str,
         default="hpo_runs_multilingual_e5_large_chain5",
     )
+
+    parser.add_argument("--trials_file", type=str, required=True,
+                        help="JSON list of HPO trial objects.")
+    parser.add_argument("--training_method", choices=["pairwise", "regression"], default="pairwise")
 
     parser.add_argument(
         "--formatted_dataset_name",
@@ -404,20 +388,6 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--hidden_dim",
-        type=int,
-        default=None,
-        help="Optional scoring head hidden dim override.",
-    )
-
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=None,
-        help="Optional scoring head dropout override.",
-    )
-
-    parser.add_argument(
         "--save_strategy",
         type=str,
         default="no",
@@ -440,7 +410,7 @@ def main() -> None:
     parser.add_argument(
         "--objective_key",
         type=str,
-        default=DEFAULT_OBJECTIVE_KEY,
+        default=DEFAULT_OBJECTIVE_KEYS["pairwise"],
         help="Metric key from hpo_dev_metrics.json to maximize.",
     )
 
@@ -467,24 +437,6 @@ def main() -> None:
         "--overwrite_summary",
         action="store_true",
         help="Delete existing hpo_summary.jsonl before running.",
-    )
-
-    parser.add_argument(
-        "--length_diagnostics",
-        action="store_true",
-        help="Enable length diagnostic metrics/plots during dev evaluation.",
-    )
-
-    parser.add_argument(
-        "--length_plot_num_bins",
-        type=int,
-        default=10,
-    )
-
-    parser.add_argument(
-        "--length_plot_max_pairs",
-        type=int,
-        default=200000,
     )
 
     parser.add_argument(

@@ -25,6 +25,15 @@ def load_fe_model(
     param_dtype: Optional[torch.dtype] = None,
     map_location: str = "cpu",
 ) -> FEModel:
+    complete_state_path = os.path.join(final_dir, "fe_model_state.pt")
+    complete_config_path = os.path.join(final_dir, "fe_model_config.json")
+    if os.path.exists(complete_state_path) and os.path.exists(complete_config_path):
+        return FEModel.from_pretrained(
+            final_dir,
+            attn_implementation=attn_implementation,
+            param_dtype=param_dtype,
+        )
+
     head_path = os.path.join(final_dir, "fe_head.pt")
     if not os.path.exists(head_path):
         from clumsification_code.compat.fe_checkpoints import find_legacy_head
@@ -40,12 +49,17 @@ def load_fe_model(
 
     evaluation_head_state = head_state["evaluation_head"]
 
+    legacy_head = any(
+        key.startswith("net.0.") or key.startswith("net.3.")
+        for key in evaluation_head_state
+    )
     model = FEModel(
         model_name=final_dir,
-        hidden_dim=head_state["hidden_dim"],
-        dropout=head_state["dropout"],
+        hidden_dim=head_state.get("hidden_dim", 256),
+        dropout=head_state.get("dropout", 0.1),
         attn_implementation=attn_implementation,
         param_dtype=param_dtype,
+        legacy_head=legacy_head,
     )
 
     model.evaluation_head.load_state_dict(evaluation_head_state, strict=True)
@@ -72,9 +86,8 @@ def save_final_model(
     trainer,
     tokenizer,
     output_dir: str,
-    hidden_dim: int,
-    dropout: float,
     rank: int,
+    metadata: Optional[dict] = None,
 ) -> str:
     """
     Saves:
@@ -111,6 +124,8 @@ def save_final_model(
     )
 
     if rank == 0:
+        unwrapped.save_pretrained(final_dir, tokenizer=tokenizer, metadata=metadata)
+
         cleaned_state_dict = {
             strip_known_prefixes(k): v
             for k, v in state_dict.items()
@@ -157,8 +172,7 @@ def save_final_model(
         torch.save(
             {
                 "evaluation_head": evaluation_head_state_dict,
-                "hidden_dim": hidden_dim,
-                "dropout": dropout,
+                "head_type": "linear",
             },
             os.path.join(final_dir, "fe_head.pt"),
         )

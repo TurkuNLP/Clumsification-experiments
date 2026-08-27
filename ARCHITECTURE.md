@@ -14,25 +14,54 @@ raw documents
                  └─ data/hf_datasets/<name>/  saved Hugging Face DatasetDict
                       └─ scripts/train_fe_model.py
                            └─ clumsification_code/fe/  model + ranking/regression training
-                                └─ <output>/final/     encoder + tokenizer + fe_head.pt
+                                └─ <output>/final/     encoder + tokenizer + FE metadata/state
                                      └─ clumsification_code/evals/  inference + benchmarks
+
+Retired FE training and chain-evaluation implementations are kept locally in
+the ignored `clumsification_code/.archive/fe_legacy/` directory. They are not
+part of production imports or training.
 ```
 
 The formatted Hugging Face dataset is the key boundary: upstream code creates
 supervision, while downstream code trains or evaluates scorers.
+
+## FE contracts (implementation target)
+
+These are the non-negotiable contracts for the simplified FE implementation:
+
+1. **Candidate-only scoring.** A trained evaluator accepts one candidate text
+   and returns one higher-is-better scalar. Sources, references, perturbation
+   layers, teacher names, and human labels are never model inputs at inference.
+2. **One scorer, two objectives.** Both training methods use the same function
+   `s(x) = w^T mean_pool(encoder(x)) + b`. The head is exactly one linear
+   projection from the pooled encoder representation to one scalar.
+3. **Source-safe flattening.** Chains are an upstream provenance and auditing
+   representation. Splits are made by source/original ID first; only then are
+   rows flattened for training.
+4. **Explicit training rows.** Regression consumes one candidate and one
+   scalar target per row. Pairwise ranking consumes two independently scored
+   candidates from the same source per row. The trainer does not construct
+   pairs from variable-length chains.
+5. **Standard training engine.** The canonical implementation uses the
+   Hugging Face `Trainer`; objective-specific behavior belongs in the model,
+   loss functions, collators, and metric functions. Custom trainer subclasses
+   are not part of the target architecture.
+6. **Training-only supervision.** Automatic teacher scores may create targets,
+   but human evaluation data remains evaluation-only and cannot affect splits,
+   transforms, checkpoint selection, or hyperparameters.
 
 ## Main folders
 
 | Path | Responsibility |
 | --- | --- |
 | `clumsification_code/data/` | Reads custom JSONL datasets, aligns originals/perturbations/scores, prevents source-ID leakage, and saves train/dev/test datasets. |
-| `clumsification_code/fe/` | Canonical FE implementation: shared encoder, evaluation head, ranking and regression objectives, trainers, evaluation, and checkpoints. |
+| `clumsification_code/fe/` | Canonical FE implementation: shared encoder, linear scalar head, objectives, collators, metrics, diagnostics, and checkpoints. |
 | `clumsification_code/evals/` | Common benchmark runner, scorer adapters, benchmark loaders, metrics, and result writing. |
 | `clumsification_code/perturbations/` | LLM-based and rule-based ways to create degraded or altered texts. |
 | `clumsification_code/prompts/`, `data/prompts/` | Validates and renders versioned prompt specifications stored independently from model transports and scorer code. |
 | `scripts/` | User-facing workflows: dataset creation, training, HPO, calibration, scoring, and UD-document generation. |
 | `filter_scripts/` | Standalone vLLM filters for deciding which generated texts to retain. |
-| `clumsification_code/compat/`, `clumsification_code/ltr/` | Removable compatibility layer for old LTR names and checkpoint files. New code must not depend on these. |
+| `clumsification_code/compat/` | Compatibility helpers for legacy checkpoint files. Production code does not depend on LTR names. |
 
 ## Canonical workflows
 
@@ -44,6 +73,11 @@ supervision, while downstream code trains or evaluates scorers.
 2. `data/format_dataset.py` to align each original with perturbation layers and external score JSONLs. Score rows are matched by canonical perturbation source, original ID, and candidate ID.
 3. `data/pairing.py` when random training pairs are requested.
 4. `data/hf_dataset.py` to produce and save a `DatasetDict` containing `train`, `dev`, and `test`.
+
+At training time, `data/flattening.py` validates source isolation and converts
+the grouped dataset into explicit regression rows or chosen/rejected pair
+rows. The grouped dataset is retained for provenance; the flattened dataset is
+what the trainer consumes.
 
 A formatted row normally contains `texts` and aligned `labels`; named score lists may also be present for regression.
 
@@ -117,14 +151,31 @@ distributed across train/dev/test.
 
 ### 2. Train an FE model
 
-`scripts/train_fe_model.py` is the only canonical training entry point. `--training-method` selects:
+`scripts/train_fe_model.py` is the only canonical training entry point. It
+loads a source-safe formatted `DatasetDict` and flattens it into the selected
+training schema before constructing the trainer.
 
-- `pairwise`: grouped candidates, `GroupedRankingCollator`, pairwise losses, and `PairwiseFETrainer`;
-- `regression`: independent text/target rows, `RegressionCollator`, and `RegressionFETrainer`.
+`--training-method` selects the row schema and loss only:
 
-Both paths use `fe/modeling.py::FEModel`: a Hugging Face encoder, mean pooling, and `EvaluationHead`. `fe/checkpointing.py` saves the encoder/tokenizer plus `fe_head.pt`. Old `ltr_head.pt` files are translated only through `compat/fe_checkpoints.py`.
+- `pairwise`: one chosen/rejected candidate pair per row, with logistic or
+  hinge ranking loss;
+- `regression`: one candidate and one numeric target per row, with a selected
+  regression loss.
 
-`scripts/run_hpo.py` repeatedly invokes this trainer using trials from `scripts/configs/hpo/hps_to_test.py`. `scripts/inspired_calibration_ft.py` performs optional CoheSentia calibration on an existing FE checkpoint.
+Both paths use the same candidate-only scalar model: a pretrained Hugging Face
+encoder, masked mean pooling, and one `Linear(hidden_size, 1)` head. Both use
+the standard Hugging Face `Trainer`; there are no objective-specific trainer
+subclasses in the target architecture. Checkpoints should use standard
+`save_pretrained`/`from_pretrained` serialization. New checkpoints include
+`fe_model_state.pt` and `fe_model_config.json`, recording objective, loss,
+target transformation, architecture, and tokenizer metadata. Legacy
+`fe_head.pt` checkpoints remain loadable through the compatibility-aware
+loader for evaluation only; their archived MLP head is not used for new
+training.
+
+`scripts/run_hpo.py` repeatedly invokes this trainer using a user-supplied JSON
+trial file. `scripts/inspired_calibration_ft.py` performs optional CoheSentia
+calibration on an existing FE checkpoint.
 
 ### 3. Evaluate
 
@@ -137,6 +188,11 @@ Both paths use `fe/modeling.py::FEModel`: a Hugging Face encoder, mean pooling, 
 - `evals/inference/vllm_scorer.py` for generic vLLM-backed judges.
 
 `evals/benchmark_runner.py` runs the datasets loaded by `benchmark_data.py`; `multilingual_benchmarks.py` provides normalized BASSE and Norwegian human-evaluation records; `metrics.py` calculates correlations/preferences; `result_writer.py` records results. `evaluate_model_on_tdt_regens.py` is the larger specialized workflow for regenerated TDT/UD texts.
+
+For flat FE training-set diagnostics, use
+`python -m scripts.analyze_fe_predictions ...`. It writes per-row predictions
+and can generate length diagnostics without affecting training or checkpoint
+selection.
 
 Direct benchmark evaluation is candidate-only unless a benchmark adapter
 explicitly defines another protocol. The source-aware `score_pairs(...)`
@@ -185,7 +241,7 @@ data/hf_datasets/<dataset>/   saved train/dev/test DatasetDict
 | New dataset field or input format | `data/format_dataset.py` | `data/hf_dataset.py`, collators |
 | New custom-dataset scoring method | `scoring/custom_dataset.py` | `scripts/score_custom_dataset.py`, score metadata |
 | New split/pairing behavior | `data/splitting.py` or `data/pairing.py` | leakage assertions and metadata |
-| New training objective | `fe/losses.py` or `fe/regression.py` | `FEModel.forward`, trainer, CLI args |
+| New training objective | `fe/losses.py` or `fe/regression_data.py` | `FEModel.forward`, metrics, CLI args |
 | Model architecture change | `fe/modeling.py` | checkpoint save/load and inference adapter |
 | New evaluation backend | `evals/inference/` | `run_benchmark.build_scorer`, common scorer interface |
 | New benchmark | `evals/benchmark_data.py` | `benchmark_runner.py`, metrics, result metadata |

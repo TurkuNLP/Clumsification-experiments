@@ -34,6 +34,47 @@ def get_available_loss_names():
     return tuple(sorted(LOSS_ALIASES))
 
 
+REGRESSION_LOSS_ALIASES: Dict[str, str] = {
+    "huber": "huber",
+    "smooth_l1": "huber",
+    "smoothl1": "huber",
+    "mse": "mse",
+    "mae": "mae",
+    "l1": "mae",
+}
+
+
+def canonicalize_regression_loss_name(loss: str | None) -> str:
+    """Return the canonical name for a scalar regression loss."""
+    key = "huber" if loss is None else str(loss).strip().lower()
+    if key not in REGRESSION_LOSS_ALIASES:
+        valid = ", ".join(sorted(REGRESSION_LOSS_ALIASES))
+        raise ValueError(f"Unknown regression loss: {loss!r}. Valid losses: {valid}")
+    return REGRESSION_LOSS_ALIASES[key]
+
+
+def regression_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    loss: str = "huber",
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    """Compute a finite, mean-reduced scalar regression loss."""
+    loss_name = canonicalize_regression_loss_name(loss)
+    predictions = predictions.float()
+    targets = targets.float()
+    if huber_delta <= 0:
+        raise ValueError(f"huber_delta must be positive, got {huber_delta}")
+    if loss_name == "huber":
+        return torch.nn.functional.huber_loss(
+            predictions, targets, delta=huber_delta, reduction="mean"
+        )
+    if loss_name == "mse":
+        return torch.nn.functional.mse_loss(predictions, targets, reduction="mean")
+    return torch.nn.functional.l1_loss(predictions, targets, reduction="mean")
+
+
 def _validate_normalization(normalization: str) -> None:
     if normalization not in {"pairs", "items"}:
         raise ValueError(f"Unknown normalization: {normalization}")

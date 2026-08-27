@@ -1,30 +1,28 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
+if __name__ == "__main__" and __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import json
 import os
 
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer, TrainingArguments, set_seed
+from transformers import AutoTokenizer, Trainer, TrainingArguments, set_seed
 
 from clumsification_code.data.hf_dataset import load_formatted_dataset_dict
 from clumsification_code.data.io import default_formatted_dataset_path
+from clumsification_code.data.flattening import flatten_dataset_dict
 from clumsification_code.fe.args import parse_train_args
 from clumsification_code.fe.checkpointing import save_final_model
 from clumsification_code.fe.collators import (
-    GroupedRankingCollator,
+    PairwiseCollator,
     RegressionCollator,
 )
-from clumsification_code.fe.evaluation import (
-    baseline_pairwise_accuracies,
-    evaluate_pairwise_accuracy_distributed,
-)
 from clumsification_code.fe.modeling import FEModel
-from clumsification_code.fe.regression import (
-    RegressionFETrainer,
-    build_regression_dataset_dict,
-    evaluate_regression_distributed,
-)
-from clumsification_code.fe.trainer import PairwiseFETrainer
+from clumsification_code.fe.metrics import pairwise_metrics, regression_metrics
+from clumsification_code.fe.regression_data import build_regression_dataset_dict
 from clumsification_code.fe.utils import (
     configure_logging,
     get_preferred_param_dtype,
@@ -76,6 +74,14 @@ def build_training_arguments(
             {
                 "load_best_model_at_end": True,
                 "metric_for_best_model": "spearman",
+                "greater_is_better": True,
+            }
+        )
+    else:
+        training_kwargs.update(
+            {
+                "load_best_model_at_end": True,
+                "metric_for_best_model": "pairwise_accuracy",
                 "greater_is_better": True,
             }
         )
@@ -172,6 +178,11 @@ def main():
             grouped_dataset_dict=dataset_dict,
             score_name=args.score_name,
         )
+    else:
+        dataset_dict = flatten_dataset_dict(
+            dataset_dict,
+            training_method="pairwise",
+        )
 
     train_dataset = dataset_dict["train"]
     dev_dataset = dataset_dict["dev"]
@@ -200,11 +211,14 @@ def main():
 
     model = FEModel(
         model_name=args.model_name,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
         attn_implementation=args.attn_implementation,
         param_dtype=param_dtype,
     )
+    model.ranking_epsilon = args.epsilon
+    model.ranking_scale = args.scale
+    model.ranking_loss = args.loss
+    model.regression_loss_name = args.loss if args.training_method == "regression" else "huber"
+    model.regression_huber_delta = args.huber_delta
 
     if model.encoder.config.pad_token_id is None:
         model.encoder.config.pad_token_id = tokenizer.pad_token_id
@@ -216,9 +230,10 @@ def main():
             text_prefix=args.text_prefix,
         )
     else:
-        data_collator = GroupedRankingCollator(
+        data_collator = PairwiseCollator(
             tokenizer=tokenizer,
             max_length=args.max_seq_len,
+            text_prefix=args.text_prefix,
         )
 
     use_cuda = torch.cuda.is_available()
@@ -231,7 +246,6 @@ def main():
 
         if args.training_method == "pairwise":
             logger.info(f"loss={args.loss}")
-            logger.info(f"loss_normalization={args.loss_normalization}")
         else:
             logger.info(f"score_name={args.score_name}")
             logger.info(f"text_prefix={args.text_prefix!r}")
@@ -250,38 +264,24 @@ def main():
     )
 
     if args.training_method == "regression":
-        scaling = regression_metadata["target_scaling"]
-
-        trainer = RegressionFETrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=dev_dataset,
             data_collator=data_collator,
             processing_class=tokenizer,
-            regression_tokenizer=tokenizer,
-            regression_max_length=args.max_seq_len,
-            text_prefix=args.text_prefix,
-            train_min=scaling["train_min"],
-            train_max=scaling["train_max"],
+            compute_metrics=regression_metrics,
         )
     else:
-        trainer = PairwiseFETrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=dev_dataset,
             data_collator=data_collator,
             processing_class=tokenizer,
-            epsilon=args.epsilon,
-            scale=args.scale,
-            loss=args.loss,
-            loss_normalization=args.loss_normalization,
-            pairwise_eval_tokenizer=tokenizer,
-            pairwise_eval_max_length=args.max_seq_len,
-            length_diagnostics=args.length_diagnostics,
-            length_plot_num_bins=args.length_plot_num_bins,
-            length_plot_max_pairs=args.length_plot_max_pairs,
+            compute_metrics=pairwise_metrics,
         )
 
     if rank == 0:
@@ -297,9 +297,20 @@ def main():
             trainer=trainer,
             tokenizer=tokenizer,
             output_dir=args.output_dir,
-            hidden_dim=args.hidden_dim,
-            dropout=args.dropout,
             rank=rank,
+            metadata={
+                "objective": args.training_method,
+                "loss": args.loss,
+                "epsilon": args.epsilon if args.training_method == "pairwise" else None,
+                "scale": args.scale if args.training_method == "pairwise" else None,
+                "huber_delta": args.huber_delta if args.training_method == "regression" else None,
+                "target_transformation": regression_metadata["target_scaling"] if regression_metadata else None,
+                "tokenizer": {
+                    "class": tokenizer.__class__.__name__,
+                    "name_or_path": getattr(tokenizer, "name_or_path", None),
+                    "max_length": args.max_seq_len,
+                },
+            },
         )
 
         if args.training_method == "regression":
@@ -359,38 +370,18 @@ def main():
         return
 
     if args.training_method == "regression":
-        scaling = regression_metadata["target_scaling"]
-
-        metrics_test = evaluate_regression_distributed(
-            model=trainer.model,
-            dataset=test_dataset,
-            tokenizer=tokenizer,
-            max_length=args.max_seq_len,
-            batch_size=max(1, args.per_device_eval_batch_size),
-            text_prefix=args.text_prefix,
-            train_min=scaling["train_min"],
-            train_max=scaling["train_max"],
+        metrics_test = trainer.evaluate(
+            eval_dataset=test_dataset,
+            metric_key_prefix="test",
         )
-
         baselines = None
 
     else:
-        metrics_test = evaluate_pairwise_accuracy_distributed(
-            model=trainer.model,
-            dataset=test_dataset,
-            tokenizer=tokenizer,
-            max_length=args.max_seq_len,
-            batch_size=max(1, args.per_device_eval_batch_size),
-            collect_length_diagnostics=args.length_diagnostics,
-            length_plot_num_bins=args.length_plot_num_bins,
-            length_plot_max_pairs=args.length_plot_max_pairs,
-            length_diag_output_dir=args.output_dir,
-            length_diag_step=trainer.state.global_step,
-            length_diag_epoch=trainer.state.epoch,
-            length_diag_seed=args.seed,
+        metrics_test = trainer.evaluate(
+            eval_dataset=test_dataset,
+            metric_key_prefix="test",
         )
-
-        baselines = baseline_pairwise_accuracies(test_dataset)
+        baselines = None
 
     trainer.accelerator.wait_for_everyone()
 

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -18,6 +18,7 @@ _RESULT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
+_MAX_RETRIES = 5
 
 
 class VLLMTextScorer:
@@ -103,17 +104,71 @@ class VLLMTextScorer:
         batch_size: int = 32,
         max_length: int = 512,
     ) -> np.ndarray:
-        del device, batch_size, max_length
+        del device, max_length
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
         prompts = [self._messages(text) for text in texts]
-        outputs = self.llm.chat(
-            prompts,
-            sampling_params=self.sampling_params,
-            chat_template_kwargs={"enable_thinking": self.enable_thinking},
-        )
-        return np.asarray(
-            [self._parse_output(output.outputs[0].text) for output in outputs],
-            dtype=np.float32,
-        )
+        scores = np.full(len(texts), np.nan, dtype=np.float32)
+        pending = list(range(len(texts)))
+        errors: Dict[int, BaseException] = {}
+
+        for attempt in range(_MAX_RETRIES + 1):
+            if not pending:
+                break
+
+            next_pending: List[int] = []
+            for start in range(0, len(pending), batch_size):
+                indices = pending[start : start + batch_size]
+                batch_scores, batch_errors = self._score_batch(
+                    [prompts[index] for index in indices]
+                )
+                for index, score, error in zip(indices, batch_scores, batch_errors):
+                    if error is None:
+                        scores[index] = score
+                    else:
+                        next_pending.append(index)
+                        errors[index] = error
+            pending = next_pending
+
+        if pending:
+            details = "; ".join(
+                f"index {index}: {errors[index]}" for index in pending
+            )
+            raise RuntimeError(
+                f"vLLM scoring failed for {len(pending)} text(s) after "
+                f"{_MAX_RETRIES} retries: {details}"
+            )
+        return scores
+
+    def _score_batch(
+        self, prompts: List[List[Dict[str, str]]]
+    ) -> Tuple[List[float], List[Optional[BaseException]]]:
+        """Score one request batch without allowing one output to abort it."""
+        try:
+            outputs = self.llm.chat(
+                prompts,
+                sampling_params=self.sampling_params,
+                chat_template_kwargs={"enable_thinking": self.enable_thinking},
+            )
+        except Exception as exc:
+            return [float("nan")] * len(prompts), [exc] * len(prompts)
+
+        scores: List[float] = []
+        errors: List[Optional[BaseException]] = []
+        for output in outputs:
+            try:
+                scores.append(self._parse_output(output.outputs[0].text))
+                errors.append(None)
+            except Exception as exc:
+                scores.append(float("nan"))
+                errors.append(exc)
+
+        # A malformed provider response can contain fewer outputs than prompts.
+        for _ in range(len(prompts) - len(scores)):
+            scores.append(float("nan"))
+            errors.append(ValueError("vLLM returned fewer outputs than prompts"))
+        return scores, errors
 
     def _parse_output(self, text: str) -> float:
         if self.output_parser == "json_score":

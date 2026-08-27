@@ -13,6 +13,32 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
 
+def flat_pairwise_length_diagnostics(dataset, score_differences) -> List[tuple]:
+    """Return ``(relative_length_difference, point)`` rows for flat pairs.
+
+    This is intentionally an offline helper: it consumes saved pair rows and
+    predictions, and does not participate in training or checkpoint choice.
+
+    Simplifies the workflow since now it need not be calculated and ran during model training!
+    """
+    differences = list(score_differences)
+    if len(dataset) != len(differences):
+        raise ValueError("Dataset and score_differences must have equal length")
+
+    rows = []
+    for row, difference in zip(dataset, differences):
+        chosen_length = len(row["chosen_text"])
+        rejected_length = len(row["rejected_text"])
+        denominator = max(chosen_length, rejected_length, 1)
+        relative_difference = abs(chosen_length - rejected_length) / denominator
+        if abs(float(difference)) <= 1e-6:
+            point = 0.5
+        else:
+            point = 1.0 if float(difference) > 0 else 0.0
+        rows.append((relative_difference, point))
+    return rows
+
+
 def diagnostic_dir(output_dir: Optional[str]) -> str:
     root = output_dir or "."
     diag_dir = os.path.join(root, "length_diagnostics")

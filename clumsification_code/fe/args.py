@@ -81,21 +81,15 @@ def parse_train_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--scale", type=float, default=5.0)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--loss", type=str, default="logistic",
+    parser.add_argument("--loss", type=str, default=None,
                         choices=["logistic", "pairwise_logistic", "hinge", "margin",
-                                 "weighted_logistic", "logistic_weighted", "weighted-logistic"],
-                        help="Pairwise ranking loss; ignored for regression.")
+                                 "weighted_logistic", "logistic_weighted", "weighted-logistic",
+                                 "huber", "smooth_l1", "smoothl1", "mse", "mae", "l1"],
+                        help="Objective loss: ranking loss for pairwise, regression loss for regression.")
+    parser.add_argument("--huber_delta", type=float, default=1.0)
     parser.add_argument("--attn_implementation", type=str, default="sdpa",
                         choices=["auto", "flash_attention_2", "sdpa", "eager"])
-    parser.add_argument("--loss_normalization", type=str, default="items",
-                        choices=["pairs", "items"],
-                        help="Pairwise loss normalization; ignored for regression.")
-    parser.add_argument("--length_diagnostics", action="store_true")
-    parser.add_argument("--length_plot_num_bins", type=int, default=10)
-    parser.add_argument("--length_plot_max_pairs", type=int, default=200000)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_strategy", type=str, default="epoch",
                         choices=["no", "steps", "epoch"])
@@ -114,6 +108,19 @@ def parse_train_args():
                         help="Skip training and only run final evaluation with the supplied model.")
 
     args = parser.parse_args()
+    if args.loss is None:
+        args.loss = "huber" if args.training_method == "regression" else "logistic"
+    ranking_losses = {
+        "logistic", "pairwise_logistic", "hinge", "margin",
+        "weighted_logistic", "logistic_weighted", "weighted-logistic",
+    }
+    regression_losses = {"huber", "smooth_l1", "smoothl1", "mse", "mae", "l1"}
+    valid_losses = ranking_losses if args.training_method == "pairwise" else regression_losses
+    if args.loss not in valid_losses:
+        parser.error(
+            f"--loss={args.loss!r} is not valid for --training-method "
+            f"{args.training_method!r}; choose from {sorted(valid_losses)}"
+        )
     if args.training_method == "regression":
         if not args.score_name:
             parser.error("--score-name is required when --training-method regression.")
