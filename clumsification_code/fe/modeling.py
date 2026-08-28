@@ -1,14 +1,16 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 import json
 import os
+import time
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 from transformers import AutoModel
 
+from .backbones import resolve_pooling
 from .losses import canonicalize_loss_name, pairwise_ranking_loss_flat, regression_loss
-from .utils import assert_uniform_floating_dtype, get_preferred_param_dtype
+from .utils import assert_uniform_floating_dtype, get_preferred_param_dtype, logger
 
 
 class EvaluationHead(nn.Module):
@@ -79,12 +81,19 @@ class FEModel(nn.Module):
     def __init__(self, model_name: str, hidden_dim: int = 256,
                  dropout: float = 0.1, attn_implementation: str = "sdpa",
                  param_dtype: Optional[torch.dtype] = None,
-                 legacy_head: bool = False):
+                 legacy_head: bool = False, pooling: str = "auto"):
         super().__init__()
+        self.pooling = resolve_pooling(model_name, pooling)
         self.param_dtype = param_dtype or get_preferred_param_dtype()
         self.encoder = _load_auto_model_with_dtype(
             model_name, attn_implementation, self.param_dtype
         )
+        # FE always pools last_hidden_state itself.  Encoder poolers (for
+        # example XLM-R's dense pooler) form a separate output branch that
+        # never contributes to the FE loss, leaving their parameters unused
+        # and breaking DDP when find_unused_parameters=False.
+        if getattr(self.encoder, "pooler", None) is not None:
+            self.encoder.pooler = None
         self.encoder.config.use_cache = False
         if hasattr(self.encoder, "gradient_checkpointing_enable"):
             self.encoder.gradient_checkpointing_enable(
@@ -103,7 +112,14 @@ class FEModel(nn.Module):
             self, expected_dtype=self.param_dtype, name="FEModel before FSDP"
         )
 
-    def save_pretrained(self, save_directory: str, *, tokenizer=None, metadata=None) -> None:
+    def save_pretrained(
+        self,
+        save_directory: str,
+        *,
+        tokenizer=None,
+        metadata=None,
+        state_dict: Optional[dict[str, torch.Tensor]] = None,
+    ) -> None:
         """Save a complete new-format FE checkpoint.
 
         The nested encoder keeps its normal Hugging Face files; the complete
@@ -111,20 +127,51 @@ class FEModel(nn.Module):
         from the encoder for new checkpoints.
         """
         os.makedirs(save_directory, exist_ok=True)
-        self.encoder.save_pretrained(save_directory, safe_serialization=True)
+        complete_state_dict = self.state_dict() if state_dict is None else state_dict
+        encoder_state_dict = {
+            key.removeprefix("encoder."): value
+            for key, value in complete_state_dict.items()
+            if key.startswith("encoder.")
+        }
+        if not encoder_state_dict:
+            raise RuntimeError("Cannot save FEModel: encoder state dict is empty")
+
+        encoder_save_started_at = time.monotonic()
+        logger.info("Final save: writing Hugging Face encoder weights")
+        self.encoder.save_pretrained(
+            save_directory,
+            state_dict=encoder_state_dict,
+            safe_serialization=True,
+            max_shard_size="2GB",
+        )
+        logger.info(
+            "Final save: encoder weights written in %.1f seconds",
+            time.monotonic() - encoder_save_started_at,
+        )
         if tokenizer is not None:
+            logger.info("Final save: writing tokenizer and FE configuration")
             tokenizer.save_pretrained(save_directory)
         config = {
                 "model_name": getattr(self.encoder.config, "_name_or_path", ""),
                 "head_type": "linear",
                 "hidden_size": self.encoder.config.hidden_size,
-                "architecture": "candidate_only_encoder_mean_pool_linear_scalar",
+                "pooling": self.pooling,
+                "architecture": "candidate_only_encoder_backbone_pool_linear_scalar",
             }
         if metadata:
             config["training"] = metadata
         with open(os.path.join(save_directory, "fe_model_config.json"), "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
-        torch.save(self.state_dict(), os.path.join(save_directory, "fe_model_state.pt"))
+        complete_state_started_at = time.monotonic()
+        logger.info("Final save: writing complete FE state")
+        torch.save(
+            complete_state_dict,
+            os.path.join(save_directory, "fe_model_state.pt"),
+        )
+        logger.info(
+            "Final save: complete FE state written in %.1f seconds",
+            time.monotonic() - complete_state_started_at,
+        )
 
     @classmethod
     def from_pretrained(cls, save_directory: str, **kwargs):
@@ -138,7 +185,7 @@ class FEModel(nn.Module):
             )
         with open(config_path, encoding="utf-8") as handle:
             config = json.load(handle)
-        model = cls(model_name=save_directory, **kwargs)
+        model = cls(model_name=save_directory, pooling=config.get("pooling", "mean"), **kwargs)
         state = torch.load(state_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state, strict=True)
         return model
@@ -148,12 +195,21 @@ class FEModel(nn.Module):
         mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
         return (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-6)
 
+    def last_token_pool(self, last_hidden_state: torch.Tensor,
+                        attention_mask: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+        last_indices = (positions.unsqueeze(0) * attention_mask.long()).max(dim=1).values
+        batch_indices = torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device)
+        return last_hidden_state[batch_indices, last_indices]
+
     def encode(self, input_ids: torch.Tensor,
                attention_mask: torch.Tensor) -> torch.Tensor:
         output = self.encoder(
             input_ids=input_ids, attention_mask=attention_mask, use_cache=False
         )
-        return self.mean_pool(output.last_hidden_state, attention_mask)
+        if self.pooling == "mean":
+            return self.mean_pool(output.last_hidden_state, attention_mask)
+        return self.last_token_pool(output.last_hidden_state, attention_mask)
 
     def score_text_batch(self, input_ids: torch.Tensor,
                    attention_mask: torch.Tensor) -> torch.Tensor:

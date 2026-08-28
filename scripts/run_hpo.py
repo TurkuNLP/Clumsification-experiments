@@ -246,10 +246,21 @@ def build_trial_command(
 
         "--attn_implementation",
         args.attn_implementation,
+
+        "--pooling",
+        args.pooling,
     ]
 
-    if args.fsdp_layer_cls:
-        cmd.extend(["--fsdp_layer_cls", args.fsdp_layer_cls])
+    cmd.extend(["--parallelism", args.parallelism])
+    if args.parallelism == "fsdp":
+        cmd.extend(
+            [
+                "--fsdp-sharding-strategy",
+                args.fsdp_sharding_strategy,
+                "--fsdp-layer-cls",
+                args.fsdp_layer_cls,
+            ]
+        )
 
     if args.extra_args:
         cmd.extend(args.extra_args)
@@ -371,13 +382,24 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--parallelism",
+        choices=["ddp", "fsdp"],
+        default="ddp",
+    )
+
+    parser.add_argument(
+        "--fsdp-sharding-strategy",
+        choices=["shard_grad_op", "full_shard"],
+        default="shard_grad_op",
+    )
+
+    parser.add_argument(
         "--fsdp_layer_cls",
+        "--fsdp-layer-cls",
+        dest="fsdp_layer_cls",
         type=str,
-        default="XLMRobertaLayer",
-        help=(
-            "For intfloat/multilingual-e5-large this is usually "
-            "XLMRobertaLayer."
-        ),
+        default=None,
+        help="Required only when --parallelism fsdp.",
     )
 
     parser.add_argument(
@@ -385,6 +407,13 @@ def main() -> None:
         type=str,
         default="sdpa",
         choices=["auto", "flash_attention_2", "sdpa", "eager"],
+    )
+
+    parser.add_argument(
+        "--pooling",
+        choices=["auto", "mean", "last_token"],
+        default="auto",
+        help="Pooling strategy; auto selects from the backbone name.",
     )
 
     parser.add_argument(
@@ -461,6 +490,8 @@ def main() -> None:
         raise ValueError(
             "Use only one of --formatted_dataset_name or --formatted_dataset_path."
         )
+    if args.parallelism == "fsdp" and not args.fsdp_layer_cls:
+        raise ValueError("--fsdp-layer-cls is required when --parallelism fsdp.")
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -472,8 +503,8 @@ def main() -> None:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     env["WANDB_MODE"] = "disabled"
-    env["ACCELERATE_USE_FSDP"] = "true"
-    env["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
+    env.pop("ACCELERATE_USE_FSDP", None)
+    env.pop("FSDP_CPU_RAM_EFFICIENT_LOADING", None)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     selected_trials = selected_trials_from_args(args)
@@ -540,10 +571,7 @@ def main() -> None:
                 "env_overrides": {
                     "CUDA_VISIBLE_DEVICES": env["CUDA_VISIBLE_DEVICES"],
                     "WANDB_MODE": env["WANDB_MODE"],
-                    "ACCELERATE_USE_FSDP": env["ACCELERATE_USE_FSDP"],
-                    "FSDP_CPU_RAM_EFFICIENT_LOADING": env[
-                        "FSDP_CPU_RAM_EFFICIENT_LOADING"
-                    ],
+                    "PARALLELISM": args.parallelism,
                     "TOKENIZERS_PARALLELISM": env["TOKENIZERS_PARALLELISM"],
                 },
                 "trial": trial,

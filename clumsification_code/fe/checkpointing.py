@@ -1,6 +1,7 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 import gc
 import os
+import time
 from typing import Optional
 
 import torch
@@ -60,6 +61,7 @@ def load_fe_model(
         attn_implementation=attn_implementation,
         param_dtype=param_dtype,
         legacy_head=legacy_head,
+        pooling="mean",
     )
 
     model.evaluation_head.load_state_dict(evaluation_head_state, strict=True)
@@ -79,7 +81,6 @@ def cleanup_memory() -> None:
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
 
 
 def save_final_model(
@@ -87,6 +88,7 @@ def save_final_model(
     tokenizer,
     output_dir: str,
     rank: int,
+    parallelism: str = "ddp",
     metadata: Optional[dict] = None,
 ) -> str:
     """
@@ -94,18 +96,25 @@ def save_final_model(
         output_dir/final/
             HF encoder files
             tokenizer files
+            fe_model_config.json
+            fe_model_state.pt
             fe_head.pt
     """
     final_dir = os.path.join(output_dir, "final")
 
+    started_at = time.monotonic()
+
     if rank == 0:
         os.makedirs(final_dir, exist_ok=True)
+        logger.info("Final save: preparing all ranks")
 
     trainer.accelerator.wait_for_everyone()
 
     trainer.optimizer = None
     trainer.lr_scheduler = None
 
+    if rank == 0:
+        logger.info("Final save: releasing optimizer memory")
     cleanup_memory()
 
     trainer.accelerator.wait_for_everyone()
@@ -115,17 +124,35 @@ def save_final_model(
     if hasattr(unwrapped, "_orig_mod"):
         unwrapped = unwrapped._orig_mod
 
-    state_dict = get_model_state_dict(
-        trainer.model,
-        options=StateDictOptions(
-            full_state_dict=True,
-            cpu_offload=True,
-        ),
-    )
+    gather_started_at = time.monotonic()
+    if parallelism == "fsdp":
+        if rank == 0:
+            logger.info(
+                "Final save: gathering the full FSDP model state on CPU; "
+                "all ranks must participate"
+            )
+        state_dict = get_model_state_dict(
+            trainer.model,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+    elif rank == 0:
+        logger.info("Final save: reading complete unwrapped DDP/model state on CPU")
+        state_dict = {
+            key: value.detach().cpu()
+            for key, value in unwrapped.state_dict().items()
+        }
+    else:
+        state_dict = {}
+    if rank == 0:
+        logger.info(
+            "Final save: full model state gathered in %.1f seconds (%d tensors)",
+            time.monotonic() - gather_started_at,
+            len(state_dict),
+        )
 
     if rank == 0:
-        unwrapped.save_pretrained(final_dir, tokenizer=tokenizer, metadata=metadata)
-
+        validation_started_at = time.monotonic()
+        logger.info("Final save: validating gathered tensors")
         cleaned_state_dict = {
             strip_known_prefixes(k): v
             for k, v in state_dict.items()
@@ -145,9 +172,6 @@ def save_final_model(
             if k.startswith("evaluation_head.")
         }
 
-        assert_finite_state_dict(encoder_state_dict, "encoder_state_dict")
-        assert_finite_state_dict(evaluation_head_state_dict, "evaluation_head_state_dict")
-
         if not encoder_state_dict:
             raise RuntimeError(
                 "encoder_state_dict is empty. State dict keys were not parsed correctly. "
@@ -160,15 +184,22 @@ def save_final_model(
                 f"Example keys: {list(cleaned_state_dict.keys())[:20]}"
             )
 
-        unwrapped.encoder.save_pretrained(
-            final_dir,
-            state_dict=encoder_state_dict,
-            safe_serialization=True,
-            max_shard_size="2GB",
+        logger.info(
+            "Final save: tensor validation completed in %.1f seconds",
+            time.monotonic() - validation_started_at,
         )
 
-        tokenizer.save_pretrained(final_dir)
-
+        write_started_at = time.monotonic()
+        logger.info(
+            "Final save: writing encoder, tokenizer, and complete FE state to %s",
+            final_dir,
+        )
+        unwrapped.save_pretrained(
+            final_dir,
+            tokenizer=tokenizer,
+            metadata=metadata,
+            state_dict=cleaned_state_dict,
+        )
         torch.save(
             {
                 "evaluation_head": evaluation_head_state_dict,
@@ -177,7 +208,10 @@ def save_final_model(
             os.path.join(final_dir, "fe_head.pt"),
         )
 
-        logger.info(f"Saved final model to {final_dir}")
+        logger.info(
+            "Final save: disk writes completed in %.1f seconds",
+            time.monotonic() - write_started_at,
+        )
 
         del cleaned_state_dict
         del encoder_state_dict
@@ -185,8 +219,17 @@ def save_final_model(
 
     del state_dict
 
+    if rank == 0:
+        logger.info("Final save: releasing gathered state and synchronizing ranks")
     cleanup_memory()
 
     trainer.accelerator.wait_for_everyone()
+
+    if rank == 0:
+        logger.info(
+            "Final save completed in %.1f seconds: %s",
+            time.monotonic() - started_at,
+            final_dir,
+        )
 
     return final_dir

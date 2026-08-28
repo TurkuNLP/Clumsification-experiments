@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 """Normalized loaders for the project's multilingual human evaluations.
 
 These loaders deliberately preserve the annotation type supplied by each

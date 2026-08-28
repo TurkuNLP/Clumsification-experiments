@@ -70,6 +70,9 @@ def parse_train_args():
                         help="Aligned score field in the formatted dataset; required for regression.")
     parser.add_argument("--text-prefix", type=str, default="",
                         help="Prefix prepended to every text before tokenization.")
+    parser.add_argument("--pooling", choices=["auto", "mean", "last_token"],
+                        default="auto",
+                        help="Pooling strategy; auto selects from the backbone name.")
 
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--num_train_epochs", type=int, default=3)
@@ -97,7 +100,16 @@ def parse_train_args():
                         choices=["no", "steps", "epoch"])
     parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--dataloader_num_workers", type=int, default=2)
-    parser.add_argument("--fsdp_layer_cls", type=str, default=None)
+    parser.add_argument("--parallelism", choices=["ddp", "fsdp"], default="ddp",
+                        help="Use ordinary Trainer DDP by default, or opt into FSDP.")
+    parser.add_argument(
+        "--fsdp-sharding-strategy",
+        choices=["shard_grad_op", "full_shard"],
+        default="shard_grad_op",
+        help="FSDP sharding strategy; ignored unless --parallelism fsdp.",
+    )
+    parser.add_argument("--fsdp-layer-cls", "--fsdp_layer_cls", dest="fsdp_layer_cls",
+                        type=str, default=None)
     parser.add_argument("--hpo_mode", action="store_true",
                         help="If set, save post-training development metrics for HPO selection.")
     parser.add_argument("--skip_final_test_eval", action="store_true",
@@ -108,6 +120,8 @@ def parse_train_args():
                         help="Skip training and only run final evaluation with the supplied model.")
 
     args = parser.parse_args()
+    if args.parallelism == "fsdp" and not args.fsdp_layer_cls:
+        parser.error("--fsdp-layer-cls is required when --parallelism fsdp.")
     if args.loss is None:
         args.loss = "huber" if args.training_method == "regression" else "logistic"
     ranking_losses = {

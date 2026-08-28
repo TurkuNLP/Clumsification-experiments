@@ -6,6 +6,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
 
 import json
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -31,8 +32,6 @@ from clumsification_code.fe.utils import (
 
 
 os.environ["WANDB_MODE"] = "disabled"
-os.environ["ACCELERATE_USE_FSDP"] = "true"
-os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
 
 
 def build_training_arguments(
@@ -93,9 +92,9 @@ def build_training_arguments(
             args.eval_strategy,
         )
 
-    use_fsdp = use_cuda
-
-    if use_fsdp:
+    if args.parallelism == "fsdp":
+        if not use_cuda or world_size <= 1:
+            raise ValueError("FSDP requires CUDA and WORLD_SIZE greater than one.")
         fsdp_config = {
             "backward_prefetch": "backward_pre",
             "forward_prefetch": False,
@@ -107,19 +106,9 @@ def build_training_arguments(
             "cpu_offload": False,
         }
 
-        if args.fsdp_layer_cls is not None:
-            training_kwargs["fsdp"] = "full_shard auto_wrap"
-            fsdp_config["transformer_layer_cls_to_wrap"] = args.fsdp_layer_cls
-        else:
-            training_kwargs["fsdp"] = "full_shard"
-            logger.warning(
-                "No fsdp_layer_cls provided. Using fsdp='full_shard' "
-                "without auto_wrap."
-            )
-
+        training_kwargs["fsdp"] = f"{args.fsdp_sharding_strategy} auto_wrap"
+        fsdp_config["transformer_layer_cls_to_wrap"] = args.fsdp_layer_cls
         training_kwargs["fsdp_config"] = fsdp_config
-    else:
-        logger.warning("FSDP disabled because CUDA is not available.")
 
     return TrainingArguments(**training_kwargs)
 
@@ -160,9 +149,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    if world_size > 1:
+    if args.parallelism == "fsdp":
         os.environ["ACCELERATE_USE_FSDP"] = "true"
         os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "true"
+    else:
+        os.environ.pop("ACCELERATE_USE_FSDP", None)
+        os.environ.pop("FSDP_CPU_RAM_EFFICIENT_LOADING", None)
 
     dataset_path = resolve_formatted_dataset_path(args)
 
@@ -220,6 +212,7 @@ def main():
         model_name=args.model_name,
         attn_implementation=args.attn_implementation,
         param_dtype=param_dtype,
+        pooling=args.pooling,
     )
     model.ranking_epsilon = args.epsilon
     model.ranking_scale = args.scale
@@ -260,7 +253,13 @@ def main():
                 f"target_scaling={regression_metadata['target_scaling']}"
             )
 
-        logger.info(f"FSDP transformer layer class={args.fsdp_layer_cls}")
+        logger.info(
+            "parallelism=%s fsdp_sharding_strategy=%s fsdp_layer_cls=%s",
+            args.parallelism,
+            args.fsdp_sharding_strategy if args.parallelism == "fsdp" else None,
+            args.fsdp_layer_cls if args.parallelism == "fsdp" else None,
+        )
+        logger.info("pooling=%s", model.pooling)
 
     training_args = build_training_arguments(
         args=args,
@@ -305,6 +304,7 @@ def main():
             tokenizer=tokenizer,
             output_dir=args.output_dir,
             rank=rank,
+            parallelism=args.parallelism,
             metadata={
                 "objective": args.training_method,
                 "loss": args.loss,
@@ -317,6 +317,15 @@ def main():
                     "name_or_path": getattr(tokenizer, "name_or_path", None),
                     "max_length": args.max_seq_len,
                 },
+                "distributed": {
+                    "parallelism": args.parallelism,
+                    "fsdp_sharding_strategy": (
+                        args.fsdp_sharding_strategy if args.parallelism == "fsdp" else None
+                    ),
+                    "world_size": world_size,
+                    "parameter_dtype": str(param_dtype),
+                },
+                "pooling": model.pooling,
             },
         )
 
@@ -376,19 +385,25 @@ def main():
 
         return
 
-    if args.training_method == "regression":
-        metrics_test = trainer.evaluate(
-            eval_dataset=test_dataset,
-            metric_key_prefix="test",
+    evaluation_started_at = time.monotonic()
+    if rank == 0:
+        logger.info(
+            "Final evaluation: starting on %d test examples",
+            len(test_dataset),
         )
-        baselines = None
 
-    else:
-        metrics_test = trainer.evaluate(
-            eval_dataset=test_dataset,
-            metric_key_prefix="test",
+    metrics_test = trainer.evaluate(
+        eval_dataset=test_dataset,
+        metric_key_prefix="test",
+    )
+    baselines = None
+
+    if rank == 0:
+        logger.info(
+            "Final evaluation: inference completed in %.1f seconds; "
+            "synchronizing ranks",
+            time.monotonic() - evaluation_started_at,
         )
-        baselines = None
 
     trainer.accelerator.wait_for_everyone()
 
@@ -419,6 +434,12 @@ def main():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
+    if rank == 0:
+        logger.info(
+            "Final evaluation completed in %.1f seconds",
+            time.monotonic() - evaluation_started_at,
+        )
 
 
 if __name__ == "__main__":

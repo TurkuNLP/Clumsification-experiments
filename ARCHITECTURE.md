@@ -33,8 +33,11 @@ These are the non-negotiable contracts for the simplified FE implementation:
    and returns one higher-is-better scalar. Sources, references, perturbation
    layers, teacher names, and human labels are never model inputs at inference.
 2. **One scorer, two objectives.** Both training methods use the same function
-   `s(x) = w^T mean_pool(encoder(x)) + b`. The head is exactly one linear
-   projection from the pooled encoder representation to one scalar.
+   `s(x) = w^T pool_backbone(encoder(x), attention_mask) + b`. The head is
+   exactly one linear projection from the pooled representation to one scalar.
+   Pooling is resolved from the backbone name: E5 uses masked mean pooling;
+   Jina v5, Qwen3 Embedding, and Harrier use the last non-padding token. The
+   resolved policy is stored in each checkpoint.
 3. **Source-safe flattening.** Chains are an upstream provenance and auditing
    representation. Splits are made by source/original ID first; only then are
    rows flattened for training.
@@ -55,7 +58,7 @@ These are the non-negotiable contracts for the simplified FE implementation:
 | Path | Responsibility |
 | --- | --- |
 | `clumsification_code/data/` | Reads custom JSONL datasets, aligns originals/perturbations/scores, prevents source-ID leakage, and saves train/dev/test datasets. |
-| `clumsification_code/fe/` | Canonical FE implementation: shared encoder, linear scalar head, objectives, collators, metrics, diagnostics, and checkpoints. |
+| `clumsification_code/fe/` | Canonical FE implementation: backbone profiles and pooling, shared encoder, linear scalar head, objectives, collators, metrics, diagnostics, and checkpoints. |
 | `clumsification_code/evals/` | Common benchmark runner, scorer adapters, benchmark loaders, metrics, and result writing. |
 | `clumsification_code/perturbations/` | LLM-based and rule-based ways to create degraded or altered texts. |
 | `clumsification_code/prompts/`, `data/prompts/` | Validates and renders versioned prompt specifications stored independently from model transports and scorer code. |
@@ -64,6 +67,28 @@ These are the non-negotiable contracts for the simplified FE implementation:
 | `clumsification_code/compat/` | Compatibility helpers for legacy checkpoint files. Production code does not depend on LTR names. |
 
 ## Canonical workflows
+
+### 0. Audit UniEval pseudo-data
+
+The released UniEval JSONL files are kept immutable under
+`data/unprocessed_datasets/unieval_pseudo_data/`.  Before training, run:
+
+```bash
+/home/tenojo/miniconda3/envs/genAI/bin/python scripts/audit_unieval_dataset.py
+```
+
+This streams and validates every row, records SHA-256 hashes, label counts,
+duplicate inputs, contradictory labels, and source-text length statistics.  It
+writes `unieval_pseudo_data.audit.json` beside (not inside) the source files.
+The audit deliberately does not clean or deduplicate data: those operations
+must be explicit experimental ablations.  The current imported release
+contains 665,523 rows when both dimension files and merged `train_all` files
+are counted, with 2,899 inputs appearing under both labels.  The merged files
+overlap their component dimension files and must not be summed as additional
+training data.
+
+The reusable implementation is in `clumsification_code/unieval/data.py` and
+can be used by later training and SEScore2 adapters.
 
 ### 1. Build training data
 
@@ -155,6 +180,10 @@ distributed across train/dev/test.
 loads a source-safe formatted `DatasetDict` and flattens it into the selected
 training schema before constructing the trainer.
 
+The backbone registry resolves pooling from the model name. Use `--pooling`
+only for an intentional override or ablation; new checkpoints store the
+resolved value and use it during reload.
+
 `--training-method` selects the row schema and loss only:
 
 - `pairwise`: one chosen/rejected candidate pair per row, with logistic or
@@ -163,15 +192,14 @@ training schema before constructing the trainer.
   regression loss.
 
 Both paths use the same candidate-only scalar model: a pretrained Hugging Face
-encoder, masked mean pooling, and one `Linear(hidden_size, 1)` head. Both use
-the standard Hugging Face `Trainer`; there are no objective-specific trainer
-subclasses in the target architecture. Checkpoints should use standard
-`save_pretrained`/`from_pretrained` serialization. New checkpoints include
-`fe_model_state.pt` and `fe_model_config.json`, recording objective, loss,
-target transformation, architecture, and tokenizer metadata. Legacy
-`fe_head.pt` checkpoints remain loadable through the compatibility-aware
-loader for evaluation only; their archived MLP head is not used for new
-training.
+encoder, backbone-specific pooling, and one `Linear(hidden_size, 1)` head.
+Training uses the standard Hugging Face `Trainer`; there are no
+objective-specific trainer subclasses. New checkpoints use
+`save_pretrained`/`from_pretrained` serialization and include
+`fe_model_state.pt` and `fe_model_config.json`, recording the resolved pooling,
+objective, loss, target transformation, architecture, and tokenizer metadata.
+Legacy `fe_head.pt` checkpoints remain loadable for evaluation; their archived
+MLP head is not used for new training.
 
 `scripts/run_hpo.py` repeatedly invokes this trainer using a user-supplied JSON
 trial file. `scripts/inspired_calibration_ft.py` performs optional CoheSentia

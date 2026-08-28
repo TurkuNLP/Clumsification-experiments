@@ -50,11 +50,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--scorer",
         required=True,
-        choices=["fe", "gptscore", "metricx", "geval", "vllm", "unieval", "ppl"],
+        choices=["fe", "gptscore", "metricx", "geval", "vllm", "unieval", "unieval-trained", "ppl"],
         help="Evaluation scorer backend.",
     )
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--model-dir", default="")
+    parser.add_argument("--unieval-base-model", default="")
     parser.add_argument("--training-dataset", default="")
     parser.add_argument("--perturbation-type", default="")
     parser.add_argument("--num-layers", type=int, default=-1)
@@ -227,6 +228,12 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
             device=device,
             cache_dir=args.unieval_cache_dir,
         )
+
+    if args.scorer == "unieval-trained":
+        from clumsification_code.evals.inference.unieval_trained import load_trained_unieval_model
+        if not args.model_dir:
+            raise ValueError("--model-dir is required with --scorer unieval-trained")
+        return load_trained_unieval_model(args.model_dir, device=device, dtype=dtype)
 
     if args.scorer == "ppl":
         from clumsification_code.evals.inference.hf_ppl import load_hf_ppl_model

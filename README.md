@@ -7,6 +7,21 @@ notices are retained where they already existed.
 
 For a two-minute overview of the data, training, evaluation, and compatibility layers, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## UniEval reproduction
+
+Phase 1 provides a streaming loader and audit for the imported UniEval data.
+Run the audit before training to validate labels and record immutable file
+hashes:
+
+```bash
+/home/tenojo/miniconda3/envs/genAI/bin/python scripts/audit_unieval_dataset.py
+```
+
+The command does not rewrite the source data.  It reports duplicate inputs and
+contradictory labels so that cleaning can be evaluated separately rather than
+silently changing the published training distribution.  Phase 2 adds the
+model-independent UniEval `Yes`/`No` scoring layer.
+
 ## Producing regression supervision scores
 
 Score perturbations against their source originals before creating the Hugging
