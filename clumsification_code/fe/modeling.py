@@ -265,14 +265,17 @@ class FEModel(nn.Module):
         if group_sizes is None:
             output = {"flat_scores": flat_scores, "logits": flat_scores}
             if labels is not None:
-                regression_loss_name = getattr(
-                    self, "regression_loss_name", regression_loss_name
-                )
-                huber_delta = getattr(self, "regression_huber_delta", huber_delta)
-                output["loss"] = regression_loss(
-                    flat_scores, labels, loss=regression_loss_name,
-                    huber_delta=huber_delta,
-                )
+                if getattr(self, "training_objective", "regression") == "binary":
+                    output["loss"] = torch.nn.functional.binary_cross_entropy_with_logits(
+                        flat_scores.float(), labels.float()
+                    )
+                else:
+                    regression_loss_name = getattr(self, "regression_loss_name", regression_loss_name)
+                    huber_delta = getattr(self, "regression_huber_delta", huber_delta)
+                    output["loss"] = regression_loss(
+                        flat_scores, labels, loss=regression_loss_name,
+                        huber_delta=huber_delta,
+                    )
             return output
 
         scores = pad_group_scores(flat_scores, group_sizes)

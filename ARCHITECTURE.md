@@ -191,6 +191,17 @@ resolved value and use it during reload.
 - `regression`: one candidate and one numeric target per row, with a selected
   regression loss.
 
+Pairwise training supports `--pair-policy` to control candidate selection:
+`all_unequal_layers` (the default) creates every pair whose perturbation-layer
+labels differ, while `original_only` creates only original-versus-perturbation
+pairs. The policy is applied when flattening a saved grouped dataset, so the
+same formatted custom dataset can be reused for either experiment:
+
+```bash
+python scripts/train_fe_model.py ... --pair-policy original_only
+python scripts/train_fe_model.py ... --pair-policy all_unequal_layers
+```
+
 Both paths use the same candidate-only scalar model: a pretrained Hugging Face
 encoder, backbone-specific pooling, and one `Linear(hidden_size, 1)` head.
 Training uses the standard Hugging Face `Trainer`; there are no

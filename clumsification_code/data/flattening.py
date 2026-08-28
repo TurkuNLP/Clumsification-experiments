@@ -123,41 +123,63 @@ def flatten_regression_dataset(dataset: Dataset, score_name: str) -> Dataset:
 def flatten_pairwise_dataset(
     dataset: Dataset,
     *,
-    policy: Literal["all_unequal_layers"] = "all_unequal_layers",
+    policy: Literal["original_only", "all_unequal_layers"] = "all_unequal_layers",
     include_weight: bool = True,
 ) -> Dataset:
     """Flatten each chain into deterministic chosen/rejected candidate pairs."""
-    if policy != "all_unequal_layers":
+    if policy not in {"original_only", "all_unequal_layers"}:
         raise ValueError(f"Unknown pair policy: {policy!r}")
 
     rows: list[dict[str, Any]] = []
     for chain in dataset:
         items = _aligned_items(chain)
-        for left in range(len(items)):
-            for right in range(left + 1, len(items)):
-                first, second = items[left], items[right]
-                if first["layer"] == second["layer"]:
-                    continue
-                chosen, rejected = (
-                    (first, second)
-                    if first["layer"] < second["layer"]
-                    else (second, first)
+        if policy == "original_only":
+            originals = [
+                item
+                for item in items
+                if item["layer"] == 0 and item["perturbation_source"] == "original"
+            ]
+            if len(originals) != 1:
+                raise ValueError(
+                    f"Chain {chain['id']!r} must contain exactly one original "
+                    f"candidate for pair policy 'original_only'; found {len(originals)}"
                 )
-                row = {
-                    "pair_id": f"{chain['id']}__pair_{left}_{right}",
-                    "source_id": str(chain["id"]),
-                    "dataset_name": chain.get("dataset_name"),
-                    "source_original_ids": list(chain.get("source_original_ids", [])),
-                    "chosen_id": chosen["candidate_id"],
-                    "rejected_id": rejected["candidate_id"],
-                    "chosen_text": chosen["text"],
-                    "rejected_text": rejected["text"],
-                    "chosen_layer": chosen["layer"],
-                    "rejected_layer": rejected["layer"],
-                }
-                if include_weight:
-                    row["weight"] = float(abs(chosen["layer"] - rejected["layer"]))
-                rows.append(row)
+            original = originals[0]
+            candidate_pairs = [
+                (original, item)
+                for item in items
+                if item is not original and item["layer"] != original["layer"]
+            ]
+        else:
+            candidate_pairs = [
+                (items[left], items[right])
+                for left in range(len(items))
+                for right in range(left + 1, len(items))
+                if items[left]["layer"] != items[right]["layer"]
+            ]
+
+        for left_item, right_item in candidate_pairs:
+            first, second = left_item, right_item
+            chosen, rejected = (
+                (first, second)
+                if first["layer"] < second["layer"]
+                else (second, first)
+            )
+            row = {
+                "pair_id": f"{chain['id']}__pair_{items.index(left_item)}_{items.index(right_item)}",
+                "source_id": str(chain["id"]),
+                "dataset_name": chain.get("dataset_name"),
+                "source_original_ids": list(chain.get("source_original_ids", [])),
+                "chosen_id": chosen["candidate_id"],
+                "rejected_id": rejected["candidate_id"],
+                "chosen_text": chosen["text"],
+                "rejected_text": rejected["text"],
+                "chosen_layer": chosen["layer"],
+                "rejected_layer": rejected["layer"],
+            }
+            if include_weight:
+                row["weight"] = float(abs(chosen["layer"] - rejected["layer"]))
+            rows.append(row)
 
     if not rows:
         raise ValueError("No unequal-label pairwise rows could be constructed")
@@ -169,7 +191,7 @@ def flatten_dataset_dict(
     *,
     training_method: Literal["regression", "pairwise"],
     score_name: str | None = None,
-    pair_policy: Literal["all_unequal_layers"] = "all_unequal_layers",
+    pair_policy: Literal["original_only", "all_unequal_layers"] = "all_unequal_layers",
 ) -> DatasetDict:
     """Validate split isolation and flatten every split with one schema."""
     assert_source_split_isolation(dataset_dict)

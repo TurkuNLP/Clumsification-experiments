@@ -18,11 +18,12 @@ from clumsification_code.data.flattening import flatten_dataset_dict
 from clumsification_code.fe.args import parse_train_args
 from clumsification_code.fe.checkpointing import save_final_model
 from clumsification_code.fe.collators import (
+    BinaryCollator,
     PairwiseCollator,
     RegressionCollator,
 )
 from clumsification_code.fe.modeling import FEModel
-from clumsification_code.fe.metrics import pairwise_metrics, regression_metrics
+from clumsification_code.fe.metrics import binary_metrics, pairwise_metrics, regression_metrics
 from clumsification_code.fe.regression_data import build_regression_dataset_dict
 from clumsification_code.fe.utils import (
     configure_logging,
@@ -44,6 +45,7 @@ def build_training_arguments(
     training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -79,7 +81,7 @@ def build_training_arguments(
                 "metric_for_best_model": (
                     "spearman"
                     if args.training_method == "regression"
-                    else "pairwise_accuracy"
+                    else ("binary_accuracy" if args.training_method == "binary" else "pairwise_accuracy")
                 ),
                 "greater_is_better": True,
             }
@@ -162,6 +164,7 @@ def main():
         logger.info(f"RANK={rank} LOCAL_RANK={local_rank} WORLD_SIZE={world_size}")
         logger.info(f"Loading formatted dataset from: {dataset_path}")
         logger.info(f"training_method={args.training_method}")
+        logger.info(f"pair_policy={args.pair_policy}")
 
         if eval_only:
             logger.info(
@@ -177,11 +180,20 @@ def main():
             grouped_dataset_dict=dataset_dict,
             score_name=args.score_name,
         )
+    elif args.training_method == "pairwise":
+        # Factorial pairwise datasets are already flat. Historical FE inputs
+        # remain grouped chains and still need source-safe flattening.
+        if "chosen_text" not in dataset_dict["train"].column_names:
+            dataset_dict = flatten_dataset_dict(
+                dataset_dict,
+                training_method="pairwise",
+                pair_policy=args.pair_policy,
+            )
     else:
-        dataset_dict = flatten_dataset_dict(
-            dataset_dict,
-            training_method="pairwise",
-        )
+        required = {"text", "label"}
+        missing = required - set(dataset_dict["train"].column_names)
+        if missing:
+            raise ValueError(f"Binary datasets require columns {sorted(required)}; missing {sorted(missing)}")
 
     train_dataset = dataset_dict["train"]
     dev_dataset = dataset_dict["dev"]
@@ -214,6 +226,7 @@ def main():
         param_dtype=param_dtype,
         pooling=args.pooling,
     )
+    model.training_objective = args.training_method
     model.ranking_epsilon = args.epsilon
     model.ranking_scale = args.scale
     model.ranking_loss = args.loss
@@ -229,10 +242,15 @@ def main():
             max_length=args.max_seq_len,
             text_prefix=args.text_prefix,
         )
-    else:
+    elif args.training_method == "pairwise":
         data_collator = PairwiseCollator(
             tokenizer=tokenizer,
             max_length=args.max_seq_len,
+            text_prefix=args.text_prefix,
+        )
+    else:
+        data_collator = BinaryCollator(
+            tokenizer=tokenizer, max_length=args.max_seq_len,
             text_prefix=args.text_prefix,
         )
 
@@ -246,12 +264,15 @@ def main():
 
         if args.training_method == "pairwise":
             logger.info(f"loss={args.loss}")
-        else:
+        elif args.training_method == "regression":
             logger.info(f"score_name={args.score_name}")
             logger.info(f"text_prefix={args.text_prefix!r}")
             logger.info(
                 f"target_scaling={regression_metadata['target_scaling']}"
             )
+        else:
+            logger.info("loss=binary")
+            logger.info(f"text_prefix={args.text_prefix!r}")
 
         logger.info(
             "parallelism=%s fsdp_sharding_strategy=%s fsdp_layer_cls=%s",
@@ -279,7 +300,7 @@ def main():
             processing_class=tokenizer,
             compute_metrics=regression_metrics,
         )
-    else:
+    elif args.training_method == "pairwise":
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -288,6 +309,12 @@ def main():
             data_collator=data_collator,
             processing_class=tokenizer,
             compute_metrics=pairwise_metrics,
+        )
+    else:
+        trainer = Trainer(
+            model=model, args=training_args, train_dataset=train_dataset,
+            eval_dataset=dev_dataset, data_collator=data_collator,
+            processing_class=tokenizer, compute_metrics=binary_metrics,
         )
 
     if rank == 0:
@@ -307,6 +334,7 @@ def main():
             parallelism=args.parallelism,
             metadata={
                 "objective": args.training_method,
+                "pair_policy": args.pair_policy if args.training_method == "pairwise" else None,
                 "loss": args.loss,
                 "epsilon": args.epsilon if args.training_method == "pairwise" else None,
                 "scale": args.scale if args.training_method == "pairwise" else None,

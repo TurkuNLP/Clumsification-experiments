@@ -63,6 +63,18 @@ def regression_metrics(eval_prediction: Any) -> dict[str, float]:
     }
 
 
+def binary_metrics(eval_prediction: Any) -> dict[str, float]:
+    """Return pointwise binary accuracy from logits."""
+    logits = _as_vector(eval_prediction.predictions)
+    labels = _as_vector(eval_prediction.label_ids)
+    if logits.numel() != labels.numel():
+        raise ValueError("Binary predictions and labels have different lengths")
+    if not logits.numel():
+        return {"binary_accuracy": 0.0}
+    accuracy = ((torch.sigmoid(logits) >= 0.5).float() == labels).float().mean()
+    return {"binary_accuracy": float(accuracy.item())}
+
+
 def pairwise_metrics(eval_prediction: Any) -> dict[str, float]:
     """Return tie-aware accuracy from chosen-minus-rejected score differences.
 

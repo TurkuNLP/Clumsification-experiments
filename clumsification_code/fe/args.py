@@ -63,9 +63,20 @@ def parse_train_args():
     _add_saved_dataset_args(parser)
 
     parser.add_argument("--training-method", type=str, default="pairwise",
-                        choices=["pairwise", "regression"],
+                        choices=["binary", "pairwise", "regression"],
                         help=("Pairwise preserves the existing grouped pairwise ranking workflow. "
                               "Regression trains independently on a selected numeric score field."))
+    parser.add_argument(
+        "--pair-policy",
+        type=str,
+        default="all_unequal_layers",
+        choices=["original_only", "all_unequal_layers"],
+        help=(
+            "Pairwise candidate selection policy. 'original_only' compares each "
+            "perturbation with its original; 'all_unequal_layers' compares all "
+            "candidates from different perturbation layers."
+        ),
+    )
     parser.add_argument("--score-name", type=str, default=None,
                         help="Aligned score field in the formatted dataset; required for regression.")
     parser.add_argument("--text-prefix", type=str, default="",
@@ -75,7 +86,8 @@ def parse_train_args():
                         help="Pooling strategy; auto selects from the backbone name.")
 
     parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--num_train_epochs", type=float, default=3)
+    parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
@@ -86,7 +98,7 @@ def parse_train_args():
     parser.add_argument("--scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--loss", type=str, default=None,
-                        choices=["logistic", "pairwise_logistic", "hinge", "margin",
+                        choices=["binary", "logistic", "pairwise_logistic", "hinge", "margin",
                                  "weighted_logistic", "logistic_weighted", "weighted-logistic",
                                  "huber", "smooth_l1", "smoothl1", "mse", "mae", "l1"],
                         help="Objective loss: ranking loss for pairwise, regression loss for regression.")
@@ -130,6 +142,10 @@ def parse_train_args():
     }
     regression_losses = {"huber", "smooth_l1", "smoothl1", "mse", "mae", "l1"}
     valid_losses = ranking_losses if args.training_method == "pairwise" else regression_losses
+    if args.training_method == "binary":
+        # Binary mode uses BCE implemented in FEModel; no regression loss name applies.
+        args.loss = "binary"
+        valid_losses = {"binary"}
     if args.loss not in valid_losses:
         parser.error(
             f"--loss={args.loss!r} is not valid for --training-method "

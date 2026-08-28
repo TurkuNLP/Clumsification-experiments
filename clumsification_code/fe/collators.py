@@ -6,6 +6,25 @@ import torch
 
 
 @dataclass
+class BinaryCollator:
+    """Tokenize independent candidate texts with binary quality labels."""
+    tokenizer: Any
+    max_length: int
+    text_prefix: str = ""
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        tokenized = self.tokenizer(
+            [f"{self.text_prefix}{feature['text']}" for feature in features],
+            padding=True, truncation=True, max_length=self.max_length,
+            return_tensors="pt", pad_to_multiple_of=8,
+        )
+        labels = [feature.get("label", feature.get("target")) for feature in features]
+        if any(label is None for label in labels):
+            raise ValueError("Binary examples require a 'label' field")
+        return {"input_ids": tokenized["input_ids"], "attention_mask": tokenized["attention_mask"], "labels": torch.tensor(labels, dtype=torch.float32)}
+
+
+@dataclass
 class RegressionCollator:
     """Tokenize independent text/target regression examples."""
 
