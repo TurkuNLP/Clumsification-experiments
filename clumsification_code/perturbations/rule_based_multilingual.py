@@ -1,5 +1,4 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
-#CREATED WITH GOT-5.6-sol
 
 """
 Multilingual rule-based perturbations backed by UniMorph.
@@ -60,6 +59,7 @@ RULE_BASED_MODEL_LABEL = "UniMorph-rule-based"
 RULE_BASED_OUTPUT_DIR = "trad_perturbed_layers"
 
 _LANGUAGE_ALIASES = {
+    "en": "eng", "eng": "eng", "english": "eng",
     "fi": "fin", "fin": "fin", "finnish": "fin",
     "da": "dan", "dan": "dan", "danish": "dan",
     "cs": "ces", "cz": "ces", "ces": "ces", "cze": "ces", "czech": "ces",
@@ -71,6 +71,7 @@ _LANGUAGE_ALIASES = {
 SUPPORTED_UNIMORPH_LANGUAGES = frozenset(
     {"fin", "dan", "ces", "deu", "ell", "ita"}
 )
+SUPPORTED_RULE_LANGUAGES = frozenset({"eng", *SUPPORTED_UNIMORPH_LANGUAGES})
 
 _POS_ATOMS = {
     "ADJ", "ADP", "ADV", "ART", "AUX", "CONJ", "DET", "INTJ", "N",
@@ -161,7 +162,8 @@ def normalize_language(language: str) -> str:
     except KeyError as exc:
         raise ValueError(
             f"Unsupported rule-based perturbation language {language!r}. "
-            "Supported languages: Finnish, Danish, Czech, German, Greek, Italian."
+            "Supported languages: English, Finnish, Danish, Czech, German, "
+            "Greek, Italian."
         ) from exc
 
 
@@ -177,7 +179,11 @@ def _require_unimorph_bindings() -> None:
     raise ImportError(message)
 
 
-def _ensure_language_downloaded(language: str) -> UniMorphStoreLike:
+def load_unimorph_store(language: str) -> UniMorphStoreLike:
+    """Open a UniMorph store, downloading the requested non-English data if needed."""
+    language = normalize_language(language)
+    if language == "eng":
+        raise ValueError("English morphology uses Lemminflect, not UniMorph")
     _require_unimorph_bindings()
     assert _UniMorphStore is not None
     assert _unimorph_download is not None
@@ -211,6 +217,11 @@ def _ensure_language_downloaded(language: str) -> UniMorphStoreLike:
             f"Could not verify the UniMorph dataset for {language!r}."
         ) from exc
     return store
+
+
+# Transitional private name for archived callers. New code uses
+# ``load_unimorph_store`` through the canonical backend selector.
+_ensure_language_downloaded = load_unimorph_store
 
 
 def _open_downloaded_store(language: str) -> UniMorphStoreLike:

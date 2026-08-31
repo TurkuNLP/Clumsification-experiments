@@ -5,10 +5,18 @@ __pycache__/
 
 # Local living research plan and agent memory
 PROJECT_VISION.local.md
+*.tar.gz
 
+# Datasets and generated data stay local. Prompt definitions are source assets
+# for the paper methodology and are the only tracked data exceptions.
 data/*
 !data/prompts/
 !data/prompts/**
+!data/perturbation_prompts/
+!data/perturbation_prompts/**
+
+# Internal utilities and all local/HPC batch jobs stay untracked. Reproduction
+# commands belong in the stable documentation instead.
 scripts/others*
 *.sh
 !scripts/experiments/
@@ -27,6 +35,7 @@ factorial_evals_visualizer.ipynb
 *.out
 *.err
 clumsification_code/evals/sanity
+# Tests and local archives are verification/history aids, not paper sources.
 clumsification_code/.archive/
 *.csv
 figures*/
@@ -244,3 +253,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+outputs_legacy.tar.gz

@@ -27,6 +27,12 @@ def _aligned_items(chain: dict[str, Any]) -> list[dict[str, Any]]:
         "labels": list(chain["labels"]),
         "candidate_ids": list(chain["candidate_ids"]),
         "perturbation_sources": list(chain["perturbation_sources"]),
+        "perturbation_methods": list(chain.get("perturbation_methods", chain["perturbation_sources"])),
+        "perturbation_run_ids": list(chain.get("perturbation_run_ids", [None] * len(chain["texts"]))),
+        "parent_candidate_ids": list(chain.get("parent_candidate_ids", [None] * len(chain["texts"]))),
+        "source_layers": list(chain.get("source_layers", [None] * len(chain["texts"]))),
+        "source_methods": list(chain.get("source_methods", [None] * len(chain["texts"]))),
+        "source_run_ids": list(chain.get("source_run_ids", [None] * len(chain["texts"]))),
     }
     lengths = {name: len(values) for name, values in fields.items()}
     if len(set(lengths.values())) != 1:
@@ -39,7 +45,9 @@ def _aligned_items(chain: dict[str, Any]) -> list[dict[str, Any]]:
         for name in chain
         if name not in {
             "id", "dataset_name", "source_original_ids", "texts", "labels",
-            "candidate_ids", "perturbation_sources",
+            "candidate_ids", "perturbation_sources", "perturbation_methods",
+            "perturbation_run_ids", "parent_candidate_ids", "source_layers",
+            "source_methods", "source_run_ids",
         }
     ]
     scores = {
@@ -62,6 +70,12 @@ def _aligned_items(chain: dict[str, Any]) -> list[dict[str, Any]]:
             "layer": fields["labels"][index],
             "candidate_id": fields["candidate_ids"][index],
             "perturbation_source": fields["perturbation_sources"][index],
+            "perturbation_method": fields["perturbation_methods"][index],
+            "perturbation_run_id": fields["perturbation_run_ids"][index],
+            "parent_candidate_id": fields["parent_candidate_ids"][index],
+            "source_layer": fields["source_layers"][index],
+            "source_method": fields["source_methods"][index],
+            "source_run_id": fields["source_run_ids"][index],
             "scores": {name: values[index] for name, values in scores.items()},
         }
         for index in range(len(fields["texts"]))
@@ -114,6 +128,9 @@ def flatten_regression_dataset(dataset: Dataset, score_name: str) -> Dataset:
                 "label": float(value),
                 "layer": item["layer"],
                 "perturbation_source": item["perturbation_source"],
+                "perturbation_method": item["perturbation_method"],
+                "perturbation_run_id": item["perturbation_run_id"],
+                "parent_candidate_id": item["parent_candidate_id"],
             })
     if not rows:
         raise ValueError(f"No valid regression rows found for score {score_name!r}")

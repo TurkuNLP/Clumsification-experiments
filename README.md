@@ -1,101 +1,56 @@
-# FKTQE
-Work in progress on automatically evaluating the quality of Finnish texts written for children
+# Clumsification experiments
 
-Python files in this repository carry an attribution notice where they have
-been co-created, refactored, or cleaned with GPT 5.6. Earlier GPT-version
-notices are retained where they already existed.
+This repository contains the central methodology for generating controlled
+fluency perturbations, constructing evaluator-training datasets, training text
+quality evaluators, and evaluating them.
 
-For a two-minute overview of the data, training, evaluation, and compatibility layers, see [ARCHITECTURE.md](ARCHITECTURE.md).
+The perturbation workflow supports:
 
-## UniEval reproduction
+- zero-shot and sampled-operation LLM perturbations;
+- UniEval-style and multilingual traditional perturbations;
+- generation from an original or any canonical perturbation layer;
+- method- and run-separated outputs with exact candidate ancestry;
+- scalar supervision attached to exact candidate identities;
+- leakage-safe Hugging Face datasets with configurable mixtures and pairs.
 
-Phase 1 provides a streaming loader and audit for the imported UniEval data.
-Run the audit before training to validate labels and record immutable file
-hashes:
+## Canonical commands
 
-```bash
-/home/tenojo/miniconda3/envs/genAI/bin/python scripts/audit_unieval_dataset.py
-```
-
-The command does not rewrite the source data.  It reports duplicate inputs and
-contradictory labels so that cleaning can be evaluated separately rather than
-silently changing the published training distribution.  Phase 2 adds the
-model-independent UniEval `Yes`/`No` scoring layer.
-
-## Producing regression supervision scores
-
-Score perturbations against their source originals before creating the Hugging
-Face training dataset.  Install the local scoring dependencies in the intended
-environment (`torch`, `transformers`, `evaluate`, and `bert-score`), then run:
+Generate one perturbation layer:
 
 ```bash
-python scripts/score_custom_dataset.py \
-  --dataset-name <dataset> \
-  --scoring-type token_normalized_perplexity \
-  --sample-limit 1000 \
-  --seed 42
+python scripts/generate_perturbations.py \
+  --dataset <dataset> --source-layer 0 \
+  --method llm_sampled --run-id sampled-v1
 ```
 
-or, for source-based BERTScore F1:
+Build a Hugging Face dataset:
+
+```bash
+python scripts/build_hf_dataset.py \
+  --datasets <dataset> --output-name <name> \
+  --include-methods llm_sampled trad_multi \
+  --include-layers 1 2
+```
+
+Run generation and HF construction from one configuration:
+
+```bash
+python scripts/prepare_dataset.py run-all \
+  --config configs/workflow.example.json
+```
+
+Score selected candidates for regression supervision:
 
 ```bash
 python scripts/score_custom_dataset.py \
   --dataset-name <dataset> \
   --scoring-type bertscore_f1 \
-  --language fi \
-  --batch-size 8
+  --scoring-run-id bertscore-v1
 ```
 
-For BLEURT, install BLEURT and its TensorFlow dependency as well, then run:
+Generated datasets, results, tests, notebooks, figures, local archives, and
+cluster batch jobs are intentionally not repository sources.
 
-```bash
-python scripts/score_custom_dataset.py \
-  --dataset-name <dataset> \
-  --scoring-type bleurt
-```
-
-BLEURT defaults to its authors' recommended `BLEURT-20` checkpoint; override
-it with `--bleurt-checkpoint` when necessary.
-
-## Running a vLLM evaluation baseline
-
-The generic vLLM scorer supports tensor parallel execution. For example, to
-use M-Prometheus-14B across four GPUs with the MENLO fluency rubric:
-
-```bash
-python -m clumsification_code.evals.run_benchmark \
-  --scorer vllm \
-  --model-name M-Prometheus-14B \
-  --vllm-model-name-or-path Unbabel/M-Prometheus-14B \
-  --vllm-tensor-parallel-size 4 \
-  --vllm-protocol prometheus_direct_assessment.json \
-  --vllm-rubric menlo_fluency.json
-```
-
-The protocol and rubric are independently selectable. Ready-to-run examples
-are provided as `scripts/run_qwen3_menlo_vllm.sh` and
-`scripts/run_qwen3_geval_vllm.sh`. Set `VLLM_TENSOR_PARALLEL_SIZE` when the
-number of GPUs differs from the default of four.
-
-Qwen3 thinking is disabled by default so the model reserves its output for the
-evaluation result. Enable it explicitly with `--vllm-enable-thinking` if
-needed. `--vllm-max-model-len` limits the combined prompt and generated output;
-`--vllm-max-tokens` limits generated output and should be increased if a model
-uses long reasoning before returning a score.
-
-Each command creates `scores/<perturbation-folder>/<method>.jsonl`, an
-accompanying error JSONL, and a metadata file within the selected custom
-dataset. Score JSONL contains only
-successful candidate scores; originals are not self-scored.  Every stored value
-is higher-is-better: BERTScore is the Hugging Face Evaluate metric's raw F1
-using its normal defaults for the selected language, BLEURT is used directly,
-and perplexity is stored as `-log(perplexity)`.
-
-When creating a regression dataset from partial scores, identify the score that
-will be trained on so its source documents are split correctly:
-
-```bash
-python scripts/create_fe_training_dataset.py \
-  --custom-datasets <dataset> \
-  --score-names bleurt
-```
+See [the perturbation workflow guide](docs/PERTURBATION_CONFIGS.md) for exact
+schemas and examples, and [the architecture overview](ARCHITECTURE.md) for the
+end-to-end data flow.

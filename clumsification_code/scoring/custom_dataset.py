@@ -1,29 +1,25 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
-"""Score perturbations in a custom dataset against their original texts.
+"""Score canonical custom-dataset candidates with explicit provenance.
 
 The public entry point is :func:`score_custom_dataset`; command-line parsing
 lives in ``scripts/score_custom_dataset.py``. Score records deliberately only
-contain successful scores; originals are self-scored by default. Failures live
-in a separate error JSONL file.
+contain successful scores. Failures live in a separate error JSONL file.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import random
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from clumsification_code.data.candidate_identity import (
-    candidate_id_from_raw_row,
-    canonical_perturbation_source,
-    make_original_candidate_id,
-)
+from clumsification_code.data.candidate_identity import make_original_candidate_id
+from clumsification_code.data.io import write_json_atomic, write_jsonl_atomic
+from clumsification_code.data.repository import DatasetRepository
+from clumsification_code.data.schemas import ScoreRecord
 
 DEFAULT_PPL_MODEL = "Qwen/Qwen3-8B-Base"
 DEFAULT_BLEURT_CHECKPOINT = "BLEURT-20"
@@ -44,11 +40,14 @@ SUPPORTED_SCORING_TYPES = frozenset(
 class ScoreTask:
     """One original/candidate comparison to be scored."""
 
-    base_text_id: int
-    perturbation_source: str
+    dataset_name: str
+    base_text_id: str
     candidate_id: str
+    perturbation_method: str
+    perturbation_run_id: str
     source_layer: int
     target_layer: int
+    reference_candidate_id: str
     source_text: str
     target_text: str
 
@@ -62,71 +61,12 @@ class ScoreFailure:
     error_message: str
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
-    with path.open("r", encoding="utf-8") as reader:
-        for line_no, line in enumerate(reader, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON in {path}:{line_no}") from exc
-            if not isinstance(row, dict):
-                raise ValueError(f"Expected an object in {path}:{line_no}")
-            rows.append(row)
-    return rows
-
-
-def _merge_source_rows(
-    path: Path,
-    new_rows: list[dict],
-    *,
-    perturbation_source: str,
-    overwrite: bool,
-) -> list[dict]:
-    """Replace one source's rows while preserving the other source."""
-    if not path.exists():
-        return new_rows
-
-    existing_rows = _read_jsonl(path)
-    for row_number, row in enumerate(existing_rows, start=1):
-        missing = {"perturbation_source", "candidate_id"} - row.keys()
-        if missing:
-            raise ValueError(
-                f"{path}:{row_number} is not a canonical score record; "
-                f"missing {sorted(missing)}. Remove the old score file "
-                "before running the new scorer."
-            )
-
-    existing_sources = {row["perturbation_source"] for row in existing_rows}
-    if perturbation_source in existing_sources and not overwrite:
-        raise FileExistsError(
-            f"{path} already contains {perturbation_source!r} records. "
-            "Pass --overwrite to replace them."
-        )
-
-    retained_rows = [
-        row
-        for row in existing_rows
-        if row["perturbation_source"] != perturbation_source
-    ]
-    return retained_rows + new_rows
-
-
-def _as_int(value: object, *, context: str) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Expected an integer {context}, got {value!r}.") from exc
-
-
 def select_original_ids(
-    original_ids: Iterable[int],
+    original_ids: Iterable[str],
     *,
     sample_limit: int | None,
     seed: int,
-) -> list[int]:
+) -> list[str]:
     """Choose source IDs reproducibly; ``None`` means use all IDs."""
     ids = sorted(set(original_ids))
     if sample_limit is None or sample_limit >= len(ids):
@@ -138,98 +78,91 @@ def select_original_ids(
 
 def load_score_tasks(
     *,
-    dataset_dir: Path,
-    layer_directory: str,
+    repository: DatasetRepository,
+    methods: Iterable[str] | None,
+    run_ids: Iterable[str] | None,
+    target_layers: Iterable[int] | None,
     sample_limit: int | None,
     seed: int,
-) -> tuple[list[ScoreTask], list[int]]:
-    """Load all candidates for a sampled set of original document IDs."""
-    perturbation_source = canonical_perturbation_source(layer_directory)
-    original_path = dataset_dir / "original.jsonl"
-    if not original_path.is_file():
-        raise FileNotFoundError(f"Missing original dataset file: {original_path}")
-
-    originals: dict[int, str] = {}
-    for row_no, row in enumerate(_read_jsonl(original_path), start=1):
-        if "custom_id" not in row or "text" not in row:
-            raise ValueError(
-                f"{original_path}:{row_no} must contain custom_id and text."
-            )
-        original_id = _as_int(row["custom_id"], context=f"at {original_path}:{row_no}")
-        if original_id in originals:
-            raise ValueError(f"Duplicate custom_id={original_id} in {original_path}.")
-        if not isinstance(row["text"], str):
-            raise ValueError(f"{original_path}:{row_no}: text must be a string.")
-        originals[original_id] = row["text"]
+    include_originals: bool = True,
+    reference_policy: str = "original",
+) -> tuple[list[ScoreTask], list[str]]:
+    """Load manifest-selected canonical candidates and their exact references."""
+    if reference_policy not in {"original", "parent"}:
+        raise ValueError("reference_policy must be 'original' or 'parent'")
+    repository.validate_lineage()
+    originals = {record.base_text_id: record for record in repository.read_originals()}
 
     selected_ids = select_original_ids(
         originals,
         sample_limit=sample_limit,
         seed=seed,
     )
-    selected_set = set(selected_ids)
-    layer_dir = dataset_dir / layer_directory
-    if not layer_dir.is_dir():
-        raise FileNotFoundError(f"Missing perturbation layer directory: {layer_dir}")
-
+    selected = set(selected_ids)
     tasks: list[ScoreTask] = []
-    dataset_name = dataset_dir.name
-
-    # Score clean originals by default. Reference-based scorers compare the
-    # original with itself; candidate-only scorers score the original directly.
-    for original_id in selected_ids:
-        tasks.append(
-            ScoreTask(
-                base_text_id=original_id,
-                perturbation_source="original",
-                candidate_id=make_original_candidate_id(
-                    dataset_name=dataset_name,
-                    base_text_id=original_id,
-                ),
-                source_layer=0,
-                target_layer=0,
-                source_text=originals[original_id],
-                target_text=originals[original_id],
-            )
+    original_candidate_ids = {
+        base_id: make_original_candidate_id(
+            dataset_name=repository.dataset_name,
+            base_text_id=base_id,
         )
-
-    candidate_indices: dict[tuple[int, int], int] = {}
-    for layer_path in sorted(layer_dir.glob("*.jsonl"), key=lambda path: path.name):
-        try:
-            target_layer = int(layer_path.stem)
-        except ValueError:
-            continue
-        for row_no, row in enumerate(_read_jsonl(layer_path), start=1):
-            if "head_id" not in row or "text" not in row:
-                raise ValueError(f"{layer_path}:{row_no} must contain head_id and text.")
-            original_id = _as_int(row["head_id"], context=f"at {layer_path}:{row_no}")
-            if original_id not in originals:
-                raise ValueError(
-                    f"{layer_path}:{row_no} has head_id={original_id}, which is not "
-                    "present in original.jsonl."
-                )
-            if original_id not in selected_set:
-                continue
-            if not isinstance(row["text"], str):
-                raise ValueError(f"{layer_path}:{row_no}: text must be a string.")
-            candidate_key = (original_id, target_layer)
-            candidate_index = candidate_indices.get(candidate_key, 0)
-            candidate_indices[candidate_key] = candidate_index + 1
+        for base_id in selected_ids
+    }
+    if include_originals:
+        for base_id in selected_ids:
             tasks.append(
                 ScoreTask(
-                    base_text_id=original_id,
-                    perturbation_source=perturbation_source,
-                    candidate_id=candidate_id_from_raw_row(
-                        row,
-                        perturbation_source=perturbation_source,
-                        base_text_id=original_id,
-                        target_layer=target_layer,
-                        candidate_index=candidate_index,
-                    ),
+                    dataset_name=repository.dataset_name,
+                    base_text_id=base_id,
+                    candidate_id=original_candidate_ids[base_id],
+                    perturbation_method="original",
+                    perturbation_run_id="original",
                     source_layer=0,
-                    target_layer=target_layer,
-                    source_text=originals[original_id],
-                    target_text=row["text"],
+                    target_layer=0,
+                    reference_candidate_id=original_candidate_ids[base_id],
+                    source_text=originals[base_id].text,
+                    target_text=originals[base_id].text,
+                )
+            )
+
+    entries = repository.list_layers(
+        methods=methods,
+        run_ids=run_ids,
+        target_layers=target_layers,
+    )
+    if not entries:
+        raise FileNotFoundError("No canonical perturbation layers match the score selection")
+    candidate_texts: dict[str, str] = {}
+    for entry in repository.list_layers():
+        for candidate in repository.read_candidates(entry):
+            candidate_texts[candidate.candidate_id] = candidate.text
+    for entry in entries:
+        for candidate in repository.read_candidates(entry):
+            if candidate.base_text_id not in selected:
+                continue
+            if reference_policy == "parent":
+                reference_id = candidate.parent_candidate_id
+                reference_text = (
+                    originals[candidate.base_text_id].text
+                    if candidate.source_layer == 0
+                    else candidate_texts[reference_id]
+                )
+                reference_layer = candidate.source_layer
+            else:
+                reference_id = original_candidate_ids[candidate.base_text_id]
+                reference_text = originals[candidate.base_text_id].text
+                reference_layer = 0
+            tasks.append(
+                ScoreTask(
+                    dataset_name=repository.dataset_name,
+                    base_text_id=candidate.base_text_id,
+                    candidate_id=candidate.candidate_id,
+                    perturbation_method=candidate.perturbation_method,
+                    perturbation_run_id=candidate.run_id,
+                    source_layer=reference_layer,
+                    target_layer=candidate.target_layer,
+                    reference_candidate_id=reference_id,
+                    source_text=reference_text,
+                    target_text=candidate.text,
                 )
             )
     return tasks, selected_ids
@@ -396,25 +329,6 @@ def score_with_failure_isolation(
     return scores, failures
 
 
-def _write_jsonl_atomically(path: Path, rows: Iterable[dict], *, overwrite: bool) -> None:
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists: {path}. Pass --overwrite to replace it.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as writer:
-        temporary_path = Path(writer.name)
-        for row in rows:
-            json.dump(row, writer, ensure_ascii=False, allow_nan=False)
-            writer.write("\n")
-    temporary_path.replace(path)
-
-
 def _package_version(package_name: str) -> str | None:
     try:
         from importlib.metadata import version
@@ -424,28 +338,11 @@ def _package_version(package_name: str) -> str | None:
         return None
 
 
-def _write_metadata(path: Path, metadata: dict, *, overwrite: bool) -> None:
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists: {path}. Pass --overwrite to replace it.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as writer:
-        temporary_path = Path(writer.name)
-        json.dump(metadata, writer, ensure_ascii=False, indent=2, sort_keys=True)
-        writer.write("\n")
-    temporary_path.replace(path)
-
-
 def score_custom_dataset(
     *,
     dataset_name: str,
     scoring_type: str,
+    scoring_run_id: str = "default",
     sample_limit: int | None,
     seed: int,
     language: str,
@@ -465,7 +362,11 @@ def score_custom_dataset(
     gptscore_tp_plan: str | None = "auto",
     max_tokens: int = 8192,
     device: str | None = None,
-    layer_directory: str = "perturbed_layers",
+    methods: Iterable[str] | None = None,
+    perturbation_run_ids: Iterable[str] | None = None,
+    target_layers: Iterable[int] | None = None,
+    include_originals: bool = True,
+    reference_policy: str = "original",
     overwrite: bool = False,
     dataset_root: Path = Path("data/custom_datasets"),
 ) -> dict:
@@ -479,18 +380,30 @@ def score_custom_dataset(
     if metricx_max_input_length < 2:
         raise ValueError("metricx_max_input_length must be at least 2.")
 
-    dataset_dir = dataset_root / dataset_name
-    perturbation_source = canonical_perturbation_source(layer_directory)
+    methods = tuple(methods) if methods is not None else None
+    perturbation_run_ids = (
+        tuple(perturbation_run_ids) if perturbation_run_ids is not None else None
+    )
+    target_layers = tuple(target_layers) if target_layers is not None else None
+    repository = DatasetRepository.from_root(dataset_root, dataset_name)
+    score_destinations = (
+        repository.score_path(scoring_type, scoring_run_id),
+        repository.score_error_path(scoring_type, scoring_run_id),
+        repository.score_metadata_path(scoring_type, scoring_run_id),
+    )
+    if not overwrite and any(path.exists() for path in score_destinations):
+        existing = next(path for path in score_destinations if path.exists())
+        raise FileExistsError(f"Score run output already exists: {existing}")
     tasks, selected_ids = load_score_tasks(
-        dataset_dir=dataset_dir,
-        layer_directory=layer_directory,
+        repository=repository,
+        methods=methods,
+        run_ids=perturbation_run_ids,
+        target_layers=target_layers,
         sample_limit=sample_limit,
         seed=seed,
+        include_originals=include_originals,
+        reference_policy=reference_policy,
     )
-    score_dir = dataset_dir / "scores"
-    score_path = score_dir / f"{scoring_type}.jsonl"
-    error_path = score_dir / f"{scoring_type}.errors.jsonl"
-    metadata_path = score_dir / f"{scoring_type}.{perturbation_source}.metadata.json"
 
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
@@ -498,6 +411,7 @@ def score_custom_dataset(
             "implementation": "evaluate.load('bertscore')",
             "language": language,
             "uses_metric_defaults": True,
+            "uses_reference": True,
         }
         direction_description = "Raw BERTScore F1; higher is better; no transformation."
     elif scoring_type == "bleurt":
@@ -505,6 +419,7 @@ def score_custom_dataset(
         scorer_config = {
             "implementation": "evaluate.load('bleurt', checkpoint)",
             "checkpoint": bleurt_checkpoint,
+            "uses_reference": True,
         }
         direction_description = "Raw BLEURT score; higher is better; no transformation."
     elif scoring_type == "metricx24_source_qe":
@@ -601,75 +516,67 @@ def score_custom_dataset(
         )
 
     scores, failures = score_with_failure_isolation(tasks, scorer)
-    score_rows = [
-        {
-            "base_text_id": task.base_text_id,
-            "perturbation_source": task.perturbation_source,
-            "candidate_id": task.candidate_id,
-            "source_layer": task.source_layer,
-            "target_layer": task.target_layer,
-            "score_name": scoring_type,
-            "score_value": score,
-        }
+    score_records = [
+        ScoreRecord(
+            dataset_name=task.dataset_name,
+            base_text_id=task.base_text_id,
+            candidate_id=task.candidate_id,
+            perturbation_method=task.perturbation_method,
+            scoring_method=scoring_type,
+            scoring_run_id=scoring_run_id,
+            score_value=score,
+            source_layer=task.source_layer,
+            target_layer=task.target_layer,
+            reference_candidate_id=task.reference_candidate_id,
+            metadata={"perturbation_run_id": task.perturbation_run_id},
+        )
         for task, score in zip(tasks, scores)
         if score is not None
     ]
     error_rows = [
         {
+            "schema_version": 1,
             "base_text_id": failure.task.base_text_id,
-            "perturbation_source": failure.task.perturbation_source,
+            "dataset_name": failure.task.dataset_name,
             "candidate_id": failure.task.candidate_id,
+            "perturbation_method": failure.task.perturbation_method,
+            "perturbation_run_id": failure.task.perturbation_run_id,
             "source_layer": failure.task.source_layer,
             "target_layer": failure.task.target_layer,
-            "score_name": scoring_type,
+            "reference_candidate_id": failure.task.reference_candidate_id,
+            "scoring_method": scoring_type,
+            "scoring_run_id": scoring_run_id,
             "error_type": failure.error_type,
             "error_message": failure.error_message,
         }
         for failure in failures
     ]
-    _write_jsonl_atomically(
-        score_path,
-        _merge_source_rows(
-            score_path,
-            score_rows,
-            perturbation_source=perturbation_source,
-            overwrite=overwrite,
-        ),
-        overwrite=True,
-    )
-    _write_jsonl_atomically(
-        error_path,
-        _merge_source_rows(
-            error_path,
-            error_rows,
-            perturbation_source=perturbation_source,
-            overwrite=overwrite,
-        ),
-        overwrite=True,
-    )
     metadata = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "dataset_name": dataset_name,
-        "input_layer_directory": layer_directory,
-        "perturbation_source": perturbation_source,
-        "candidate_id_schema": (
-            "{source}__base_{base_id}__layer_{target_layer}__candidate_{index}"
+        "scoring_method": scoring_type,
+        "scoring_run_id": scoring_run_id,
+        "selected_methods": sorted(methods) if methods is not None else None,
+        "selected_perturbation_run_ids": (
+            sorted(perturbation_run_ids) if perturbation_run_ids is not None else None
         ),
-        "scoring_type": scoring_type,
+        "selected_target_layers": (
+            sorted(target_layers) if target_layers is not None else None
+        ),
+        "reference_policy": reference_policy,
         "score_direction": "higher_is_better",
         "score_transform": direction_description,
-        "scored_against": "original_and_candidate",
-        "original_self_scores": "written_by_default",
-        "num_original_tasks": len(selected_ids),
-        "num_perturbation_tasks": len(tasks) - len(selected_ids),
+        "include_originals": include_originals,
+        "num_original_tasks": sum(task.target_layer == 0 for task in tasks),
+        "num_perturbation_tasks": sum(task.target_layer > 0 for task in tasks),
         "failures": "written_to_errors_jsonl; no null or NaN score values are written",
         "sample_limit": sample_limit,
         "seed": seed,
         "selected_original_ids": selected_ids,
         "num_selected_originals": len(selected_ids),
         "num_candidate_tasks": len(tasks),
-        "num_successful_scores": len(score_rows),
+        "num_successful_scores": len(score_records),
         "num_failures": len(error_rows),
         "language": language,
         "teacher_input_mode": scorer_config.get("input_mode", "candidate_only"),
@@ -687,11 +594,18 @@ def score_custom_dataset(
             "transformers": _package_version("transformers"),
         },
     }
-    _write_metadata(metadata_path, metadata, overwrite=overwrite)
+    score_path, error_path, metadata_path = repository.write_scores(
+        score_records,
+        scoring_method=scoring_type,
+        scoring_run_id=scoring_run_id,
+        errors=error_rows,
+        metadata=metadata,
+        overwrite=overwrite,
+    )
     return {
         "score_path": str(score_path),
         "error_path": str(error_path),
         "metadata_path": str(metadata_path),
-        "num_successful_scores": len(score_rows),
+        "num_successful_scores": len(score_records),
         "num_failures": len(error_rows),
     }

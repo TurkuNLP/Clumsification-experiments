@@ -18,19 +18,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from clumsification_code.scoring.args import parse_score_args
+from clumsification_code.scoring.custom_dataset import score_custom_dataset
+
 
 def main():
-    # Import project modules after the checkout path has been made available.
-    # This keeps the top-level imports lightweight and preserves direct
-    # execution with ``python scripts/score_custom_dataset.py``.
-    from clumsification_code.scoring.args import parse_score_args
-    from clumsification_code.scoring.custom_dataset import score_custom_dataset
-
     args = parse_score_args()
 
     result = score_custom_dataset(
         dataset_name=args.dataset_name,
         scoring_type=args.scoring_type,
+        scoring_run_id=args.scoring_run_id,
         sample_limit=args.sample_limit,
         seed=args.seed,
         language=args.language,
@@ -50,7 +48,11 @@ def main():
         gptscore_tp_plan=args.gptscore_tp_plan,
         max_tokens=args.max_tokens,
         device=args.device,
-        layer_directory=args.layer_directory,
+        methods=args.methods,
+        perturbation_run_ids=args.perturbation_run_ids,
+        target_layers=args.target_layers,
+        include_originals=not args.exclude_originals,
+        reference_policy=args.reference_policy,
         overwrite=args.overwrite,
         dataset_root=args.dataset_root,
     )

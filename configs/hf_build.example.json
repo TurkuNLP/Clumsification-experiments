@@ -1,0 +1,31 @@
+{
+  "output_name": "example_mixed_hf",
+  "datasets": [
+    "example_dataset"
+  ],
+  "include_methods": [
+    "llm_sampled",
+    "trad_multi"
+  ],
+  "include_runs": [
+    "sampled-medium-v1",
+    "trad-v1"
+  ],
+  "include_layers": [
+    1,
+    2
+  ],
+  "composition": "balanced",
+  "samples_per_source": 1,
+  "pair_policy": "parent_child",
+  "reuse_limit": 5,
+  "score_names": [
+    "teacher"
+  ],
+  "score_run_ids": [
+    "teacher-v1"
+  ],
+  "heldout_ratio": 0.3,
+  "test_ratio_within_heldout": 0.5,
+  "seed": 42
+}

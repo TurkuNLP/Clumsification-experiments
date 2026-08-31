@@ -11,6 +11,7 @@ from clumsification_code.scoring.custom_dataset import (
     DEFAULT_PPL_MODEL,
     SUPPORTED_SCORING_TYPES,
 )
+from clumsification_code.perturbations.registry import list_method_specs
 
 
 def parse_score_args():
@@ -25,6 +26,7 @@ def parse_score_args():
         required=True,
         choices=sorted(SUPPORTED_SCORING_TYPES),
     )
+    parser.add_argument("--scoring-run-id", default="default")
     parser.add_argument(
         "--sample-limit",
         type=int,
@@ -82,11 +84,19 @@ def parse_score_args():
         help="Torch device for perplexity scoring, for example cuda or cuda:0.",
     )
     parser.add_argument(
-        "--layer-directory",
-        type=str,
-        default="perturbed_layers",
-        help="Perturbation folder inside the selected custom dataset.",
+        "--methods",
+        nargs="+",
+        choices=[spec.name for spec in list_method_specs()],
+        default=None,
     )
+    parser.add_argument("--perturbation-run-ids", nargs="+", default=None)
+    parser.add_argument("--target-layers", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--reference-policy",
+        choices=["original", "parent"],
+        default="original",
+    )
+    parser.add_argument("--exclude-originals", action="store_true")
     parser.add_argument(
         "--dataset-root",
         type=Path,
@@ -103,4 +113,8 @@ def parse_score_args():
         parser.error("--max-tokens must be at least 2.")
     if args.metricx_max_input_length < 2:
         parser.error("--metricx-max-input-length must be at least 2.")
+    if not args.scoring_run_id.strip():
+        parser.error("--scoring-run-id must be non-empty.")
+    if args.target_layers is not None and any(layer < 1 for layer in args.target_layers):
+        parser.error("--target-layers values must be positive.")
     return args

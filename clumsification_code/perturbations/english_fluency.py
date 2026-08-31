@@ -1,6 +1,5 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
-"""
-EvalEval-style non-LLM perturbations for the perturbation pipeline.
+"""English fluency rules used by the canonical traditional editor.
 
 This module implements the rule/traditional perturbation templates described in
 Sai et al. (2021), "Perturbation CheckLists for Evaluating NLG Evaluation
@@ -35,7 +34,7 @@ except Exception:  # pragma: no cover
     _num2words = None
 
 
-RULE_BASED_MODEL_LABEL = "EvalEval-rule-based"
+RULE_BASED_MODEL_LABEL = "traditional-english-fluency"
 RULE_BASED_OUTPUT_DIR = "trad_perturbed_layers"
 
 _FALLBACK_STOPWORDS = {
@@ -292,7 +291,7 @@ class RuleTemplate:
     fn: Callable[[dict], str]
 
 
-class EvalEvalRulePerturber:
+class EnglishFluencyRulePerturber:
     def __init__(self, corpus_texts: list[str] | None = None):
         self.stopwords = _get_stopwords()
         self.corpus_texts = [t for t in (corpus_texts or []) if isinstance(t, str) and t.strip()]
@@ -642,7 +641,7 @@ class EvalEvalRulePerturber:
         ])
 
 
-def build_rule_templates(perturber: EvalEvalRulePerturber) -> list[RuleTemplate]:
+def build_rule_templates(perturber: EnglishFluencyRulePerturber) -> list[RuleTemplate]:
     P = perturber
     common_fluency = [
         ("misplaced_punctuation", "Fluency", P.misplaced_punctuation),
@@ -843,7 +842,7 @@ def _init_rule_worker(
     else:
         random.seed(random_seed + os.getpid())
 
-    perturber = EvalEvalRulePerturber(corpus_texts)
+    perturber = EnglishFluencyRulePerturber(corpus_texts)
     _WORKER_TEMPLATES = select_rule_templates(
         build_rule_templates(perturber),
         rule_task=rule_task,
@@ -883,7 +882,7 @@ def rule_based_perturbation(
     random_seed: int | None = None,
 ) -> list[dict]:
     """
-    Apply EvalEval-style non-LLM perturbations and return rows with the same
+    Apply English non-LLM fluency perturbations and return rows with the same
     schema as the vLLM perturbation path:
 
       perturbation_type, model, head_id, text, max_length, _source_ds
@@ -904,7 +903,7 @@ def rule_based_perturbation(
     corpus_texts = [x.get("text", "") for x in ds_items]
 
     # Build once in parent for validation and for sequential mode.
-    perturber = EvalEvalRulePerturber(corpus_texts)
+    perturber = EnglishFluencyRulePerturber(corpus_texts)
     templates = select_rule_templates(
         build_rule_templates(perturber),
         rule_task=rule_task,

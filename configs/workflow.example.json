@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "dataset": "example_dataset",
+  "dataset_root": "data/custom_datasets",
+  "seed": 42,
+  "generations": [
+    {
+      "method": "llm_sampled",
+      "run_id": "sampled-medium-v1",
+      "source_layer": 0,
+      "target_layer": 1,
+      "config": {
+        "severity": "medium",
+        "target_dimensions": [
+          "Clarity",
+          "Naturalness"
+        ]
+      }
+    },
+    {
+      "method": "trad_multi",
+      "run_id": "trad-v1",
+      "source_layer": 1,
+      "source_method": "llm_sampled",
+      "source_run_id": "sampled-medium-v1",
+      "target_layer": 2,
+      "config": {
+        "language": "en"
+      }
+    }
+  ],
+  "hf": {
+    "output_name": "example_mixed_hf",
+    "include_methods": [
+      "llm_sampled",
+      "trad_multi"
+    ],
+    "include_runs": [
+      "sampled-medium-v1",
+      "trad-v1"
+    ],
+    "include_layers": [
+      1,
+      2
+    ],
+    "composition": "all",
+    "pair_policy": "parent_child"
+  }
+}
