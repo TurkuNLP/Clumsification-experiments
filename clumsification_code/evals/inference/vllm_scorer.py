@@ -17,6 +17,7 @@ _RESULT_RE = re.compile(
     r"(?:\[\s*RESULT\s*\]|\bRESULT\b)\s*:?\s*([1-5])\b",
     flags=re.IGNORECASE,
 )
+_RATING_RE = re.compile(r"\bRating\s*:\s*([1-5])\b", flags=re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 _MAX_RETRIES = 5
 
@@ -174,6 +175,14 @@ class VLLMTextScorer:
         if self.output_parser == "json_score":
             visible_text = _THINK_BLOCK_RE.sub("", text or "").strip()
             return parse_score_response(visible_text).score
+        if self.output_parser == "themis_rating":
+            visible_text = _THINK_BLOCK_RE.sub("", text or "")
+            match = _RATING_RE.search(visible_text)
+            if match is None:
+                raise ValueError(
+                    f"Could not find Rating score in Themis output: {text[:300]!r}"
+                )
+            return float(match.group(1))
         return self._parse_score(text)
 
 

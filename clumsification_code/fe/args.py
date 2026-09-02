@@ -79,6 +79,8 @@ def parse_train_args():
     )
     parser.add_argument("--score-name", type=str, default=None,
                         help="Aligned score field in the formatted dataset; required for regression.")
+    parser.add_argument("--exclude-layer-zero", action="store_true",
+                        help="Exclude original (layer 0) candidates from regression training/evaluation.")
     parser.add_argument("--text-prefix", type=str, default="",
                         help="Prefix prepended to every text before tokenization.")
     parser.add_argument("--pooling", choices=["auto", "mean", "last_token"],

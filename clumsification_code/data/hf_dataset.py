@@ -340,7 +340,7 @@ def create_formatted_dataset_dict(
     if include_layers is None and max_layers is not None:
         include_layers = list(range(1, max_layers + 1))
     if methods is None and layer_type == "trad":
-        methods = ["unieval", "unieval_summinflect", "trad_single", "trad_multi"]
+        methods = ["unieval", "unieval_trad", "trad_single", "trad_multi"]
     if random_pairs:
         pair_policy = "cross_source_unmatched"
     repositories = {
@@ -414,6 +414,18 @@ def create_formatted_dataset_dict(
         "samples_per_source": samples_per_source,
         "pair_policy": pair_policy,
         "num_examples": {split: len(final[split]) for split in final},
+        "selected_layer_hashes": {
+            dataset_name: {
+                f"{entry.method}:{entry.run_id}:{entry.target_layer}": {
+                    "content_hash": entry.content_hash,
+                    "config_hash": entry.config_hash,
+                }
+                for entry in repositories[dataset_name].list_layers(
+                    methods=methods, run_ids=run_ids, target_layers=include_layers
+                )
+            }
+            for dataset_name in dataset_names
+        },
     }
     return (final, metadata) if return_metadata else final
 

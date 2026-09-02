@@ -13,7 +13,7 @@ from clumsification_code.evals.nlg_eval_loader import (
     iter_nlg_eval_records,
 )
 from clumsification_code.evals.standalone_benchmarks import (
-    DEFAULT_ARGESSAY_PATH,
+    DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     DEFAULT_COHESENTIA_PATH,
     DEFAULT_ELLIPSE_PATH,
     iter_standalone_records,
@@ -86,18 +86,20 @@ def eval_pairwise_preference_dataset(
         clean_text = getattr(data, "_clean_text")
 
     pairs = []
-    for p, d in zip(preferred_texts, dispreferred_texts):
+    tie_values = human_ties if human_ties is not None else [False] * len(preferred_texts)
+    for p, d, tie in zip(preferred_texts, dispreferred_texts, tie_values):
         p = clean_text(p)
         d = clean_text(d)
         if p and d:
-            pairs.append((p, d))
+            pairs.append((p, d, bool(tie)))
 
     if not pairs:
         print(f"{name}: no valid preference pairs.")
         return None
 
-    preferred_texts = [p for p, _ in pairs]
-    dispreferred_texts = [d for _, d in pairs]
+    preferred_texts = [p for p, _, _ in pairs]
+    dispreferred_texts = [d for _, d, _ in pairs]
+    human_ties = [tie for _, _, tie in pairs]
 
     maybe_set_prompt_context(model, task_name, aspect)
 
@@ -360,20 +362,22 @@ def run_legacy_benchmark_suite(
             )
         )
 
-    # ARG-ESSAY
-    arge_ds = data.load_argessay_data("data/benchmarks/arg-essay.csv")
+    # Herbold et al. (2023) human/ChatGPT argumentative-essay comparison.
+    arge_ds = data.load_human_chatgpt_essay_data(
+        "data/benchmarks/human-chatgpt-argumentative-essays.csv"
+    )
 
     for aspect, result_name, label_key in [
         (
             "language_mastery",
-            "ARG-ESSAY_language_mastery",
+            "HUMAN-CHATGPT-ESSAYS_language_mastery",
             "language_mastery",
         ),
-        ("complexity", "ARG-ESSAY_complexity", "complexity"),
-        ("vocabulary", "ARG-ESSAY_vocabulary", "vocabulary"),
+        ("complexity", "HUMAN-CHATGPT-ESSAYS_complexity", "complexity"),
+        ("vocabulary", "HUMAN-CHATGPT-ESSAYS_vocabulary", "vocabulary"),
         (
             "language_constructs",
-            "ARG-ESSAY_language_constructs",
+            "HUMAN-CHATGPT-ESSAYS_language_constructs",
             "language_constructs",
         ),
     ]:
@@ -460,7 +464,7 @@ def run_standard_benchmark_suite(
     max_length: int,
     nlg_eval_path=DEFAULT_NLG_EVAL_PATH,
     ellipse_path=DEFAULT_ELLIPSE_PATH,
-    argessay_path=DEFAULT_ARGESSAY_PATH,
+    human_chatgpt_essays_path=DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     cohesentia_path=DEFAULT_COHESENTIA_PATH,
     skip_preferences: bool = False,
     max_records_per_dimension: Optional[int] = None,
@@ -580,7 +584,7 @@ def run_standard_benchmark_suite(
     standalone_records = list(
         iter_standalone_records(
             ellipse_path=ellipse_path,
-            argessay_path=argessay_path,
+            human_chatgpt_essays_path=human_chatgpt_essays_path,
             cohesentia_path=cohesentia_path,
         )
     )

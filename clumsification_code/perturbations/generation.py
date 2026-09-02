@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import gc
 import re
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,11 +21,153 @@ from clumsification_code.data.schemas import (
 )
 
 from .registry import get_method_spec
-from .schemas import ChatRunner, GenerationRuntime, PerturbationInput
+from .schemas import ChatRunner, GenerationRuntime, PerturbationInput, SkippedGeneration
 
 
 class GenerationValidationError(ValueError):
     """A method returned output that cannot become a canonical candidate."""
+
+
+LEGACY_TEXT_BUCKETS = (512, 1024, 2048, 4096, 8192, 16384)
+LEGACY_PROMPT_OVERHEAD = 512
+
+
+def _legacy_bucket_params(text_bucket: int) -> tuple[int, int]:
+    """Return the legacy context and output limits for a text bucket."""
+    thinking = max(1024, int(text_bucket * 0.45))
+    total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + thinking + 128
+    if total > 4000:
+        thinking = 4096
+        total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + thinking + 128
+    model_len = 1
+    while model_len < total:
+        model_len *= 2
+    return model_len, text_bucket + thinking + 256
+
+
+def _source_text_from_prompt(messages: list[dict[str, str]]) -> str:
+    content = str(messages[-1].get("content", "")) if messages else ""
+    for marker in ("Source text:\n", "Now, edit this text: \n"):
+        if marker in content:
+            return content.rsplit(marker, 1)[1]
+    return content
+
+
+def _automatic_context_buckets(max_model_len: int) -> tuple[int, ...]:
+    """Return ascending power-of-two buckets ending at ``max_model_len``."""
+    if max_model_len < 1:
+        raise ValueError("max_model_len must be a positive integer")
+    buckets: list[int] = []
+    bucket = 4096
+    while bucket < max_model_len:
+        buckets.append(bucket)
+        bucket *= 2
+    if not buckets or buckets[-1] != max_model_len:
+        buckets.append(max_model_len)
+    return tuple(buckets)
+
+
+def estimate_chat_prompt_tokens(
+    model: str,
+    messages: list[dict[str, str]],
+    *,
+    tokenizer: Any | None = None,
+) -> int:
+    """Count tokens in a rendered chat request using the model tokenizer."""
+    if tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError("LLM length estimation requires transformers") from exc
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    if hasattr(tokenizer, "apply_chat_template"):
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    else:
+        encoded = tokenizer(
+            "\n".join(str(message.get("content", "")) for message in messages),
+            add_special_tokens=True,
+        )["input_ids"]
+    return len(encoded)
+
+
+def plan_context_buckets(
+    model: str,
+    prompts: list[list[dict[str, str]]],
+    *,
+    max_model_len: int,
+    max_tokens: int,
+    tokenizer: Any | None = None,
+    safety_margin: int = 256,
+    bucket_policy: str = "legacy_text_length",
+) -> tuple[dict[int, list[int]], list[dict[str, int]]]:
+    """Assign prompts to automatic context buckets and report over-limit items.
+
+    Returned bucket values contain original prompt indices. Over-limit entries
+    contain their index and measured lengths, allowing the execution layer to
+    skip them without changing the order of eligible requests.
+    """
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be a positive integer")
+    if safety_margin < 0:
+        raise ValueError("safety_margin must be non-negative")
+    if bucket_policy not in {"legacy_text_length", "rendered_prompt"}:
+        raise ValueError("bucket_policy must be 'legacy_text_length' or 'rendered_prompt'")
+    planned: dict[int, list[int]] = {}
+    skipped: list[dict[str, int]] = []
+    if tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError("LLM length estimation requires transformers") from exc
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    for index, messages in enumerate(prompts):
+        if bucket_policy == "rendered_prompt":
+            if hasattr(tokenizer, "apply_chat_template"):
+                rendered = tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True
+                )
+            else:
+                rendered = tokenizer(
+                    "\n".join(str(message.get("content", "")) for message in messages),
+                    add_special_tokens=True,
+                )["input_ids"]
+            prompt_tokens = len(rendered)
+            required_tokens = prompt_tokens + max_tokens + safety_margin
+            bucket = next(
+                (boundary for boundary in _automatic_context_buckets(max_model_len)
+                 if boundary >= required_tokens),
+                None,
+            )
+            if bucket is None:
+                skipped.append({"prompt_index": index, "prompt_tokens": prompt_tokens,
+                                "required_tokens": required_tokens})
+            else:
+                planned.setdefault(bucket, []).append(index)
+            continue
+        text_tokens = len(tokenizer(_source_text_from_prompt(messages), add_special_tokens=True)["input_ids"])
+        text_bucket = next((boundary for boundary in LEGACY_TEXT_BUCKETS if text_tokens <= boundary), None)
+        if text_bucket is None:
+            text_bucket = LEGACY_TEXT_BUCKETS[-1]
+            model_len, bucket_tokens = _legacy_bucket_params(text_bucket)
+            skipped.append({"prompt_index": index, "prompt_tokens": text_tokens, "required_tokens": model_len + 1})
+            continue
+        model_len, bucket_tokens = _legacy_bucket_params(text_bucket)
+        required_tokens = model_len
+        if required_tokens > max_model_len:
+            skipped.append(
+                {
+                    "prompt_index": index,
+                    "prompt_tokens": text_tokens,
+                    "required_tokens": required_tokens,
+                }
+            )
+        else:
+            planned.setdefault(model_len, []).append(index)
+    return {bucket: indices for bucket, indices in planned.items() if indices}, skipped
 
 
 def _parse_vllm_text(output: Any) -> str:
@@ -40,24 +183,66 @@ def run_vllm(
     prompts: list[list[dict[str, str]]],
     temperature: float,
     max_tokens: int,
+    *,
+    max_model_len: int = 32768,
+    safety_margin: int = 256,
+    bucket_policy: str = "legacy_text_length",
 ) -> Sequence[str]:
-    """Execute an LLM batch; heavy optional dependencies stay lazy."""
+    """Execute prompts sequentially in automatically sized vLLM buckets."""
     try:
         import torch
         from vllm import LLM, SamplingParams
     except ImportError as exc:
         raise RuntimeError("LLM methods require vLLM and torch") from exc
-    llm = LLM(
-        model=model_path,
-        max_model_len=max_tokens * 2,
-        tensor_parallel_size=max(1, torch.cuda.device_count()),
-        language_model_only=True,
-    )
-    outputs = llm.chat(
+    plan, skipped = plan_context_buckets(
+        model_path,
         prompts,
-        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=temperature),
+        max_model_len=max_model_len,
+        max_tokens=max_tokens,
+        safety_margin=safety_margin,
+        bucket_policy=bucket_policy,
     )
-    return [_parse_vllm_text(output) for output in outputs]
+    run_vllm.last_context_stats = {
+        "bucket_counts": {str(bucket): len(indices) for bucket, indices in plan.items()},
+        "skipped_over_length_count": len(skipped),
+    }
+    print(
+        "[vLLM] context buckets: "
+        + ", ".join(f"{bucket}={len(indices)}" for bucket, indices in plan.items())
+        + f"; skipped_over_limit={len(skipped)}",
+        flush=True,
+    )
+    results: list[str | SkippedGeneration | None] = [None] * len(prompts)
+    for entry in skipped:
+        results[entry["prompt_index"]] = SkippedGeneration(
+            prompt_tokens=entry["prompt_tokens"],
+            required_tokens=entry["required_tokens"],
+        )
+    for bucket, indices in plan.items():
+        llm = LLM(
+            model=model_path,
+            max_model_len=bucket,
+            tensor_parallel_size=max(1, torch.cuda.device_count()),
+            language_model_only=True,
+        )
+        bucket_outputs = llm.chat(
+            [prompts[index] for index in indices],
+            sampling_params=SamplingParams(max_tokens=max_tokens, temperature=temperature),
+        )
+        for index, output in zip(indices, bucket_outputs):
+            results[index] = _parse_vllm_text(output)
+        del llm
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    if any(output is None for output in results):
+        raise RuntimeError("Bucketed vLLM execution did not produce every output")
+    return [output if isinstance(output, SkippedGeneration) else str(output) for output in results]
+
+
+# Marker consumed by GenerationRuntime without changing the public injected
+# runner contract used by tests and downstream callers.
+run_vllm.supports_context_buckets = True
 
 
 class PerturbationGenerationService:
@@ -153,6 +338,8 @@ class PerturbationGenerationService:
             config=method_config,
         ).validate()
         spec = get_method_spec(method)
+        # Resolve the historical name before constructing paths/provenance.
+        method = spec.name
         allow_unchanged = method_config.get("allow_unchanged", False)
         if not isinstance(allow_unchanged, bool):
             raise ValueError("allow_unchanged must be true or false")
@@ -167,6 +354,24 @@ class PerturbationGenerationService:
         persisted_config = {
             key: value for key, value in method_config.items() if key != "store"
         }
+        if spec.perturbation_source == "LLM":
+            max_model_len = int(method_config.get("max_model_len", 32768))
+            max_tokens = int(method_config.get("max_tokens", 2048))
+            safety_margin = int(method_config.get("context_safety_margin", 256))
+            if max_model_len < 1 or max_tokens < 1:
+                raise ValueError("LLM context and output limits must be positive")
+            persisted_config["max_model_len"] = max_model_len
+            persisted_config["max_tokens"] = max_tokens
+            persisted_config["context_safety_margin"] = safety_margin
+            bucket_policy = str(method_config.get("bucket_policy", "legacy_text_length"))
+            if bucket_policy not in {"legacy_text_length", "rendered_prompt"}:
+                raise ValueError(
+                    "bucket_policy must be 'legacy_text_length' or 'rendered_prompt'"
+                )
+            persisted_config["bucket_policy"] = bucket_policy
+            persisted_config["context_buckets"] = list(
+                _automatic_context_buckets(max_model_len)
+            )
         canonical_json_hash(persisted_config)
         destination = self.repository.layer_path(method, run_id, resolved_target)
         if not overwrite:
@@ -197,11 +402,21 @@ class PerturbationGenerationService:
             parent_base_ids[candidate_id] = item.base_text_id
         candidate_counts: dict[str, int] = defaultdict(int)
         candidates = []
+        skipped_over_length: list[dict[str, Any]] = []
         input_by_parent = {str(item.candidate_id): item for item in items}
         for result in results:
             parent_id = result.parent_candidate_id
             if parent_id not in parent_base_ids:
                 raise ValueError("Generated result references an unknown parent candidate")
+            if isinstance(result.text, SkippedGeneration):
+                skipped_over_length.append(
+                    {
+                        "parent_candidate_id": parent_id,
+                        "prompt_tokens": result.text.prompt_tokens,
+                        "required_tokens": result.text.required_tokens,
+                    }
+                )
+                continue
             if result.base_text_id != parent_base_ids[parent_id]:
                 raise ValueError("Generated result and parent have different base_text_id values")
             expected = (
@@ -291,9 +506,22 @@ class PerturbationGenerationService:
                     metadata=metadata,
                 )
             )
-        if set(candidate_counts) != set(parent_base_ids):
-            missing = len(set(parent_base_ids) - set(candidate_counts))
+        skipped_ids = {entry["parent_candidate_id"] for entry in skipped_over_length}
+        if set(candidate_counts) | skipped_ids != set(parent_base_ids):
+            missing = len(set(parent_base_ids) - set(candidate_counts) - skipped_ids)
             raise ValueError(f"Generated layer has no candidate for {missing} input parent(s)")
+        if skipped_over_length:
+            persisted_config["skipped_over_length_count"] = len(skipped_over_length)
+            persisted_config["skipped_over_length"] = skipped_over_length
+        execution_stats = getattr(self.llm_runner, "last_context_stats", None)
+        if spec.perturbation_source == "LLM" and isinstance(execution_stats, dict):
+            persisted_config.update(
+                {
+                    key: value
+                    for key, value in execution_stats.items()
+                    if key == "bucket_counts"
+                }
+            )
         return self.repository.write_candidate_layer(
             candidates,
             method=method,
@@ -362,7 +590,10 @@ __all__ = [
     "ChatRunner",
     "GenerationValidationError",
     "PerturbationGenerationService",
+    "SkippedGeneration",
+    "estimate_chat_prompt_tokens",
     "generate_layer",
     "load_source_items",
+    "plan_context_buckets",
     "run_vllm",
 ]

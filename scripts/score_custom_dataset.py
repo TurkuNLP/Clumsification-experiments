@@ -1,8 +1,9 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 """Generate scalar supervision JSONL files for a custom dataset.
 
-The supported local methods are ``token_normalized_perplexity``, ``bertscore_f1``,
-``bleurt``, ``metricx24_source_qe``, and ``gptscore_source_fluency``. All emit
+The supported methods are ``token_normalized_perplexity``, ``bertscore_f1``,
+``bleurt``, ``metricx24_source_qe``, ``gptscore_source_fluency``, and
+``geval_gpt54mini_fluency``. All emit
 values where higher is better. In particular,
 perplexity is stored as ``-log(perplexity)`` (negative mean token NLL), because
 ordinary perplexity has the opposite direction.
@@ -46,6 +47,13 @@ def main():
         gptscore_device_map=args.gptscore_device_map,
         gptscore_dtype=args.gptscore_dtype,
         gptscore_tp_plan=args.gptscore_tp_plan,
+        geval_cache_path=args.geval_cache_path,
+        themis_model_name=args.themis_model_name,
+        themis_tensor_parallel_size=args.themis_tensor_parallel_size,
+        themis_max_model_len=args.themis_max_model_len,
+        themis_max_tokens=args.themis_max_tokens,
+        themis_gpu_memory_utilization=args.themis_gpu_memory_utilization,
+        themis_trust_remote_code=args.themis_trust_remote_code,
         max_tokens=args.max_tokens,
         device=args.device,
         methods=args.methods,

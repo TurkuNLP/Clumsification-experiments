@@ -80,6 +80,8 @@ _METHODS: dict[str, MethodSpec] = {
     ),
 }
 
+_DEPRECATED_ALIASES = {"unieval_summinflect": "unieval_trad"}
+
 
 def list_method_specs(*, implemented_only: bool = False) -> tuple[MethodSpec, ...]:
     """Return canonical methods in stable registration order."""
@@ -91,8 +93,9 @@ def list_method_specs(*, implemented_only: bool = False) -> tuple[MethodSpec, ..
 
 def get_method_spec(name: str) -> MethodSpec:
     """Resolve a canonical method name, without implicit aliases."""
+    canonical_name = _DEPRECATED_ALIASES.get(name, name)
     try:
-        return _METHODS[name]
+        return _METHODS[canonical_name]
     except KeyError as exc:
         valid = ", ".join(_METHODS)
         raise ValueError(f"Unknown perturbation method {name!r}; choose one of: {valid}") from exc

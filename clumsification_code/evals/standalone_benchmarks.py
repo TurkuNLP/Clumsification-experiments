@@ -14,7 +14,13 @@ from typing import Dict, Iterator, List, Mapping, Optional
 # outside NLG-eval.  Centralizing them prevents different runners from silently
 # using different copies of the same benchmark.
 DEFAULT_ELLIPSE_PATH = Path("data/benchmarks/ELLIPSE.csv")
-DEFAULT_ARGESSAY_PATH = Path("data/benchmarks/arg-essay.csv")
+DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH = Path(
+    "data/benchmarks/human-chatgpt-argumentative-essays.csv"
+)
+# Compatibility alias for callers written before the two essay datasets were
+# disambiguated.  This points to Herbold et al. (2023), not Bao et al.'s
+# ArgEssay corpus.
+DEFAULT_ARGESSAY_PATH = DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH
 DEFAULT_COHESENTIA_PATH = Path("data/benchmarks/CohesentiaTestData.json")
 DEFAULT_MTEB_SUMMEVAL_DATASET = "mteb/summeval"
 
@@ -61,8 +67,8 @@ def iter_ellipse_records(path: Path) -> Iterator[Dict[str, object]]:
                 }
 
 
-def iter_argessay_records(path: Path) -> Iterator[Dict[str, object]]:
-    """Yield ARG-ESSAY records for the selected proficiency dimensions."""
+def iter_human_chatgpt_essay_records(path: Path) -> Iterator[Dict[str, object]]:
+    """Yield Herbold et al. essay-comparison proficiency dimensions."""
     columns = {
         "language_mastery": "STUD_LangMastery",
         "language_constructs": "STUD_LangConstructs",
@@ -84,16 +90,16 @@ def iter_argessay_records(path: Path) -> Iterator[Dict[str, object]]:
                     if score is None:
                         continue
                     yield {
-                        "id": f"ARG-ESSAY:{row_number}:{system}:{aspect}",
+                        "id": f"HUMAN-CHATGPT-ESSAYS:{row_number}:{system}:{aspect}",
                         "source": None,
                         "text": text,
                         "human_scores": [score],
                         "human_score": score,
-                        "benchmark": "ARG-ESSAY",
+                        "benchmark": "HUMAN-CHATGPT-ESSAYS",
                         "aspect": aspect,
                         "metadata_aspect": aspect,
                         "task": "Essay Evaluation",
-                        "original_data": "ARG-ESSAY",
+                        "original_data": "Herbold et al. (2023)",
                         "task_family": "essays",
                         "fluency_categories": ("grammaticality",),
                         "label_type": "scalar",
@@ -190,6 +196,7 @@ def iter_mteb_summeval_records(
 def iter_standalone_records(
     *,
     ellipse_path: Optional[Path] = None,
+    human_chatgpt_essays_path: Optional[Path] = None,
     argessay_path: Optional[Path] = None,
     cohesentia_path: Optional[Path] = None,
     include_mteb_summeval: bool = True,
@@ -197,9 +204,19 @@ def iter_standalone_records(
     """Yield records from whichever standalone sources were requested."""
     if ellipse_path is not None:
         yield from iter_ellipse_records(ellipse_path)
-    if argessay_path is not None:
-        yield from iter_argessay_records(argessay_path)
+    if human_chatgpt_essays_path is not None and argessay_path is not None:
+        raise ValueError(
+            "Pass human_chatgpt_essays_path, not both it and deprecated argessay_path"
+        )
+    essay_path = human_chatgpt_essays_path or argessay_path
+    if essay_path is not None:
+        yield from iter_human_chatgpt_essay_records(essay_path)
     if cohesentia_path is not None:
         yield from iter_cohesentia_records(cohesentia_path)
     if include_mteb_summeval:
         yield from iter_mteb_summeval_records()
+
+
+# Backward-compatible function name. New code should use the publication-
+# specific name above.
+iter_argessay_records = iter_human_chatgpt_essay_records

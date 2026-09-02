@@ -816,9 +816,11 @@ def legacy_main():
         bench.correlation_bundle(hanna_ds["complexity"], raw_preds, "HANNA_complexity")
     )
 
-    # ── ARG-ESSAY ─────────────────────────────────────────────────
-    arge_ds = bench.load_argessay_data("data/benchmarks/arg-essay.csv")
-    print(f"\nARG-ESSAY texts: {len(arge_ds)}")
+    # ── Herbold et al. human/ChatGPT essay comparison ──────────────
+    arge_ds = bench.load_human_chatgpt_essay_data(
+        "data/benchmarks/human-chatgpt-argumentative-essays.csv"
+    )
+    print(f"\nHuman–ChatGPT essay-comparison texts: {len(arge_ds)}")
     raw_preds = bench.getModelPreds(
         device,
         model,
@@ -830,28 +832,28 @@ def legacy_main():
         bench.correlation_bundle(
             arge_ds["language_mastery"],
             raw_preds,
-            "ARG-ESSAY_language_mastery",
+            "HUMAN-CHATGPT-ESSAYS_language_mastery",
         )
     )
     all_results.update(
         bench.correlation_bundle(
             arge_ds["complexity"],
             raw_preds,
-            "ARG-ESSAY_complexity",
+            "HUMAN-CHATGPT-ESSAYS_complexity",
         )
     )
     all_results.update(
         bench.correlation_bundle(
             arge_ds["vocabulary"],
             raw_preds,
-            "ARG-ESSAY_vocabulary",
+            "HUMAN-CHATGPT-ESSAYS_vocabulary",
         )
     )
     all_results.update(
         bench.correlation_bundle(
             arge_ds["language_constructs"],
             raw_preds,
-            "ARG-ESSAY_language_constructs",
+            "HUMAN-CHATGPT-ESSAYS_language_constructs",
         )
     )
 

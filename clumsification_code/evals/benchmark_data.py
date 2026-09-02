@@ -239,7 +239,7 @@ def load_human_ratings_of_nlg_data(file_path: str):
     return datasets.Dataset.from_list(data)
 
 
-def load_argessay_data(file_path: str):
+def load_human_chatgpt_essay_data(file_path: str):
     with open(file_path, newline="\n") as csvfile:
         data = []
         reader = csv.reader(csvfile, delimiter=",", quotechar='"')
@@ -283,6 +283,10 @@ def load_argessay_data(file_path: str):
                 }
             )
     return datasets.Dataset.from_list(data)
+
+
+# Compatibility alias retained for older evaluation entry points.
+load_argessay_data = load_human_chatgpt_essay_data
 
 
 def load_hanna_data(file_path: str):

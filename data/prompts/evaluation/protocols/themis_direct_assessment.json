@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "themis.direct_assessment.no_reference",
+  "version": "1",
+  "description": "Themis-style candidate-only direct assessment with an injected rubric.",
+  "required_variables": ["candidate_text", "rubric"],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Please act as an impartial and helpful evaluator for natural language generation (NLG), and the audience is an expert in the field.\nYour task is to evaluate the quality of standalone text strictly based on the given evaluation criterion.\nBegin the evaluation by providing your analysis concisely and accurately, and then on the next line, start with \"Rating:\" followed by your rating on a Likert scale from 1 to 5 (higher means better).\nYou MUST keep to the strict boundaries of the evaluation criterion and focus solely on the issues and errors involved.\n\n###Evaluation Criterion###\n{rubric}\n\n###Target Text###\n{candidate_text}\n\n###Your Evaluation###"
+    }
+  ],
+  "metadata": {
+    "method": "themis",
+    "assessment": "direct",
+    "output_parser": "themis_rating",
+    "reference_mode": "none",
+    "source_status": "adapted",
+    "source_url": "https://github.com/PKU-ONELab/Themis/blob/main/eval.py",
+    "note": "The evaluator structure follows Themis; candidate-only target formatting is adapted for custom-dataset fluency supervision."
+  }
+}

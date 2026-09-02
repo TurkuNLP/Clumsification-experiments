@@ -38,12 +38,12 @@ def preset_config(name: str, dataset: str) -> dict[str, Any]:
             "dataset": dataset,
             "generations": [
                 {"method": method, "source_layer": 0}
-                for method in ("unieval", "unieval_summinflect", "trad_single", "trad_multi")
+                for method in ("unieval", "unieval_trad", "trad_single", "trad_multi")
             ],
             "hf": {
                 "output_name": f"{dataset}_traditional", "include_layers": [1],
                 "include_methods": [
-                    "unieval", "unieval_summinflect", "trad_single", "trad_multi"
+                    "unieval", "unieval_trad", "trad_single", "trad_multi"
                 ],
             },
         },
@@ -83,6 +83,8 @@ def load_workflow_config(
 def run_generations(config: WorkflowConfig, *, overwrite: bool = False) -> list[Path]:
     outputs = []
     for generation in config.generations:
+        generation_config = dict(generation.config)
+        generation_config.setdefault("seed", config.seed)
         outputs.append(generate_layer(
             config.dataset,
             dataset_root=config.dataset_root,
@@ -92,7 +94,7 @@ def run_generations(config: WorkflowConfig, *, overwrite: bool = False) -> list[
             method=generation.method,
             run_id=generation.run_id,
             target_layer=generation.target_layer,
-            config=dict(generation.config),
+            config=generation_config,
             limit=generation.limit,
             overwrite=overwrite,
         ))

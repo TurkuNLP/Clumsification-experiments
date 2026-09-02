@@ -77,12 +77,22 @@ class MetricX24QEInferenceModel:
         candidate = "" if candidate is None else str(candidate)
         inp = f"source: {source} candidate: {candidate}"
 
-        tok = self.tokenizer(
-            inp,
-            max_length=self.max_input_length,
-            truncation=True,
-            padding=False,
-        )
+        tok = self.tokenizer(inp, max_length=self.max_input_length,
+                             truncation=True, padding=False)
+        # Right truncation can discard the candidate when the source is long.
+        # Rebuild overflowed inputs with a guaranteed candidate segment and
+        # spend remaining budget on the source/prefix instead.
+        untruncated = self.tokenizer(inp, truncation=False, padding=False)
+        if len(untruncated["input_ids"]) > self.max_input_length:
+            candidate_ids = self.tokenizer(
+                str(candidate), truncation=False, padding=False
+            )["input_ids"]
+            prefix_ids = self.tokenizer(
+                f"source: {source} candidate: ", truncation=False, padding=False
+            )["input_ids"]
+            budget = max(self.max_input_length - len(candidate_ids), 1)
+            input_ids = prefix_ids[:budget] + candidate_ids[: self.max_input_length - min(len(prefix_ids), budget)]
+            tok = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
 
         # Match official MetricX predict.py behavior: remove EOS.
         if len(tok["input_ids"]) > 0:

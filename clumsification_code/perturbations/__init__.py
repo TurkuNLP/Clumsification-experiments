@@ -3,6 +3,7 @@ from .registry import MethodSpec, get_method_spec, list_method_specs, register_m
 from .schemas import (
     ChatRunner,
     GenerationRuntime,
+    SkippedGeneration,
     PerturbationInput,
     PerturbationMethod,
     PerturbationResult,
@@ -49,6 +50,7 @@ __all__ = [
     "MethodSpec",
     "ChatRunner",
     "GenerationRuntime",
+    "SkippedGeneration",
     "PerturbationInput",
     "PerturbationMethod",
     "PerturbationResult",

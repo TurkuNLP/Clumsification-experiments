@@ -18,7 +18,7 @@ from .nlg_eval_loader import (
 )
 from .standalone_benchmarks import iter_standalone_records
 from .standalone_benchmarks import (
-    DEFAULT_ARGESSAY_PATH,
+    DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     DEFAULT_COHESENTIA_PATH,
     DEFAULT_ELLIPSE_PATH,
     DEFAULT_MTEB_SUMMEVAL_DATASET,
@@ -42,7 +42,7 @@ def build_audit_report(
     nlg_eval_path: Path = DEFAULT_NLG_EVAL_PATH,
     metadata_path: Path = DEFAULT_NLG_EVAL_METADATA_PATH,
     ellipse_path: Path | None = DEFAULT_ELLIPSE_PATH,
-    argessay_path: Path | None = DEFAULT_ARGESSAY_PATH,
+    human_chatgpt_essays_path: Path | None = DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     cohesentia_path: Path | None = DEFAULT_COHESENTIA_PATH,
 ) -> Dict[str, object]:
     """Build a machine-readable count and mapping report."""
@@ -64,7 +64,7 @@ def build_audit_report(
     standalone_counts = Counter()
     for record in iter_standalone_records(
         ellipse_path=ellipse_path,
-        argessay_path=argessay_path,
+        human_chatgpt_essays_path=human_chatgpt_essays_path,
         cohesentia_path=cohesentia_path,
     ):
         standalone_counts[str(record["benchmark"])] += 1
@@ -96,7 +96,11 @@ def build_audit_report(
             "nlg_eval": str(nlg_eval_path),
             "nlg_eval_metadata": str(metadata_path),
             "ellipse": str(ellipse_path) if ellipse_path else None,
-            "argessay": str(argessay_path) if argessay_path else None,
+            "human_chatgpt_essays": (
+                str(human_chatgpt_essays_path)
+                if human_chatgpt_essays_path
+                else None
+            ),
             "cohesentia": str(cohesentia_path) if cohesentia_path else None,
             "mteb_summeval": DEFAULT_MTEB_SUMMEVAL_DATASET,
         },
@@ -122,7 +126,13 @@ def main() -> None:
     parser.add_argument("--nlg-eval-path", type=Path, default=DEFAULT_NLG_EVAL_PATH)
     parser.add_argument("--metadata-path", type=Path, default=DEFAULT_NLG_EVAL_METADATA_PATH)
     parser.add_argument("--ellipse-path", type=Path, default=DEFAULT_ELLIPSE_PATH)
-    parser.add_argument("--argessay-path", type=Path, default=DEFAULT_ARGESSAY_PATH)
+    parser.add_argument(
+        "--human-chatgpt-essays-path",
+        "--argessay-path",
+        dest="human_chatgpt_essays_path",
+        type=Path,
+        default=DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
+    )
     parser.add_argument("--cohesentia-path", type=Path, default=DEFAULT_COHESENTIA_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_MANIFEST_PATH)
     args = parser.parse_args()

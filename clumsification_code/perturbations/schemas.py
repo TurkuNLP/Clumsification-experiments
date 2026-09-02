@@ -22,6 +22,14 @@ ChatRunner = Callable[
 
 
 @dataclass(frozen=True)
+class SkippedGeneration:
+    """Marker for a prompt excluded before LLM inference."""
+
+    prompt_tokens: int
+    required_tokens: int
+
+
+@dataclass(frozen=True)
 class GenerationRuntime:
     """Optional execution dependencies supplied by the generation service."""
 
@@ -43,19 +51,25 @@ class GenerationRuntime:
             raise ValueError("temperature must be a finite non-negative number")
         if max_tokens < 1:
             raise ValueError("max_tokens must be a positive integer")
-        outputs = list(
-            self.chat_runner(
-                str(model),
-                prompts,
-                temperature,
-                max_tokens,
+        # The built-in vLLM runner additionally receives the configured
+        # context limit so it can execute automatic length buckets. Keep the
+        # four-argument call for injected runners used by tests and callers.
+        if getattr(self.chat_runner, "supports_context_buckets", False):
+            outputs = list(
+                    self.chat_runner(
+                        str(model), prompts, temperature, max_tokens,
+                        max_model_len=int(config.get("max_model_len", 32768)),
+                        safety_margin=int(config.get("context_safety_margin", 256)),
+                        bucket_policy=str(config.get("bucket_policy", "legacy_text_length")),
+                )
             )
-        )
+        else:
+            outputs = list(self.chat_runner(str(model), prompts, temperature, max_tokens))
         if len(outputs) != len(prompts):
             raise ValueError(
                 f"Chat runner returned {len(outputs)} outputs for {len(prompts)} prompts"
             )
-        if any(not isinstance(output, str) for output in outputs):
+        if any(not isinstance(output, (str, SkippedGeneration)) for output in outputs):
             raise ValueError("Chat runner outputs must all be strings")
         return str(model), outputs
 

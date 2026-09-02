@@ -251,6 +251,11 @@ def build_trial_command(
         args.pooling,
     ]
 
+    if args.training_method == "regression":
+        if not getattr(args, "score_name", None):
+            raise ValueError("--score_name is required for regression HPO")
+        cmd.extend(["--score-name", args.score_name])
+
     cmd.extend(["--parallelism", args.parallelism])
     if args.parallelism == "fsdp":
         cmd.extend(
@@ -315,6 +320,8 @@ def main() -> None:
     parser.add_argument("--trials_file", type=str, required=True,
                         help="JSON list of HPO trial objects.")
     parser.add_argument("--training_method", choices=["pairwise", "regression"], default="pairwise")
+    parser.add_argument("--score_name", type=str, default=None,
+                        help="Score field required for regression HPO.")
 
     parser.add_argument(
         "--formatted_dataset_name",
@@ -439,7 +446,7 @@ def main() -> None:
     parser.add_argument(
         "--objective_key",
         type=str,
-        default=DEFAULT_OBJECTIVE_KEYS["pairwise"],
+        default=None,
         help="Metric key from hpo_dev_metrics.json to maximize.",
     )
 
@@ -486,12 +493,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.objective_key is None:
+        args.objective_key = DEFAULT_OBJECTIVE_KEYS[args.training_method]
+
     if args.formatted_dataset_name and args.formatted_dataset_path:
         raise ValueError(
             "Use only one of --formatted_dataset_name or --formatted_dataset_path."
         )
     if args.parallelism == "fsdp" and not args.fsdp_layer_cls:
         raise ValueError("--fsdp-layer-cls is required when --parallelism fsdp.")
+    if args.training_method == "regression" and not args.score_name:
+        raise ValueError("--score_name is required when --training_method regression")
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)

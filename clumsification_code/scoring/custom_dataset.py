@@ -25,6 +25,8 @@ DEFAULT_PPL_MODEL = "Qwen/Qwen3-8B-Base"
 DEFAULT_BLEURT_CHECKPOINT = "BLEURT-20"
 DEFAULT_METRICX_MODEL = "google/metricx-24-hybrid-xl-v2p6"
 DEFAULT_METRICX_TOKENIZER = "google/mt5-xl"
+DEFAULT_THEMIS_MODEL = "PKU-ONELab/Themis"
+DEFAULT_GEVAL_MODEL = "gpt-5.4-mini-2026-03-17"
 SUPPORTED_SCORING_TYPES = frozenset(
     {
         "token_normalized_perplexity",
@@ -32,6 +34,8 @@ SUPPORTED_SCORING_TYPES = frozenset(
         "bleurt",
         "metricx24_source_qe",
         "gptscore_source_fluency",
+        "geval_gpt54mini_fluency",
+        "menlo_themis_fluency",
     }
 )
 
@@ -360,6 +364,13 @@ def score_custom_dataset(
     gptscore_device_map: str | None = None,
     gptscore_dtype: str = "auto",
     gptscore_tp_plan: str | None = "auto",
+    geval_cache_path: str | None = None,
+    themis_model_name: str = DEFAULT_THEMIS_MODEL,
+    themis_tensor_parallel_size: int = 1,
+    themis_max_model_len: int | None = None,
+    themis_max_tokens: int = 512,
+    themis_gpu_memory_utilization: float = 0.9,
+    themis_trust_remote_code: bool = False,
     max_tokens: int = 8192,
     device: str | None = None,
     methods: Iterable[str] | None = None,
@@ -404,6 +415,17 @@ def score_custom_dataset(
         include_originals=include_originals,
         reference_policy=reference_policy,
     )
+    selected_layer_hashes = {
+        f"{entry.method}:{entry.run_id}:{entry.target_layer}": {
+            "content_hash": entry.content_hash,
+            "config_hash": entry.config_hash,
+        }
+        for entry in repository.list_layers(
+            methods=methods,
+            run_ids=perturbation_run_ids,
+            target_layers=target_layers,
+        )
+    }
 
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
@@ -450,6 +472,75 @@ def score_custom_dataset(
             "MetricX-24 raw QE error is lower-is-better; stored value is its "
             "negation, so higher is better."
         )
+    elif scoring_type == "menlo_themis_fluency":
+        from clumsification_code.evals.inference.vllm_scorer import VLLMTextScorer
+
+        teacher = VLLMTextScorer(
+            themis_model_name,
+            tensor_parallel_size=themis_tensor_parallel_size,
+            max_model_len=themis_max_model_len,
+            max_tokens=themis_max_tokens,
+            temperature=0.0,
+            gpu_memory_utilization=themis_gpu_memory_utilization,
+            trust_remote_code=themis_trust_remote_code,
+            protocol="themis_direct_assessment.json",
+            rubric="menlo_fluency.json",
+            task="custom_dataset",
+            aspect="fluency",
+        )
+
+        def scorer(task_batch: Sequence[ScoreTask]) -> list[float]:
+            return teacher.score_texts(
+                [task.target_text for task in task_batch],
+                batch_size=batch_size,
+            ).tolist()
+
+        scorer_config = {
+            "model_name": themis_model_name,
+            "input_mode": "candidate_only",
+            "uses_reference": False,
+            "protocol": "themis_direct_assessment.json",
+            "protocol_id": "themis.direct_assessment.no_reference",
+            "protocol_version": "1",
+            "rubric": "menlo_fluency.json",
+            "rubric_id": "menlo.fluency",
+            "rubric_version": "1",
+            "parser": "themis_rating",
+            "temperature": 0.0,
+            "max_tokens": themis_max_tokens,
+        }
+        direction_description = "Themis 1-5 score with MENLO fluency rubric; higher is better."
+    elif scoring_type == "geval_gpt54mini_fluency":
+        from clumsification_code.evals.geval.scorer import GEvalScorer
+
+        teacher = GEvalScorer(
+            model_name=DEFAULT_GEVAL_MODEL,
+            cache_path=geval_cache_path,
+            task="custom_dataset",
+            aspect="fluency",
+            temperature=0.0,
+            n_samples=1,
+        )
+
+        def scorer(task_batch: Sequence[ScoreTask]) -> list[float]:
+            return teacher.score_texts(
+                [task.target_text for task in task_batch],
+                batch_size=batch_size,
+            ).tolist()
+
+        scorer_config = {
+            "model_name": DEFAULT_GEVAL_MODEL,
+            "input_mode": "candidate_only",
+            "uses_reference": False,
+            "protocol": "geval_json.json",
+            "protocol_id": "geval.no_reference",
+            "prompt_version": "geval_qe_no_reference_v2",
+            "parser": "json_score",
+            "cache_path": geval_cache_path,
+            "temperature": 0.0,
+            "n_samples": 1,
+        }
+        direction_description = "G-Eval 1-5 fluency score; higher is better."
     elif scoring_type == "gptscore_source_fluency":
         from clumsification_code.evals.inference.gptscore import (
             DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT,
@@ -575,6 +666,7 @@ def score_custom_dataset(
         "seed": seed,
         "selected_original_ids": selected_ids,
         "num_selected_originals": len(selected_ids),
+        "selected_layer_hashes": selected_layer_hashes,
         "num_candidate_tasks": len(tasks),
         "num_successful_scores": len(score_records),
         "num_failures": len(error_rows),
@@ -592,6 +684,8 @@ def score_custom_dataset(
             "bleurt": _package_version("BLEURT"),
             "torch": _package_version("torch"),
             "transformers": _package_version("transformers"),
+            "vllm": _package_version("vllm"),
+            "openai": _package_version("openai"),
         },
     }
     score_path, error_path, metadata_path = repository.write_scores(

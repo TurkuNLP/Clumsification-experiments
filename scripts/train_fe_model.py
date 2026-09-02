@@ -5,6 +5,7 @@ if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import json
+import inspect
 import os
 import time
 
@@ -33,6 +34,18 @@ from clumsification_code.fe.utils import (
 
 
 os.environ["WANDB_MODE"] = "disabled"
+
+
+def _compat_kwargs(callable_obj, kwargs: dict) -> dict:
+    """Keep the entrypoint usable across supported Transformers releases."""
+    parameters = inspect.signature(callable_obj).parameters
+    accepted = {name for name, parameter in parameters.items()
+                if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)}
+    filtered = {name: value for name, value in kwargs.items() if name in accepted}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        logger.warning("Ignoring unsupported Transformers arguments: %s", dropped)
+    return filtered
 
 
 def build_training_arguments(
@@ -112,7 +125,13 @@ def build_training_arguments(
         fsdp_config["transformer_layer_cls_to_wrap"] = args.fsdp_layer_cls
         training_kwargs["fsdp_config"] = fsdp_config
 
-    return TrainingArguments(**training_kwargs)
+    # `eval_strategy` replaced the older `evaluation_strategy` name.  The
+    # cluster's Transformers build is old enough that it may also lack newer
+    # fields such as `warmup_ratio`; filter against the actual constructor.
+    training_parameters = inspect.signature(TrainingArguments).parameters
+    if "eval_strategy" not in training_parameters and "evaluation_strategy" in training_parameters:
+        training_kwargs["evaluation_strategy"] = training_kwargs.pop("eval_strategy")
+    return TrainingArguments(**_compat_kwargs(TrainingArguments, training_kwargs))
 
 
 def log_dtype_counts(model) -> None:
@@ -179,6 +198,7 @@ def main():
         dataset_dict, regression_metadata = build_regression_dataset_dict(
             grouped_dataset_dict=dataset_dict,
             score_name=args.score_name,
+            exclude_layer_zero=args.exclude_layer_zero,
         )
     elif args.training_method == "pairwise":
         # Factorial pairwise datasets are already flat. Historical FE inputs
@@ -220,12 +240,23 @@ def main():
     if rank == 0:
         logger.info(f"Using parameter dtype: {param_dtype}")
 
-    model = FEModel(
-        model_name=args.model_name,
-        attn_implementation=args.attn_implementation,
-        param_dtype=param_dtype,
-        pooling=args.pooling,
-    )
+    if eval_only:
+        # Evaluation-only runs must use the trained encoder and scalar head,
+        # rather than silently constructing a fresh random head.
+        model = load_fe_model(
+            final_dir=args.model_name,
+            attn_implementation=args.attn_implementation,
+            param_dtype=param_dtype,
+            map_location="cpu",
+        )
+        model.to(dtype=param_dtype)
+    else:
+        model = FEModel(
+            model_name=args.model_name,
+            attn_implementation=args.attn_implementation,
+            param_dtype=param_dtype,
+            pooling=args.pooling,
+        )
     model.training_objective = args.training_method
     model.ranking_epsilon = args.epsilon
     model.ranking_scale = args.scale
@@ -290,32 +321,23 @@ def main():
         world_size=world_size,
     )
 
+    trainer_common = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": dev_dataset,
+        "data_collator": data_collator,
+        "processing_class": tokenizer,
+    }
     if args.training_method == "regression":
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=dev_dataset,
-            data_collator=data_collator,
-            processing_class=tokenizer,
-            compute_metrics=regression_metrics,
-        )
+        trainer_common["compute_metrics"] = regression_metrics
     elif args.training_method == "pairwise":
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=dev_dataset,
-            data_collator=data_collator,
-            processing_class=tokenizer,
-            compute_metrics=pairwise_metrics,
-        )
+        trainer_common["compute_metrics"] = pairwise_metrics
     else:
-        trainer = Trainer(
-            model=model, args=training_args, train_dataset=train_dataset,
-            eval_dataset=dev_dataset, data_collator=data_collator,
-            processing_class=tokenizer, compute_metrics=binary_metrics,
-        )
+        trainer_common["compute_metrics"] = binary_metrics
+    if "processing_class" not in inspect.signature(Trainer).parameters:
+        trainer_common["tokenizer"] = trainer_common.pop("processing_class")
+    trainer = Trainer(**_compat_kwargs(Trainer, trainer_common))
 
     if rank == 0:
         log_dtype_counts(model)

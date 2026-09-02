@@ -9,6 +9,7 @@ from clumsification_code.scoring.custom_dataset import (
     DEFAULT_METRICX_MODEL,
     DEFAULT_METRICX_TOKENIZER,
     DEFAULT_PPL_MODEL,
+    DEFAULT_GEVAL_MODEL,
     SUPPORTED_SCORING_TYPES,
 )
 from clumsification_code.perturbations.registry import list_method_specs
@@ -76,6 +77,17 @@ def parse_score_args():
     parser.add_argument("--gptscore-device-map", default=None)
     parser.add_argument("--gptscore-dtype", default="auto")
     parser.add_argument("--gptscore-tp-plan", default="auto")
+    parser.add_argument(
+        "--geval-cache-path",
+        default=None,
+        help="Optional JSON cache path for GPT-5.4-mini G-Eval responses.",
+    )
+    parser.add_argument("--themis-model-name", default="PKU-ONELab/Themis")
+    parser.add_argument("--themis-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--themis-max-model-len", type=int, default=None)
+    parser.add_argument("--themis-max-tokens", type=int, default=512)
+    parser.add_argument("--themis-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--themis-trust-remote-code", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument(
         "--device",

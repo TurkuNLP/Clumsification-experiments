@@ -11,7 +11,7 @@ from clumsification_code.evals.inference.fe import load_fe_inference_model
 from clumsification_code.evals.nlg_eval_loader import DEFAULT_NLG_EVAL_PATH
 from clumsification_code.evals.result_writer import EvalMetadata, write_results_jsonl
 from clumsification_code.evals.standalone_benchmarks import (
-    DEFAULT_ARGESSAY_PATH,
+    DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     DEFAULT_COHESENTIA_PATH,
     DEFAULT_ELLIPSE_PATH,
 )
@@ -77,7 +77,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     # explicit for reproducible FE and direct-evaluator runs.
     parser.add_argument("--nlg-eval-path", default=str(DEFAULT_NLG_EVAL_PATH))
     parser.add_argument("--ellipse-path", default=str(DEFAULT_ELLIPSE_PATH))
-    parser.add_argument("--argessay-path", default=str(DEFAULT_ARGESSAY_PATH))
+    parser.add_argument(
+        "--human-chatgpt-essays-path",
+        "--argessay-path",
+        dest="human_chatgpt_essays_path",
+        default=str(DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH),
+        help=(
+            "Herbold et al. (2023) human/ChatGPT essay-comparison CSV. "
+            "--argessay-path is a deprecated compatibility spelling."
+        ),
+    )
     parser.add_argument("--cohesentia-path", default=str(DEFAULT_COHESENTIA_PATH))
     parser.add_argument(
         "--skip-preferences",
@@ -287,7 +296,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_length=args.max_length,
         nlg_eval_path=args.nlg_eval_path,
         ellipse_path=args.ellipse_path,
-        argessay_path=args.argessay_path,
+        human_chatgpt_essays_path=args.human_chatgpt_essays_path,
         cohesentia_path=args.cohesentia_path,
         skip_preferences=args.skip_preferences,
         max_records_per_dimension=args.max_records_per_dimension,

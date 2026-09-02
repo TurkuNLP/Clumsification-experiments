@@ -138,6 +138,39 @@ python scripts/score_custom_dataset.py \
 parent candidate. Score files retain both candidate and reference identities.
 All stored scores are higher-is-better.
 
+The custom-dataset scorer also supports `geval_gpt54mini_fluency`, which uses
+the existing G-Eval scorer with the pinned GPT-5.4-mini snapshot, and
+`menlo_themis_fluency`, which uses the Themis vLLM scorer with the MENLO
+five-point fluency rubric. Both score candidates only; their prompt, rubric,
+model, parser, and decoding settings are retained in score-run metadata.
+
+For example, G-Eval scoring uses the pinned GPT-5.4-mini judge and an optional
+response cache:
+
+```bash
+python scripts/score_custom_dataset.py \
+  --dataset-name my_dataset \
+  --scoring-type geval_gpt54mini_fluency \
+  --scoring-run-id geval-gpt54mini-v1 \
+  --geval-cache-path data/evals/my_dataset_geval_cache.json
+```
+
+The Themis/MENLO scorer runs locally through vLLM:
+
+```bash
+python scripts/score_custom_dataset.py \
+  --dataset-name my_dataset \
+  --scoring-type menlo_themis_fluency \
+  --scoring-run-id menlo-themis-v1 \
+  --themis-model-name PKU-ONELab/Themis \
+  --themis-tensor-parallel-size 1
+```
+
+These custom-dataset commands score candidate text only. They do not pass the
+original or parent text to either judge, even when `--reference-policy` is
+used for score provenance. The reference policy controls stored candidate
+identity only.
+
 ## Build a Hugging Face dataset
 
 The standalone builder accepts canonical CLI fields or an `HFBuildSpec` JSON

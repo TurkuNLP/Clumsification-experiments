@@ -10,10 +10,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Iterator
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from .schemas import GenerationRuntime, PerturbationInput, PerturbationResult
 from .rule_based_multilingual import (
@@ -24,6 +27,32 @@ from .rule_based_multilingual import (
 from .english_fluency import EnglishFluencyRulePerturber
 from .morphology import load_morphology_backend, morphology_backend_name
 from .unieval_fluency import apply_unieval_disfluency
+
+
+_TRADITIONAL_WORKER: "TraditionalMethodAdapter | None" = None
+
+
+def _init_traditional_worker(method_name: str, config: dict[str, Any]) -> None:
+    global _TRADITIONAL_WORKER
+    adapter_type = {
+        "trad_single": TraditionalSingleMethod,
+        "trad_multi": TraditionalMultiMethod,
+        "unieval": UniEvalMethod,
+        "unieval_trad": UniEvalTraditionalMethod,
+    }[method_name]
+    _TRADITIONAL_WORKER = adapter_type(config)
+
+
+def _generate_traditional_item(
+    index: int, item: PerturbationInput
+) -> tuple[int, PerturbationResult]:
+    if _TRADITIONAL_WORKER is None:
+        raise RuntimeError("Traditional worker was not initialized")
+    seed = _input_seed(
+        int(_TRADITIONAL_WORKER.config.get("seed", 42)), item, index
+    )
+    output, edits = _TRADITIONAL_WORKER._apply(item.text, seed=seed)
+    return index, _TRADITIONAL_WORKER._result(item, output, edits, seed)
 
 @dataclass(frozen=True)
 class TraditionalOperation:
@@ -178,13 +207,28 @@ class TraditionalSingle:
     ) -> tuple[str, list[str]]:
         rng = random.Random(seed)
         available = traditional_operations_for_language(self.editor.language)
-        name = operation or rng.choice([item.name for item in available])
-        output = self.editor.apply(
-            text, name, seed=seed, item_metadata=item_metadata
-        )
-        if output.strip() == text.strip():
-            raise RuntimeError(f"Traditional operation {name!r} produced no change")
-        return output, [name]
+        if operation is not None:
+            output = self.editor.apply(
+                text, operation, seed=seed, item_metadata=item_metadata
+            )
+            if output.strip() == text.strip():
+                raise RuntimeError(
+                    f"Traditional operation {operation!r} produced no change"
+                )
+            return output, [operation]
+
+        # Some operations are inherently inapplicable to individual texts
+        # (for example, drop_adjectives when no adjective is present). Try
+        # each sampled operation at most once instead of failing the layer.
+        names = [item.name for item in available]
+        rng.shuffle(names)
+        for name in names:
+            output = self.editor.apply(
+                text, name, seed=seed, item_metadata=item_metadata
+            )
+            if output.strip() != text.strip():
+                return output, [name]
+        raise RuntimeError("No traditional operation produced a change")
 
 
 class TraditionalMulti:
@@ -332,13 +376,36 @@ class TraditionalMethodAdapter:
         items: list[PerturbationInput],
         runtime: GenerationRuntime | None = None,
     ) -> list[PerturbationResult]:
-        base_seed = int(self.config.get("seed", 42))
-        results = []
-        for index, item in enumerate(items):
-            seed = _input_seed(base_seed, item, index)
-            output, edits = self._apply(item.text, seed=seed)
-            results.append(self._result(item, output, edits, seed))
-        return results
+        target_layer = int(self.config.get("target_layer", 1))
+        if not items:
+            return []
+        n_jobs = max(1, min(int(self.config.get("n_jobs", os.cpu_count() or 1)), len(items)))
+        results: list[PerturbationResult | None] = [None] * len(items)
+        if n_jobs == 1:
+            for index, item in enumerate(items):
+                seed = _input_seed(int(self.config.get("seed", 42)), item, index)
+                output, edits = self._apply(item.text, seed=seed)
+                results[index] = self._result(item, output, edits, seed)
+            return [result for result in results if result is not None]
+        with ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_init_traditional_worker,
+            initargs=(self.name, self.config),
+        ) as executor:
+            futures = [
+                executor.submit(_generate_traditional_item, index, item)
+                for index, item in enumerate(items)
+            ]
+            with tqdm(
+                total=len(items),
+                desc=f"Generating {self.name} layer {target_layer}",
+                unit="item",
+            ) as progress:
+                for future in as_completed(futures):
+                    index, result = future.result()
+                    results[index] = result
+                    progress.update(1)
+        return [result for result in results if result is not None]
 
     def _apply(self, text: str, *, seed: int) -> tuple[str, list[str]]:
         raise NotImplementedError
@@ -397,12 +464,18 @@ class UniEvalTraditionalMethod(TraditionalMethodAdapter):
         return f"unieval+{suffix}" if suffix else "unieval"
 
     def _apply(self, text: str, *, seed: int) -> tuple[str, list[str]]:
+        operations = self.config.get("operations")
+        if operations is None and self.editor.language == "eng":
+            # This method is UniEval noise plus the two intended English
+            # Lemminflect morphology edits; unrelated traditional rules are
+            # not part of its default semantics.
+            operations = ["subject_verb_dis", "random_inflection"]
         return UniEvalTraditional(self.editor).apply(
             text,
             seed=seed,
             n_noise=int(self.config.get("n_noise", 1)),
             n_edits=int(self.config.get("n_edits", 1)),
-            operations=self.config.get("operations"),
+            operations=operations,
         )
 
 
