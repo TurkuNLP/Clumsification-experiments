@@ -33,10 +33,9 @@ python scripts/build_hf_dataset.py \
 ```
 
 For regression training, add `--exclude-layer-zero` to omit original texts
-from the flattened train/dev/test rows. LLM generation retains the historical
-length bucketing by default; set `bucket_policy` to `rendered_prompt` in the
-method configuration to bucket using rendered prompt tokens plus the output
-budget.
+from the flattened train/dev/test rows. LLM generation uses the historical
+text-length buckets and derives the context and output limits automatically
+for each bucket.
 
 Run generation and HF construction from one configuration:
 

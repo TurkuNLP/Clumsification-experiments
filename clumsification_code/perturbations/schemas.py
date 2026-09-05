@@ -30,6 +30,14 @@ class SkippedGeneration:
 
 
 @dataclass(frozen=True)
+class SkippedPerturbation:
+    """Marker for one input that exhausted method-level retries."""
+
+    reason: str
+    attempts: int
+
+
+@dataclass(frozen=True)
 class GenerationRuntime:
     """Optional execution dependencies supplied by the generation service."""
 
@@ -59,8 +67,7 @@ class GenerationRuntime:
                     self.chat_runner(
                         str(model), prompts, temperature, max_tokens,
                         max_model_len=int(config.get("max_model_len", 32768)),
-                        safety_margin=int(config.get("context_safety_margin", 256)),
-                        bucket_policy=str(config.get("bucket_policy", "legacy_text_length")),
+                        seed=int(config.get("sampling_seed", config.get("seed", 42))),
                 )
             )
         else:
@@ -80,7 +87,7 @@ class PerturbationInput:
 
     dataset_name: str
     base_text_id: str
-    text: str
+    text: str | SkippedGeneration | SkippedPerturbation
     source_layer: int = 0
     source_method: str | None = None
     source_run_id: str | None = None

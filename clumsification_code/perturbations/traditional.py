@@ -18,7 +18,12 @@ from typing import Any, Callable, Iterator
 import numpy as np
 from tqdm.auto import tqdm
 
-from .schemas import GenerationRuntime, PerturbationInput, PerturbationResult
+from .schemas import (
+    GenerationRuntime,
+    PerturbationInput,
+    PerturbationResult,
+    SkippedPerturbation,
+)
 from .rule_based_multilingual import (
     MultilingualRulePerturber,
     build_rule_templates,
@@ -30,6 +35,10 @@ from .unieval_fluency import apply_unieval_disfluency
 
 
 _TRADITIONAL_WORKER: "TraditionalMethodAdapter | None" = None
+
+
+class TraditionalNoChangeError(RuntimeError):
+    """A valid traditional operation was inapplicable to one input."""
 
 
 def _init_traditional_worker(method_name: str, config: dict[str, Any]) -> None:
@@ -48,11 +57,7 @@ def _generate_traditional_item(
 ) -> tuple[int, PerturbationResult]:
     if _TRADITIONAL_WORKER is None:
         raise RuntimeError("Traditional worker was not initialized")
-    seed = _input_seed(
-        int(_TRADITIONAL_WORKER.config.get("seed", 42)), item, index
-    )
-    output, edits = _TRADITIONAL_WORKER._apply(item.text, seed=seed)
-    return index, _TRADITIONAL_WORKER._result(item, output, edits, seed)
+    return index, _TRADITIONAL_WORKER._generate_item(item, index=index)
 
 @dataclass(frozen=True)
 class TraditionalOperation:
@@ -212,7 +217,7 @@ class TraditionalSingle:
                 text, operation, seed=seed, item_metadata=item_metadata
             )
             if output.strip() == text.strip():
-                raise RuntimeError(
+                raise TraditionalNoChangeError(
                     f"Traditional operation {operation!r} produced no change"
                 )
             return output, [operation]
@@ -228,7 +233,7 @@ class TraditionalSingle:
             )
             if output.strip() != text.strip():
                 return output, [name]
-        raise RuntimeError("No traditional operation produced a change")
+        raise TraditionalNoChangeError("No traditional operation produced a change")
 
 
 class TraditionalMulti:
@@ -279,7 +284,7 @@ class TraditionalMulti:
                 current = output
                 applied.append(name)
         if not applied:
-            raise RuntimeError("Traditional operations produced no change")
+            raise TraditionalNoChangeError("Traditional operations produced no change")
         return current, applied
 
 
@@ -371,6 +376,28 @@ class TraditionalMethodAdapter:
                 backends.append(backend)
         return "+".join(backends)
 
+    def _generate_item(
+        self, item: PerturbationInput, *, index: int
+    ) -> PerturbationResult:
+        max_attempts = int(self.config.get("max_attempts", 100))
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        base_seed = _input_seed(int(self.config.get("seed", 42)), item, index)
+        for attempt in range(max_attempts):
+            seed = base_seed + attempt
+            try:
+                output, edits = self._apply(item.text, seed=seed)
+            except TraditionalNoChangeError:
+                continue
+            if output.strip() != item.text.strip():
+                return self._result(item, output, edits, seed)
+        return self._result(
+            item,
+            SkippedPerturbation(reason="no_change", attempts=max_attempts),
+            [],
+            base_seed + max_attempts - 1,
+        )
+
     def generate(
         self,
         items: list[PerturbationInput],
@@ -383,9 +410,7 @@ class TraditionalMethodAdapter:
         results: list[PerturbationResult | None] = [None] * len(items)
         if n_jobs == 1:
             for index, item in enumerate(items):
-                seed = _input_seed(int(self.config.get("seed", 42)), item, index)
-                output, edits = self._apply(item.text, seed=seed)
-                results[index] = self._result(item, output, edits, seed)
+                results[index] = self._generate_item(item, index=index)
             return [result for result in results if result is not None]
         with ProcessPoolExecutor(
             max_workers=n_jobs,
@@ -437,22 +462,15 @@ class UniEvalMethod(TraditionalMethodAdapter):
         return "unieval"
 
     def _apply(self, text: str, *, seed: int) -> tuple[str, list[str]]:
-        max_attempts = int(self.config.get("max_attempts", 100))
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
-        for attempt in range(max_attempts):
-            attempt_seed = seed + attempt
-            output, edits = apply_unieval_disfluency(
-                text,
-                n_noise=int(self.config.get("n_noise", 1)),
-                python_rng=random.Random(attempt_seed),
-                numpy_rng=np.random.default_rng(attempt_seed),
-            )
-            if output.strip() != text.strip():
-                return output, [str(edit["transform_type"]) for edit in edits]
-        raise RuntimeError(
-            f"UniEval produced no change after {max_attempts} deterministic attempts"
+        output, edits = apply_unieval_disfluency(
+            text,
+            n_noise=int(self.config.get("n_noise", 1)),
+            python_rng=random.Random(seed),
+            numpy_rng=np.random.default_rng(seed),
         )
+        if output.strip() == text.strip():
+            raise TraditionalNoChangeError("UniEval produced no change")
+        return output, [str(edit["transform_type"]) for edit in edits]
 
 
 class UniEvalTraditionalMethod(TraditionalMethodAdapter):

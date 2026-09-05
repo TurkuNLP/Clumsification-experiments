@@ -49,15 +49,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32768,
         help=(
-            "Absolute maximum rendered LLM request length in tokens. "
-            "Bucketing and over-limit filtering are applied by the LLM runner."
+            "Absolute context ceiling. Text bucketing and generation limits "
+            "are derived automatically by the LLM runner."
         ),
-    )
-    parser.add_argument(
-        "--bucket-policy",
-        choices=["legacy_text_length", "rendered_prompt"],
-        default=None,
-        help="LLM context bucketing policy; legacy_text_length preserves historical behavior.",
     )
     parser.add_argument("--method-config", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -70,6 +64,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--severity", default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--allow-unchanged", action="store_true", default=None)
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Additional per-entry retries for invalid LLM outputs (default: 3).",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="Per-entry attempts for traditional perturbations (default: 100).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.source_layer < 0:
@@ -89,7 +95,6 @@ def main() -> None:
                 "language": args.language,
                 "model": args.model_path,
                 "max_model_len": args.max_model_len,
-                "bucket_policy": args.bucket_policy,
                 "seed": args.seed,
                 "n_noise": args.n_noise,
                 "n_edits": args.n_edits,
@@ -99,6 +104,8 @@ def main() -> None:
                 "target_dimensions": args.target_dimensions,
                 "severity": args.severity,
                 "allow_unchanged": args.allow_unchanged,
+                "max_retries": args.max_retries,
+                "max_attempts": args.max_attempts,
             }.items()
             if value is not None
         }

@@ -21,7 +21,13 @@ from clumsification_code.data.schemas import (
 )
 
 from .registry import get_method_spec
-from .schemas import ChatRunner, GenerationRuntime, PerturbationInput, SkippedGeneration
+from .schemas import (
+    ChatRunner,
+    GenerationRuntime,
+    PerturbationInput,
+    SkippedGeneration,
+    SkippedPerturbation,
+)
 
 
 class GenerationValidationError(ValueError):
@@ -33,16 +39,21 @@ LEGACY_PROMPT_OVERHEAD = 512
 
 
 def _legacy_bucket_params(text_bucket: int) -> tuple[int, int]:
-    """Return the legacy context and output limits for a text bucket."""
-    thinking = max(1024, int(text_bucket * 0.45))
-    total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + thinking + 128
+    """Return legacy context sizing and a no-thinking output allowance."""
+    # Keep the original reserved headroom when sizing the context. Besides
+    # reasoning, that headroom protects the variable sampled-operation prompt
+    # from overflowing its bucket. It is deliberately not made available to
+    # generation now that thinking is disabled.
+    reserved_headroom = max(1024, int(text_bucket * 0.45))
+    total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + reserved_headroom + 128
     if total > 4000:
-        thinking = 4096
-        total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + thinking + 128
+        reserved_headroom = 4096
+        total = LEGACY_PROMPT_OVERHEAD + text_bucket + text_bucket + reserved_headroom + 128
+    output_tokens = text_bucket + 256
     model_len = 1
     while model_len < total:
         model_len *= 2
-    return model_len, text_bucket + thinking + 256
+    return model_len, output_tokens
 
 
 def _source_text_from_prompt(messages: list[dict[str, str]]) -> str:
@@ -99,79 +110,82 @@ def plan_context_buckets(
     prompts: list[list[dict[str, str]]],
     *,
     max_model_len: int,
-    max_tokens: int,
     tokenizer: Any | None = None,
-    safety_margin: int = 256,
-    bucket_policy: str = "legacy_text_length",
 ) -> tuple[dict[int, list[int]], list[dict[str, int]]]:
-    """Assign prompts to automatic context buckets and report over-limit items.
+    """Assign prompts using the original text-length bucket implementation.
 
     Returned bucket values contain original prompt indices. Over-limit entries
     contain their index and measured lengths, allowing the execution layer to
     skip them without changing the order of eligible requests.
     """
-    if max_tokens < 1:
-        raise ValueError("max_tokens must be a positive integer")
-    if safety_margin < 0:
-        raise ValueError("safety_margin must be non-negative")
-    if bucket_policy not in {"legacy_text_length", "rendered_prompt"}:
-        raise ValueError("bucket_policy must be 'legacy_text_length' or 'rendered_prompt'")
-    planned: dict[int, list[int]] = {}
-    skipped: list[dict[str, int]] = []
+    groups, skipped = _plan_legacy_bucket_groups(
+        model, prompts, max_model_len=max_model_len, tokenizer=tokenizer
+    )
+    return {
+        model_len: list(group["indices"])
+        for model_len, group in groups.items()
+    }, skipped
+
+
+def _plan_legacy_bucket_groups(
+    model: str,
+    prompts: list[list[dict[str, str]]],
+    *,
+    max_model_len: int,
+    tokenizer: Any | None = None,
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, int]]]:
+    """Return merged legacy buckets including their automatic output limits."""
+    if max_model_len < 1:
+        raise ValueError("max_model_len must be a positive integer")
     if tokenizer is None:
         try:
             from transformers import AutoTokenizer
         except ImportError as exc:
             raise RuntimeError("LLM length estimation requires transformers") from exc
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    raw_buckets: dict[int, list[tuple[int, int]]] = {}
     for index, messages in enumerate(prompts):
-        if bucket_policy == "rendered_prompt":
-            if hasattr(tokenizer, "apply_chat_template"):
-                rendered = tokenizer.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=True
-                )
-            else:
-                rendered = tokenizer(
-                    "\n".join(str(message.get("content", "")) for message in messages),
-                    add_special_tokens=True,
-                )["input_ids"]
-            prompt_tokens = len(rendered)
-            required_tokens = prompt_tokens + max_tokens + safety_margin
-            bucket = next(
-                (boundary for boundary in _automatic_context_buckets(max_model_len)
-                 if boundary >= required_tokens),
-                None,
-            )
-            if bucket is None:
-                skipped.append({"prompt_index": index, "prompt_tokens": prompt_tokens,
-                                "required_tokens": required_tokens})
-            else:
-                planned.setdefault(bucket, []).append(index)
-            continue
-        text_tokens = len(tokenizer(_source_text_from_prompt(messages), add_special_tokens=True)["input_ids"])
+        text_tokens = len(
+            tokenizer(
+                _source_text_from_prompt(messages), add_special_tokens=False
+            )["input_ids"]
+        )
         text_bucket = next((boundary for boundary in LEGACY_TEXT_BUCKETS if text_tokens <= boundary), None)
         if text_bucket is None:
-            text_bucket = LEGACY_TEXT_BUCKETS[-1]
-            model_len, bucket_tokens = _legacy_bucket_params(text_bucket)
-            skipped.append({"prompt_index": index, "prompt_tokens": text_tokens, "required_tokens": model_len + 1})
-            continue
-        model_len, bucket_tokens = _legacy_bucket_params(text_bucket)
-        required_tokens = model_len
-        if required_tokens > max_model_len:
-            skipped.append(
+            text_bucket = 1
+            while text_bucket < text_tokens:
+                text_bucket *= 2
+        raw_buckets.setdefault(text_bucket, []).append((index, text_tokens))
+
+    groups: dict[int, dict[str, Any]] = {}
+    skipped: list[dict[str, int]] = []
+    for text_bucket in sorted(raw_buckets):
+        model_len, output_tokens = _legacy_bucket_params(text_bucket)
+        entries = raw_buckets[text_bucket]
+        if model_len > max_model_len:
+            skipped.extend(
                 {
                     "prompt_index": index,
                     "prompt_tokens": text_tokens,
-                    "required_tokens": required_tokens,
+                    "required_tokens": model_len,
                 }
+                for index, text_tokens in entries
             )
-        else:
-            planned.setdefault(model_len, []).append(index)
-    return {bucket: indices for bucket, indices in planned.items() if indices}, skipped
+            continue
+        group = groups.setdefault(
+            model_len,
+            {"indices": [], "text_buckets": [], "max_tokens": 0},
+        )
+        group["indices"].extend(index for index, _ in entries)
+        group["text_buckets"].append(text_bucket)
+        group["max_tokens"] = max(group["max_tokens"], output_tokens)
+    return groups, skipped
 
 
 def _parse_vllm_text(output: Any) -> str:
     text = str(output.outputs[0].text)
+    if "<think>" in text and "</think>" not in text:
+        return ""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     if "</think>" in text:
         text = text.rsplit("</think>", 1)[1]
@@ -185,8 +199,7 @@ def run_vllm(
     max_tokens: int,
     *,
     max_model_len: int = 32768,
-    safety_margin: int = 256,
-    bucket_policy: str = "legacy_text_length",
+    seed: int = 42,
 ) -> Sequence[str]:
     """Execute prompts sequentially in automatically sized vLLM buckets."""
     try:
@@ -194,21 +207,24 @@ def run_vllm(
         from vllm import LLM, SamplingParams
     except ImportError as exc:
         raise RuntimeError("LLM methods require vLLM and torch") from exc
-    plan, skipped = plan_context_buckets(
+    groups, skipped = _plan_legacy_bucket_groups(
         model_path,
         prompts,
         max_model_len=max_model_len,
-        max_tokens=max_tokens,
-        safety_margin=safety_margin,
-        bucket_policy=bucket_policy,
     )
     run_vllm.last_context_stats = {
-        "bucket_counts": {str(bucket): len(indices) for bucket, indices in plan.items()},
+        "bucket_counts": {
+            str(bucket): len(group["indices"])
+            for bucket, group in groups.items()
+        },
         "skipped_over_length_count": len(skipped),
     }
     print(
         "[vLLM] context buckets: "
-        + ", ".join(f"{bucket}={len(indices)}" for bucket, indices in plan.items())
+        + ", ".join(
+            f"{bucket}={len(group['indices'])} (max_tokens={group['max_tokens']})"
+            for bucket, group in groups.items()
+        )
         + f"; skipped_over_limit={len(skipped)}",
         flush=True,
     )
@@ -218,7 +234,8 @@ def run_vllm(
             prompt_tokens=entry["prompt_tokens"],
             required_tokens=entry["required_tokens"],
         )
-    for bucket, indices in plan.items():
+    for bucket, group in groups.items():
+        indices = group["indices"]
         llm = LLM(
             model=model_path,
             max_model_len=bucket,
@@ -227,7 +244,10 @@ def run_vllm(
         )
         bucket_outputs = llm.chat(
             [prompts[index] for index in indices],
-            sampling_params=SamplingParams(max_tokens=max_tokens, temperature=temperature),
+            sampling_params=SamplingParams(
+                max_tokens=group["max_tokens"], temperature=temperature, seed=seed
+            ),
+            chat_template_kwargs={"enable_thinking": False},
         )
         for index, output in zip(indices, bucket_outputs):
             results[index] = _parse_vllm_text(output)
@@ -356,22 +376,20 @@ class PerturbationGenerationService:
         }
         if spec.perturbation_source == "LLM":
             max_model_len = int(method_config.get("max_model_len", 32768))
-            max_tokens = int(method_config.get("max_tokens", 2048))
-            safety_margin = int(method_config.get("context_safety_margin", 256))
-            if max_model_len < 1 or max_tokens < 1:
-                raise ValueError("LLM context and output limits must be positive")
+            if max_model_len < 1:
+                raise ValueError("LLM context limit must be positive")
             persisted_config["max_model_len"] = max_model_len
-            persisted_config["max_tokens"] = max_tokens
-            persisted_config["context_safety_margin"] = safety_margin
-            bucket_policy = str(method_config.get("bucket_policy", "legacy_text_length"))
-            if bucket_policy not in {"legacy_text_length", "rendered_prompt"}:
-                raise ValueError(
-                    "bucket_policy must be 'legacy_text_length' or 'rendered_prompt'"
-                )
-            persisted_config["bucket_policy"] = bucket_policy
-            persisted_config["context_buckets"] = list(
-                _automatic_context_buckets(max_model_len)
-            )
+            max_retries = int(method_config.get("max_retries", 3))
+            if max_retries < 0:
+                raise ValueError("max_retries must be non-negative")
+            method_config["max_retries"] = max_retries
+            persisted_config["max_retries"] = max_retries
+        elif spec.perturbation_source == "trad":
+            max_attempts = int(method_config.get("max_attempts", 100))
+            if max_attempts < 1:
+                raise ValueError("max_attempts must be at least 1")
+            method_config["max_attempts"] = max_attempts
+            persisted_config["max_attempts"] = max_attempts
         canonical_json_hash(persisted_config)
         destination = self.repository.layer_path(method, run_id, resolved_target)
         if not overwrite:
@@ -390,20 +408,81 @@ class PerturbationGenerationService:
             source_run_id=resolved_source_run_id,
             limit=limit,
         )
-        adapter = spec.create(method_config)
-        results = list(
-            adapter.generate(items, GenerationRuntime(chat_runner=self.llm_runner))
-        )
         parent_base_ids: dict[str, str] = {}
         for item in items:
             candidate_id = item.candidate_id
             if candidate_id is None or candidate_id in parent_base_ids:
                 raise ValueError("Generation inputs must have unique candidate identities")
             parent_base_ids[candidate_id] = item.base_text_id
+        input_by_parent = {str(item.candidate_id): item for item in items}
+        adapter = spec.create(method_config)
+        runtime = GenerationRuntime(chat_runner=self.llm_runner)
+        context_bucket_counts: dict[str, int] = defaultdict(int)
+
+        def record_context_stats() -> None:
+            stats = getattr(self.llm_runner, "last_context_stats", None)
+            if not isinstance(stats, dict):
+                return
+            for bucket, count in stats.get("bucket_counts", {}).items():
+                context_bucket_counts[str(bucket)] += int(count)
+
+        results = list(adapter.generate(items, runtime))
+        record_context_stats()
+
+        retry_counts: dict[str, int] = defaultdict(int)
+        if spec.perturbation_source == "LLM" and max_retries:
+            for attempt in range(1, max_retries + 1):
+                retry_parent_ids: set[str] = set()
+                for result in results:
+                    parent_id = str(result.parent_candidate_id)
+                    item = input_by_parent.get(parent_id)
+                    if item is None or isinstance(result.text, SkippedGeneration):
+                        continue
+                    invalid = not isinstance(result.text, str) or not result.text.strip()
+                    if (
+                        not invalid
+                        and not allow_unchanged
+                        and result.text.strip() == item.text.strip()
+                    ):
+                        invalid = True
+                    max_output_chars = result.metadata.get("max_output_chars")
+                    if max_output_chars is not None:
+                        if (
+                            isinstance(max_output_chars, bool)
+                            or not isinstance(max_output_chars, int)
+                            or max_output_chars < 1
+                        ):
+                            raise GenerationValidationError(
+                                "max_output_chars must be a positive integer"
+                            )
+                        invalid = invalid or len(result.text) > max_output_chars
+                    if invalid:
+                        retry_parent_ids.add(parent_id)
+                if not retry_parent_ids:
+                    break
+                pending = [
+                    item for item in items if str(item.candidate_id) in retry_parent_ids
+                ]
+                # A distinct sampling seed prevents a newly constructed vLLM
+                # engine from deterministically reproducing the failed answer.
+                adapter.config["sampling_seed"] = int(method_config["seed"]) + attempt
+                replacements = list(adapter.generate(pending, runtime))
+                record_context_stats()
+                replacement_by_parent = {
+                    str(result.parent_candidate_id): result for result in replacements
+                }
+                if set(replacement_by_parent) != retry_parent_ids:
+                    raise ValueError("LLM retry did not return exactly one result per input")
+                results = [
+                    replacement_by_parent.get(str(result.parent_candidate_id), result)
+                    for result in results
+                ]
+                for parent_id in retry_parent_ids:
+                    retry_counts[parent_id] += 1
         candidate_counts: dict[str, int] = defaultdict(int)
         candidates = []
         skipped_over_length: list[dict[str, Any]] = []
-        input_by_parent = {str(item.candidate_id): item for item in items}
+        skipped_invalid_output: list[dict[str, Any]] = []
         for result in results:
             parent_id = result.parent_candidate_id
             if parent_id not in parent_base_ids:
@@ -414,6 +493,16 @@ class PerturbationGenerationService:
                         "parent_candidate_id": parent_id,
                         "prompt_tokens": result.text.prompt_tokens,
                         "required_tokens": result.text.required_tokens,
+                    }
+                )
+                continue
+            if isinstance(result.text, SkippedPerturbation):
+                skipped_invalid_output.append(
+                    {
+                        "parent_candidate_id": parent_id,
+                        "reason": result.text.reason,
+                        "retry_attempts": result.text.attempts - 1,
+                        "attempts": result.text.attempts,
                     }
                 )
                 continue
@@ -444,14 +533,24 @@ class PerturbationGenerationService:
                     "Generated result provenance does not match the request"
                 )
             if not isinstance(result.text, str) or not result.text.strip():
-                raise GenerationValidationError(
-                    f"Method returned empty output for parent {parent_id!r}"
+                skipped_invalid_output.append(
+                    {
+                        "parent_candidate_id": parent_id,
+                        "reason": "empty_output",
+                        "retry_attempts": retry_counts.get(parent_id, 0),
+                    }
                 )
+                continue
             source_text = input_by_parent[parent_id].text
             if not allow_unchanged and result.text.strip() == source_text.strip():
-                raise GenerationValidationError(
-                    f"Method returned unchanged output for parent {parent_id!r}"
+                skipped_invalid_output.append(
+                    {
+                        "parent_candidate_id": parent_id,
+                        "reason": "unchanged_output",
+                        "retry_attempts": retry_counts.get(parent_id, 0),
+                    }
                 )
+                continue
             max_output_chars = result.metadata.get("max_output_chars")
             if max_output_chars is not None:
                 if (
@@ -463,10 +562,21 @@ class PerturbationGenerationService:
                         "max_output_chars must be a positive integer"
                     )
                 if len(result.text) > max_output_chars:
-                    raise GenerationValidationError(
-                        f"Output for parent {parent_id!r} exceeds its "
-                        f"{max_output_chars}-character limit"
+                    # Output length is controlled by the model, so an isolated
+                    # refusal to follow this prompt constraint must not discard
+                    # every valid generation in a large batch. Treat it like an
+                    # over-context request: omit the candidate and preserve an
+                    # auditable reason in the layer configuration.
+                    skipped_invalid_output.append(
+                        {
+                            "parent_candidate_id": parent_id,
+                            "reason": "max_output_chars_exceeded",
+                            "output_chars": len(result.text),
+                            "max_output_chars": max_output_chars,
+                            "retry_attempts": retry_counts.get(parent_id, 0),
+                        }
                     )
+                    continue
             candidate_index = candidate_counts[parent_id]
             candidate_counts[parent_id] += 1
             metadata = dict(result.metadata)
@@ -506,22 +616,26 @@ class PerturbationGenerationService:
                     metadata=metadata,
                 )
             )
-        skipped_ids = {entry["parent_candidate_id"] for entry in skipped_over_length}
+        skipped_ids = {
+            entry["parent_candidate_id"]
+            for entry in [*skipped_over_length, *skipped_invalid_output]
+        }
         if set(candidate_counts) | skipped_ids != set(parent_base_ids):
             missing = len(set(parent_base_ids) - set(candidate_counts) - skipped_ids)
             raise ValueError(f"Generated layer has no candidate for {missing} input parent(s)")
         if skipped_over_length:
             persisted_config["skipped_over_length_count"] = len(skipped_over_length)
             persisted_config["skipped_over_length"] = skipped_over_length
-        execution_stats = getattr(self.llm_runner, "last_context_stats", None)
-        if spec.perturbation_source == "LLM" and isinstance(execution_stats, dict):
-            persisted_config.update(
-                {
-                    key: value
-                    for key, value in execution_stats.items()
-                    if key == "bucket_counts"
-                }
+        if skipped_invalid_output:
+            persisted_config["skipped_invalid_output_count"] = len(
+                skipped_invalid_output
             )
+            persisted_config["skipped_invalid_output"] = skipped_invalid_output
+        if retry_counts:
+            persisted_config["retried_input_count"] = len(retry_counts)
+            persisted_config["retry_attempt_count"] = sum(retry_counts.values())
+        if spec.perturbation_source == "LLM" and context_bucket_counts:
+            persisted_config["bucket_counts"] = dict(context_bucket_counts)
         return self.repository.write_candidate_layer(
             candidates,
             method=method,
