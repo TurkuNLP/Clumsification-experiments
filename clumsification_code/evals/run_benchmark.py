@@ -79,13 +79,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ellipse-path", default=str(DEFAULT_ELLIPSE_PATH))
     parser.add_argument(
         "--human-chatgpt-essays-path",
-        "--argessay-path",
-        dest="human_chatgpt_essays_path",
         default=str(DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH),
-        help=(
-            "Herbold et al. (2023) human/ChatGPT essay-comparison CSV. "
-            "--argessay-path is a deprecated compatibility spelling."
-        ),
+        help="Herbold et al. (2023) human/ChatGPT essay-comparison CSV.",
     )
     parser.add_argument("--cohesentia-path", default=str(DEFAULT_COHESENTIA_PATH))
     parser.add_argument(

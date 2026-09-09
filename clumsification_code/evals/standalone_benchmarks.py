@@ -197,20 +197,14 @@ def iter_standalone_records(
     *,
     ellipse_path: Optional[Path] = None,
     human_chatgpt_essays_path: Optional[Path] = None,
-    argessay_path: Optional[Path] = None,
     cohesentia_path: Optional[Path] = None,
     include_mteb_summeval: bool = True,
 ) -> Iterator[Dict[str, object]]:
     """Yield records from whichever standalone sources were requested."""
     if ellipse_path is not None:
         yield from iter_ellipse_records(ellipse_path)
-    if human_chatgpt_essays_path is not None and argessay_path is not None:
-        raise ValueError(
-            "Pass human_chatgpt_essays_path, not both it and deprecated argessay_path"
-        )
-    essay_path = human_chatgpt_essays_path or argessay_path
-    if essay_path is not None:
-        yield from iter_human_chatgpt_essay_records(essay_path)
+    if human_chatgpt_essays_path is not None:
+        yield from iter_human_chatgpt_essay_records(human_chatgpt_essays_path)
     if cohesentia_path is not None:
         yield from iter_cohesentia_records(cohesentia_path)
     if include_mteb_summeval:

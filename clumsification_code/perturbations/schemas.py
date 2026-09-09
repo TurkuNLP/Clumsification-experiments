@@ -123,8 +123,6 @@ class PerturbationResult:
     generator: str | None = None
     seed: int | None = None
     prompt_version: str | None = None
-    prompt_hash: str | None = None
-    catalog_hash: str | None = None
     method_config: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -153,8 +151,6 @@ class PerturbationResult:
                 "generator": self.generator,
                 "seed": self.seed,
                 "prompt_version": self.prompt_version,
-                "prompt_hash": self.prompt_hash,
-                "catalog_hash": self.catalog_hash,
                 "method_config": dict(self.method_config),
             }
         )

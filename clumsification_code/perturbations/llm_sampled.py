@@ -7,18 +7,11 @@ import hashlib
 from typing import Any, Mapping, Sequence
 import math
 
-from clumsification_code.data.io import canonical_json_hash, sha256_file
-
+from .assignment_plan import LLMAssignment, load_llm_assignments
 from .sampling import (
     EditCatalogEntry,
     SampledEditAssignment,
     load_edit_catalog,
-    sample_edit_assignment,
-    sample_edit_count,
-    sample_dimension_count,
-    sample_severity,
-    sample_target_dimensions,
-    SEVERITIES,
 )
 from .schemas import GenerationRuntime, PerturbationInput, PerturbationResult
 
@@ -47,12 +40,6 @@ class SampledPromptRequest:
 def _stable_item_seed(base_seed: int, item: Mapping[str, Any], index: int) -> int:
     identity = item.get("candidate_id") or item.get("custom_id") or item.get("_source_index") or index
     raw = f"{base_seed}:{identity}".encode("utf-8")
-    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big")
-
-
-def _stable_stream_seed(item_seed: int, stream: str) -> int:
-    """Derive an independent deterministic sampling stream for one item."""
-    raw = f"{item_seed}:{stream}".encode("utf-8")
     return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big")
 
 
@@ -123,42 +110,71 @@ class SampledLLMMethod:
             "edit_catalog", "data/perturbation_prompts/english/edit_types.jsonl"
         )
         self.catalog = load_edit_catalog(catalog_path)
-        self.catalog_hash = sha256_file(catalog_path)
         self.seed = int(self.config.get("seed", 42))
-        self.weights = self.config.get("weights")
-        self.require_dimension_coverage = bool(self.config.get("require_dimension_coverage", True))
+        self._planned_assignments = self._load_planned_assignments()
+
+    def _load_planned_assignments(self) -> dict[str, LLMAssignment]:
+        path = self.config.get("assignment_file")
+        if path is None:
+            raise ValueError(
+                "LLM generation requires assignment_file created by "
+                "plan_llm_assignments.py"
+            )
+        if not isinstance(path, (str, bytes)):
+            raise ValueError("assignment_file must be a path string")
+        assignments = [
+            assignment
+            for assignment in load_llm_assignments(path)
+            if assignment.method == self.name
+        ]
+        by_base_text_id = {
+            assignment.base_text_id: assignment for assignment in assignments
+        }
+        if len(by_base_text_id) != len(assignments):
+            raise ValueError(
+                f"Assignment file has duplicate {self.name!r} rows for one source"
+            )
+        catalog_by_id = {entry.edit_id: entry for entry in self.catalog}
+        for assignment in assignments:
+            try:
+                entries = tuple(catalog_by_id[edit_id] for edit_id in assignment.edits)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Assignment for {assignment.base_text_id!r} references an "
+                    f"unknown edit type {exc.args[0]!r}"
+                ) from exc
+            dimensions = tuple(dict.fromkeys(
+                dimension for entry in entries for dimension in entry.target_dimensions
+            ))
+            if assignment.target_dimensions != dimensions:
+                raise ValueError(
+                    f"Assignment dimensions do not match edits for "
+                    f"{assignment.base_text_id!r}"
+                )
+        return by_base_text_id
+
+    def _planned_assignment_for_item(
+        self, item: Mapping[str, Any], *, seed: int
+    ) -> SampledEditAssignment:
+        base_text_id = item.get("base_text_id")
+        if not isinstance(base_text_id, str) or not base_text_id:
+            raise ValueError("Planned LLM generation requires base_text_id")
+        assignment = self._planned_assignments.get(base_text_id)
+        if assignment is None:
+            raise ValueError(
+                f"No {self.name!r} assignment exists for source {base_text_id!r}"
+            )
+        catalog_by_id = {entry.edit_id: entry for entry in self.catalog}
+        return SampledEditAssignment(
+            target_dimensions=assignment.target_dimensions,
+            edits=tuple(catalog_by_id[edit_id] for edit_id in assignment.edits),
+            severity=assignment.severity,
+            seed=seed,
+        )
 
     def assignment_for_item(self, item: Mapping[str, Any], *, index: int = 0) -> SampledEditAssignment:
         seed = _stable_item_seed(self.seed, item, index)
-        n_edits = sample_edit_count(
-            len(str(item.get("text", "")).replace("\n", " ")),
-            seed=_stable_stream_seed(seed, "edit_count"),
-        )
-        available_dimension_count = len({
-            " ".join(dimension.casefold().split())
-            for entry in self.catalog
-            for dimension in entry.target_dimensions
-        })
-        target_dimensions = sample_target_dimensions(
-            self.catalog,
-            n_dimensions=sample_dimension_count(
-                n_edits=n_edits,
-                available_dimensions=available_dimension_count,
-                seed=_stable_stream_seed(seed, "dimension_count"),
-            ),
-            seed=_stable_stream_seed(seed, "target_dimensions"),
-        )
-        return sample_edit_assignment(
-            self.catalog,
-            target_dimensions=target_dimensions,
-            n_edits=n_edits,
-            severity=sample_severity(
-                SEVERITIES, seed=_stable_stream_seed(seed, "severity")
-            ),
-            seed=_stable_stream_seed(seed, "edit_operations"),
-            weights=self.weights,
-            require_dimension_coverage=self.require_dimension_coverage,
-        )
+        return self._planned_assignment_for_item(item, seed=seed)
 
     def build_requests(self, items: Sequence[Mapping[str, Any]]) -> list[SampledPromptRequest]:
         return [
@@ -179,7 +195,15 @@ class SampledLLMMethod:
         runtime: GenerationRuntime,
     ) -> list[PerturbationResult]:
         requests = self.build_requests(
-            [item.metadata | {"text": item.text} for item in items]
+            [
+                item.metadata
+                | {
+                    "base_text_id": item.base_text_id,
+                    "candidate_id": item.candidate_id,
+                    "text": item.text,
+                }
+                for item in items
+            ]
         )
         model, outputs = runtime.run_chat(
             self.config, [request.messages for request in requests]
@@ -204,8 +228,6 @@ class SampledLLMMethod:
                 generator=model,
                 seed=request.assignment.seed,
                 prompt_version=request.prompt_version,
-                prompt_hash=canonical_json_hash(request.messages),
-                catalog_hash=self.catalog_hash,
                 method_config=dict(self.config),
                 metadata={
                     "max_output_chars": int(
@@ -228,22 +250,13 @@ class SingleLLMMethod(SampledLLMMethod):
         self, item: Mapping[str, Any], *, index: int = 0
     ) -> SampledEditAssignment:
         seed = _stable_item_seed(self.seed, item, index)
-        target_dimensions = sample_target_dimensions(
-            self.catalog,
-            n_dimensions=1,
-            seed=_stable_stream_seed(seed, "target_dimensions"),
-        )
-        return sample_edit_assignment(
-            self.catalog,
-            target_dimensions=target_dimensions,
-            n_edits=1,
-            severity=sample_severity(
-                SEVERITIES, seed=_stable_stream_seed(seed, "severity")
-            ),
-            seed=_stable_stream_seed(seed, "edit_operations"),
-            weights=self.weights,
-            require_dimension_coverage=True,
-        )
+        planned = self._planned_assignment_for_item(item, seed=seed)
+        if len(planned.edits) != 1:
+            raise ValueError(
+                f"llm_single assignment for {item.get('base_text_id')!r} "
+                "must contain exactly one edit"
+            )
+        return planned
 
 
 __all__ = [

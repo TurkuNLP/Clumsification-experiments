@@ -2,7 +2,6 @@
 """Shared filesystem primitives for canonical and transitional dataset code."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -97,37 +96,10 @@ def write_jsonl_atomic(
     return destination
 
 
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def canonical_json_hash(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def read_ds(ds_path: str):
-    """Compatibility alias for historical callers."""
-    return read_jsonl(ds_path)
-
-
 __all__ = [
-    "canonical_json_hash",
     "default_formatted_dataset_path",
-    "read_ds",
     "read_json",
     "read_jsonl",
-    "sha256_file",
     "write_json_atomic",
     "write_jsonl_atomic",
 ]

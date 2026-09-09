@@ -61,6 +61,7 @@ def main():
         target_layers=args.target_layers,
         include_originals=not args.exclude_originals,
         reference_policy=args.reference_policy,
+        source_partitions=args.source_partitions,
         overwrite=args.overwrite,
         dataset_root=args.dataset_root,
     )

@@ -33,20 +33,6 @@ class EvaluationHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class LegacyEvaluationHead(nn.Module):
-    """Archived MLP head used only to evaluate pre-migration checkpoints."""
-
-    def __init__(self, input_dim: int, hidden_dim: int = 256, dropout: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
-
-
 def pad_group_scores(flat_scores: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
     sizes = group_sizes.detach().cpu().tolist()
     padded = flat_scores.new_zeros((len(sizes), max(sizes)))
@@ -72,16 +58,11 @@ def _load_auto_model_with_dtype(model_name: str, attn_implementation: str,
 
 
 class FEModel(nn.Module):
-    """Shared encoder and candidate-only linear scalar evaluator.
-
-    The optional head arguments are retained only for checkpoint/caller
-    compatibility during migration; they do not alter the architecture.
-    """
+    """Shared encoder and candidate-only linear scalar evaluator."""
 
     def __init__(self, model_name: str, hidden_dim: int = 256,
                  dropout: float = 0.1, attn_implementation: str = "sdpa",
-                 param_dtype: Optional[torch.dtype] = None,
-                 legacy_head: bool = False, pooling: str = "auto"):
+                 param_dtype: Optional[torch.dtype] = None, pooling: str = "auto"):
         super().__init__()
         self.pooling = resolve_pooling(model_name, pooling)
         self.param_dtype = param_dtype or get_preferred_param_dtype()
@@ -99,10 +80,7 @@ class FEModel(nn.Module):
             self.encoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-        self.evaluation_head = (
-            LegacyEvaluationHead(self.encoder.config.hidden_size, hidden_dim, dropout)
-            if legacy_head else EvaluationHead(self.encoder.config.hidden_size)
-        )
+        self.evaluation_head = EvaluationHead(self.encoder.config.hidden_size)
         self.evaluation_head.to(
             device=next(self.encoder.parameters()).device,
             dtype=self.param_dtype,

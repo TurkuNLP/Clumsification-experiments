@@ -10,6 +10,8 @@ Each custom dataset starts with `original.jsonl`:
 ```text
 data/custom_datasets/<dataset>/
   original.jsonl
+  perturbation_assignments.jsonl
+  split_assignments.jsonl
   perturbations/
     perturbation_manifest.json
     <method>/<run_id>/<target_layer>.jsonl
@@ -41,8 +43,8 @@ The fixed English source corpus is
    `contains_substantial_high_quality_section=true` was retained. This yielded
    exactly **84,554** documents: 451,780 explicit FAIL rows, 20,679 malformed
    assessments, and 4 internally inconsistent assessments were excluded.
-5. A seeded, source-level character-length-decile partition produced 15,000
-   `dev` sources, 15,000 `test` sources, and 54,554 `train_01` sources.
+5. The four perturbation workflows are generated from the same unsplit source
+   corpus. A shared source-level split manifest is created afterward.
 
 The mass filter writes one output row for every input row and stores its JSON
 assessment in `passes_filters`. The importer reconstructs the pass-only
@@ -65,10 +67,9 @@ python scripts/import_filtered_custom_dataset.py \
 The importer fails closed: null, malformed, FAIL, or internally inconsistent
 assessments are excluded. Passing rows retain their original metadata plus the
 parsed filter assessment and input line number under `filter_provenance`. The
-manifest records the input/output paths and SHA-256 checksums, the exact
-acceptance rule, and counts for every outcome. Duplicate passing source IDs,
-invalid texts, and existing derived perturbation/score/partition artifacts are
-hard errors.
+manifest records the input/output paths, the exact acceptance rule, and counts
+for every outcome. Duplicate passing source IDs, invalid texts, and existing
+derived perturbation/score/split artifacts are hard errors.
 
 An original row requires `custom_id` and `text`. String and integer source IDs
 are accepted and normalized to strings. The source ID identifies a document;
@@ -79,52 +80,52 @@ to infer layers. Every candidate records its method, run, source and target
 layers, and exact `parent_candidate_id`. A new layer may therefore start from
 an original or any existing layer, including one produced by another method.
 
-### Fixed source partitions for staged experiments
+### LLM assignments and workflow splits
 
-For a large custom dataset, assign source-level partitions once before
-generation. This preserves train/dev/test isolation across every perturbation
-method. The fixed English corpus uses 15,000 sources for each held-out
-source-text partition and all 54,554 remaining sources for training:
+Plan the two LLM workflows before generation. The assignment file freezes
+their edit types, edit counts, severities, and derived dimensions; retries reuse
+that assignment and change only the model-generation seed.
 
 ```bash
-# Preview only; this does not change original.jsonl.
-python -m scripts.assign_dataset_partitions \
-  --dataset nemotron-cc-high-propella-custom-eng \
-  --dev-size 15000 --test-size 15000 --train-block-size 54554 \
-  --seed 42 --dry-run
-
-# Apply the reviewed plan atomically.
-python -m scripts.assign_dataset_partitions \
-  --dataset nemotron-cc-high-propella-custom-eng \
-  --dev-size 15000 --test-size 15000 --train-block-size 54554 \
-  --seed 42
+python scripts/plan_llm_assignments.py \
+  --dataset nemotron-cc-high-propella-custom-eng --seed 42
 ```
 
-The command adds `partition` to each original record and writes
-`partition_manifest.json`. The completed English-corpus manifest records the
-seed (`42`), character-length-decile stratification, input and output hashes,
-and the exact `dev=15,000`, `test=15,000`, `train_01=54,554` assignments.
-
-Generate a partition-selected LLM layer by supplying the model explicitly:
+Pass the resulting file when generating either LLM layer:
 
 ```bash
-python -m scripts.generate_perturbations \
+python scripts/generate_perturbations.py \
   --dataset nemotron-cc-high-propella-custom-eng \
-  --source-layer 0 --method llm_sampled --run-id sampled-pilot-v1 \
+  --source-layer 0 --method llm_sampled --run-id sampled-balanced-v2 \
   --model-path Qwen/Qwen3.5-27B \
-  --source-partitions dev test train_01
+  --assignment-file data/custom_datasets/nemotron-cc-high-propella-custom-eng/perturbation_assignments.jsonl
 ```
 
-The selected partition labels are recorded in the layer manifest. The same
-option works when generating from a nonzero source layer because selection is
-always resolved through the canonical original source.
+After all four independent workflows have completed, create one source-level
+split file. It defaults to 15,000 development sources, 15,000 test sources,
+and all remaining sources in training. It balances source length and LLM
+assignments while treating realized traditional edit types as a lighter signal.
+
+```bash
+python scripts/assign_workflow_splits.py \
+  --dataset nemotron-cc-high-propella-custom-eng \
+  --llm-single-run-id single-balanced-v2 \
+  --llm-sampled-run-id sampled-balanced-v2 \
+  --trad-single-run-id trad-single-v1 \
+  --trad-sampled-run-id trad-sampled-v1
+```
+
+The result is `split_assignments.jsonl`, with one `base_text_id` and one of
+`train`, `dev`, or `test` per row. It is the only supported source of split
+membership. It applies to the original and to all workflow outputs for that
+source.
 
 ## Generate one layer
 
 Run one method per layer with `scripts/generate_perturbations.py`. The command
-records the full effective configuration, deterministic seed, source selection,
-candidate ancestry, method-specific edit evidence, and output-file checksum in
-the perturbation manifest.
+records the effective configuration, source selection, candidate ancestry, and
+method-specific edit evidence in the perturbation manifest. LLM assignment
+choices are recorded separately in `perturbation_assignments.jsonl`.
 
 ### Canonical methods
 
@@ -132,15 +133,15 @@ The only generative methods are:
 
 | Method | Number of edits | Generation procedure |
 | --- | --- | --- |
-| `llm_single` | Exactly 1 | Sample one catalog operation, one target dimension, and one severity, then ask the LLM to apply it. |
-| `llm_sampled` | 1--5 | Sample a length-conditioned number of catalog operations, dimensions, and severity, then ask the LLM to apply them. |
+| `llm_single` | Exactly 1 | Use the preplanned catalog operation, target dimension, and severity, then ask the LLM to apply it. |
+| `llm_sampled` | 1--5 | Use the preplanned length-conditioned operations, derived dimensions, and severity, then ask the LLM to apply them. |
 | `trad_single` | Exactly 1 | Sample one applicable operation from the five-operation traditional mix. |
 | `trad_sampled` | 1--5 | Sample a length-conditioned number of traditional edits. |
 
-For both sampled methods, the requested edit count is sampled uniformly from
+For `llm_sampled`, the planner assigns the requested edit count uniformly from
 `1..min(5, floor(character_length / 500))`. A text shorter than 500 characters
-therefore receives one edit. This count is deterministic for a source candidate
-and seed.
+therefore receives one edit. `trad_sampled` applies the same rule during its
+CPU generation. Both are deterministic for a source candidate and seed.
 
 Run the two LLM workflows from originals as follows. `--model-path` identifies
 the local or Hugging Face model served by the LLM runner.
@@ -153,7 +154,8 @@ python scripts/generate_perturbations.py \
   --method llm_single \
   --run-id llm-single-v1 \
   --target-layer 1 \
-  --model-path Qwen/Qwen3.5-27B
+  --model-path Qwen/Qwen3.5-27B \
+  --assignment-file data/custom_datasets/my_dataset/perturbation_assignments.jsonl
 
 # One to five LLM edits per original source, conditional on text length.
 python scripts/generate_perturbations.py \
@@ -162,7 +164,8 @@ python scripts/generate_perturbations.py \
   --method llm_sampled \
   --run-id llm-sampled-v1 \
   --target-layer 1 \
-  --model-path Qwen/Qwen3.5-27B
+  --model-path Qwen/Qwen3.5-27B \
+  --assignment-file data/custom_datasets/my_dataset/perturbation_assignments.jsonl
 ```
 
 Run the two traditional workflows from originals as follows. `--language en`
@@ -211,13 +214,14 @@ can be passed with `--method-config`; explicit CLI values take precedence.
 ### Recover failed inputs without regenerating successful ones
 
 If a completed layer contains skipped inputs, rerun the original command with
-the same dataset, source, method, run ID, partition selection, and generation
-configuration, adding `--retry-failed`:
+the same dataset, source, method, run ID, frozen assignment file, and
+generation configuration, adding `--retry-failed`:
 
 ```bash
 python scripts/generate_perturbations.py \
   --dataset my_dataset --source-layer 0 --method llm_sampled \
   --run-id sampled-dynamic-v1 --model-path Qwen/Qwen3.5-27B \
+  --assignment-file data/custom_datasets/my_dataset/perturbation_assignments.jsonl \
   --retry-failed
 ```
 
@@ -228,9 +232,6 @@ retry records its effective seed, attempted and recovered counts, and any
 remaining failures in that layer's manifest. `--retry-failed` cannot be used
 with `--overwrite`.
 
-`llm_zero_shot` and the previous traditional pathways are archived historical
-ablations, not valid generation methods.
-
 ### Sampled LLM options
 
 ```json
@@ -238,26 +239,18 @@ ablations, not valid generation methods.
   "model": "Qwen/Qwen3.5-27B",
   "language": "english",
   "edit_catalog": "data/perturbation_prompts/english/edit_types.jsonl",
-  "require_dimension_coverage": true,
-  "weights": {
-    "unnecessary_circumlocution": 1.0,
-    "odd_collocation": 1.0
-  },
+  "assignment_file": "data/custom_datasets/my_dataset/perturbation_assignments.jsonl",
   "seed": 42
 }
 ```
 
-For `llm_sampled`, the edit count is not a configuration option. Target
-dimensions are sampled uniformly from the dimensions in the edit catalog. The
-number selected is sampled uniformly from one through the smaller of the edit
-count and the number of catalog dimensions. Severity is sampled uniformly and
-deterministically from `weak`, `medium`, and `strong`; it is not a
-configuration option. When a selected dimension has fewer catalog operations than the
-sampled edit count, operations may repeat so that the requested count is
-preserved.
-Each sampling decision uses its own deterministic seed derived from the
-candidate identity, so changing one sampling stage does not reshuffle the
-others.
+`assignment_file` is required for both LLM methods. It fixes the edit count,
+edit types, severity, and dimensions for every source before any model call.
+For `llm_sampled`, the assignment planner samples a length-conditioned count
+from one through `min(5, floor(character_length / 500))`; operations and
+severity are balanced over the full corpus, and dimensions are derived from
+the assigned operations. The stable `seed` records the assignment identity;
+retries change only the generation seed.
 
 LLM outputs that are empty, unchanged, or longer than their requested
 character limit are retried up to three times. If the final output is otherwise
@@ -271,9 +264,9 @@ Every generated candidate row has an `edit_count` field. For both
 `llm_sampled` and traditional methods, it is the number of recorded
 `perturbation_edits` and must equal the length of that array. In particular,
 it is not the number of target dimensions or a severity level. For
-`llm_sampled`, it is the per-text sampled number of required edit operations;
+`llm_sampled`, it is the per-text planned number of required edit operations;
 for traditional methods, it is the number of operations that actually made a
-change. Historical rows without this field remain readable as `null`.
+change.
 
 ### Traditional sampling and verification
 
@@ -375,21 +368,8 @@ python scripts/build_hf_dataset.py \
   --score-run-ids bertscore-v1
 ```
 
-For a partitioned one-method 50k pilot, fixed `dev` and `test` sources are
-included automatically and `train_01` is selected explicitly:
-
-```bash
-python -m scripts.build_hf_dataset \
-  --datasets nemotron-cc-high-propella-custom-eng \
-  --output-name en/trad_single_pilot_50k \
-  --include-methods trad_single --include-runs trad-single-v1 --include-layers 1 \
-  --train-partitions 1
-```
-
-`--train-partitions 1 2` builds the nested 100k version. Partition numbers
-must be the contiguous prefix `1..N`; ratio splitting and `downsample_size`
-are not used in this mode. The builder rejects a selected source with no
-candidate matching the method/run/layer filters.
+The builder reads `split_assignments.jsonl` automatically and requires it to
+cover every selected source.
 
 Equivalent config-based use:
 
@@ -426,63 +406,3 @@ selected candidate and method, specify `score_run_ids`; ambiguity is rejected.
 The output is a `DatasetDict` with `train`, `dev`, and `test`. Sources are
 split before composition or pairing. Rows preserve aligned text, target layer,
 candidate ID, method, run, parent, source-layer, and score arrays.
-
-## Run a complete configured workflow
-
-`scripts/prepare_dataset.py` uses the same generation and HF contracts. Copy
-`configs/workflow.example.json`, adjust it, then run:
-
-```bash
-python scripts/prepare_dataset.py generate --config configs/workflow.example.json
-python scripts/prepare_dataset.py build-hf --config configs/workflow.example.json
-python scripts/prepare_dataset.py run-all --config configs/workflow.example.json
-```
-
-Generation options belong inside each entry's `config` object:
-
-```json
-{
-  "schema_version": 1,
-  "dataset": "my_dataset",
-  "dataset_root": "data/custom_datasets",
-  "seed": 42,
-  "generations": [
-    {
-      "method": "llm_sampled",
-      "run_id": "sampled-dynamic-v1",
-      "source_layer": 0,
-      "target_layer": 1,
-      "config": {
-        "model": "Qwen/Qwen3.5-27B"
-      }
-    }
-  ],
-  "hf": {
-    "output_name": "my_dataset_sampled",
-    "include_methods": ["llm_sampled"],
-    "include_runs": ["sampled-dynamic-v1"],
-    "include_layers": [1],
-    "composition": "all",
-    "pair_policy": "none"
-  }
-}
-```
-
-Within a workflow, `hf.datasets` defaults to the top-level dataset and
-`hf.seed` defaults to the workflow seed. Presets are available for
-`single_llm_ablation`, `sampled_llm_ablation`, and `traditional_comparison`.
-
-## Legacy import
-
-Historical folders are accepted only through explicit migration:
-
-```bash
-python scripts/import_legacy_dataset.py \
-  --dataset my_dataset \
-  --source-directory perturbed_layers \
-  --method llm_single \
-  --run-id legacy-import
-```
-
-New generation, scoring, and HF construction use only canonical repositories
-and manifests. Deprecated scripts are not extension points.

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 """Build a canonical custom dataset from rows accepted by the vLLM filter.
 
 The input is the row-preserving JSONL produced by
@@ -9,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,14 +42,6 @@ def parse_args() -> argparse.Namespace:
         help="Validate and count rows without writing output files.",
     )
     return parser.parse_args()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def parse_assessment(value: Any) -> tuple[str, dict[str, Any] | None]:
@@ -121,7 +113,7 @@ def validate_destination(dataset_dir: Path, overwrite: bool) -> tuple[Path, Path
     derived = [
         dataset_dir / "perturbations",
         dataset_dir / "scores",
-        dataset_dir / "partition_manifest.json",
+        dataset_dir / "split_assignments.jsonl",
     ]
     existing_derived = [str(path) for path in derived if path.exists()]
     if existing_derived:
@@ -163,7 +155,6 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
     seen_ids: set[str] = set()
     temp_name: str | None = None
     output_handle = None
-    output_digest = hashlib.sha256()
     try:
         if not args.dry_run:
             descriptor, temp_name = tempfile.mkstemp(
@@ -197,7 +188,6 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                         + "\n"
                     )
                     output_handle.write(encoded)
-                    output_digest.update(encoded.encode("utf-8"))
         if counts["passed"] == 0:
             raise ValueError("No rows passed the filter; refusing to create an empty dataset")
         if output_handle is not None:
@@ -227,10 +217,9 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             'embedded JSON has decision="PASS" and '
             "contains_substantial_high_quality_section=true"
         ),
-        "input": {"path": str(input_path), "sha256": sha256_file(input_path)},
+        "input": {"path": str(input_path)},
         "output": {
             "path": str(output_path.resolve()),
-            "sha256": None if args.dry_run else output_digest.hexdigest(),
         },
         "counts": counts,
         "dry_run": args.dry_run,

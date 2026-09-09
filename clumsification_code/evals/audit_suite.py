@@ -128,8 +128,6 @@ def main() -> None:
     parser.add_argument("--ellipse-path", type=Path, default=DEFAULT_ELLIPSE_PATH)
     parser.add_argument(
         "--human-chatgpt-essays-path",
-        "--argessay-path",
-        dest="human_chatgpt_essays_path",
         type=Path,
         default=DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     )

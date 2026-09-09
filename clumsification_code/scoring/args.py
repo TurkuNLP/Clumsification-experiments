@@ -104,6 +104,12 @@ def parse_score_args():
     parser.add_argument("--perturbation-run-ids", nargs="+", default=None)
     parser.add_argument("--target-layers", nargs="+", type=int, default=None)
     parser.add_argument(
+        "--source-partitions",
+        nargs="+",
+        default=None,
+        help="Score only these split assignments; uses embedded partition metadata as fallback.",
+    )
+    parser.add_argument(
         "--reference-policy",
         choices=["original", "parent"],
         default="original",

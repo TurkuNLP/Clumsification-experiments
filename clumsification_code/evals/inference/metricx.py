@@ -151,7 +151,7 @@ class MetricX24QEInferenceModel:
         max_length: int = 512,
     ) -> np.ndarray:
         """
-        Adapter expected by evaluate_model_on_benchmark.py.
+        Adapter used by the shared benchmark runner.
 
         By default returns higher-is-better scores by negating raw MetricX
         lower-is-better error scores.

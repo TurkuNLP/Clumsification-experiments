@@ -15,19 +15,36 @@ import pyarrow as pa
 from datasets import Dataset, DatasetDict, load_from_disk
 
 from clumsification_code.data.candidate_identity import make_original_candidate_id
-from clumsification_code.data.partitioning import PARTITION_FIELD
 from clumsification_code.data.repository import DatasetRepository
 from clumsification_code.data.schemas import COMPOSITION_POLICIES, HFBuildSpec, PAIR_POLICIES
-from clumsification_code.data.splitting import (
-    assert_no_original_id_leakage,
-    split_ids_to_metadata,
-    split_original_ids_by_dataset,
-)
 
 
 def _stable_seed(seed: int, *parts: object) -> int:
     payload = "\0".join([str(seed), *(str(part) for part in parts)]).encode()
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big")
+
+
+def _assert_no_split_leakage(split_ids: dict[str, dict[str, set[str]]]) -> None:
+    seen: dict[tuple[str, str], str] = {}
+    for split, by_dataset in split_ids.items():
+        for dataset_name, source_ids in by_dataset.items():
+            for source_id in source_ids:
+                identity = (dataset_name, source_id)
+                if identity in seen:
+                    raise ValueError(
+                        f"Source {dataset_name}:{source_id} appears in both "
+                        f"{seen[identity]!r} and {split!r}"
+                    )
+                seen[identity] = split
+
+
+def _split_ids_to_metadata(
+    split_ids: dict[str, dict[str, set[str]]],
+) -> dict[str, dict[str, list[str]]]:
+    return {
+        split: {dataset: sorted(ids) for dataset, ids in by_dataset.items()}
+        for split, by_dataset in split_ids.items()
+    }
 
 
 def _original_item(repository: DatasetRepository, original: Any) -> dict[str, Any]:
@@ -338,42 +355,39 @@ def _downsample_dataset_dict(
     })
 
 
-def _partitioned_split_ids(
+def _split_assignment_ids(
     repositories: dict[str, DatasetRepository],
     *,
-    train_partitions: tuple[int, ...],
+    eligible_ids: dict[str, set[str]] | None,
 ) -> dict[str, dict[str, set[str]]]:
-    """Select fixed source partitions for a nested training subset."""
-    requested_train_labels = {f"train_{index:02d}" for index in train_partitions}
+    """Use complete source-level split-assignment files."""
+    assignments = {
+        dataset_name: repository.read_split_assignments()
+        for dataset_name, repository in repositories.items()
+    }
+    if not all(assignments.values()):
+        missing = sorted(name for name, values in assignments.items() if values is None)
+        raise ValueError(f"Missing split_assignments.jsonl for: {missing}")
     result = {
         split: {dataset_name: set() for dataset_name in repositories}
         for split in ("train", "dev", "test")
     }
-    for dataset_name, repository in repositories.items():
-        for record in repository.read_originals():
-            partition = record.metadata.get(PARTITION_FIELD)
-            if not isinstance(partition, str) or not partition:
+    for dataset_name, by_id in assignments.items():
+        assert by_id is not None
+        permitted = None if eligible_ids is None else eligible_ids.get(dataset_name, set())
+        for base_text_id, split in by_id.items():
+            if split not in result:
                 raise ValueError(
-                    f"{dataset_name}:{record.base_text_id} has no valid "
-                    f"{PARTITION_FIELD!r} assignment"
+                    f"{dataset_name}:{base_text_id} has unsupported split {split!r}"
                 )
-            if partition == "dev":
-                result["dev"][dataset_name].add(record.base_text_id)
-            elif partition == "test":
-                result["test"][dataset_name].add(record.base_text_id)
-            elif partition in requested_train_labels:
-                result["train"][dataset_name].add(record.base_text_id)
-            elif partition != "train_remainder" and not partition.startswith("train_"):
-                raise ValueError(
-                    f"{dataset_name}:{record.base_text_id} has unknown partition "
-                    f"{partition!r}"
-                )
+            if permitted is None or base_text_id in permitted:
+                result[split][dataset_name].add(base_text_id)
     if any(not result[split][dataset_name] for split in result for dataset_name in repositories):
         sizes = {
-            split: {name: len(ids) for name, ids in values.items()}
-            for split, values in result.items()
+            split: {name: len(ids) for name, ids in by_dataset.items()}
+            for split, by_dataset in result.items()
         }
-        raise ValueError(f"Partition selection produced an empty required split: {sizes}")
+        raise ValueError(f"Split assignments produced an empty required split: {sizes}")
     return result
 
 
@@ -385,8 +399,6 @@ def create_formatted_dataset_dict(
     random_pairs: bool = False,
     reuse_limit: int = 5,
     downsample_size: Optional[int] = None,
-    heldout_ratio: float = 0.3,
-    test_ratio_within_heldout: float = 0.5,
     score_names: Optional[list[str]] = None,
     methods: Optional[list[str]] = None,
     composition: str = "all",
@@ -399,7 +411,6 @@ def create_formatted_dataset_dict(
     include_layers: Optional[list[int]] = None,
     pair_policy: str = "none",
     score_run_ids: Optional[list[str]] = None,
-    train_partitions: Optional[list[int]] = None,
 ):
     """Build source-isolated HF splits from manifests and parent links."""
     if not dataset_names:
@@ -436,26 +447,9 @@ def create_formatted_dataset_dict(
             }
             for name, groups in groups_by_dataset.items()
         }
-    if train_partitions is not None:
-        normalized_train_partitions = tuple(train_partitions)
-        expected = tuple(range(1, len(normalized_train_partitions) + 1))
-        if normalized_train_partitions != expected:
-            raise ValueError("train_partitions must be the contiguous prefix 1..N")
-        if eligible_ids is not None:
-            raise ValueError(
-                "train_partitions cannot be combined with score-based source filtering"
-            )
-        split_ids = _partitioned_split_ids(
-            repositories, train_partitions=normalized_train_partitions
-        )
-        split_strategy = "canonical_original_partition"
-    else:
-        split_ids = split_original_ids_by_dataset(
-            dataset_names, heldout_ratio, test_ratio_within_heldout, seed,
-            eligible_ids, dataset_root=dataset_root, repositories=repositories,
-        )
-        split_strategy = "canonical_base_text_id_before_composition"
-    assert_no_original_id_leakage(split_ids)
+    split_ids = _split_assignment_ids(repositories, eligible_ids=eligible_ids)
+    split_strategy = "split_assignments"
+    _assert_no_split_leakage(split_ids)
     records: dict[str, list[dict[str, Any]]] = {
         name: [] for name in ("train", "dev", "test")
     }
@@ -467,11 +461,6 @@ def create_formatted_dataset_dict(
                     method_weights=method_weights, samples_per_source=samples_per_source,
                     seed=_stable_seed(seed, dataset_name, base_id, composition),
                 )
-                if train_partitions is not None and len(items) < 2:
-                    raise ValueError(
-                        f"Selected source {dataset_name}:{base_id} has no candidate "
-                        "for the requested method/run/layer selection"
-                    )
                 records[split].append(
                     _chain(dataset_name, [base_id], items, f"{dataset_name}:{base_id}")
                 )
@@ -490,7 +479,7 @@ def create_formatted_dataset_dict(
         final = _downsample_dataset_dict(final, downsample_size, seed)
     metadata = {
         "split_strategy": split_strategy,
-        "split_original_ids": split_ids_to_metadata(split_ids),
+        "split_original_ids": _split_ids_to_metadata(split_ids),
         "score_fields": sorted(discovered_scores),
         "score_run_ids": score_run_ids,
         "include_methods": methods,
@@ -500,20 +489,7 @@ def create_formatted_dataset_dict(
         "method_weights": method_weights,
         "samples_per_source": samples_per_source,
         "pair_policy": pair_policy,
-        "train_partitions": list(train_partitions or []),
         "num_examples": {split: len(final[split]) for split in final},
-        "selected_layer_hashes": {
-            dataset_name: {
-                f"{entry.method}:{entry.run_id}:{entry.target_layer}": {
-                    "content_hash": entry.content_hash,
-                    "config_hash": entry.config_hash,
-                }
-                for entry in repositories[dataset_name].list_layers(
-                    methods=methods, run_ids=run_ids, target_layers=include_layers
-                )
-            }
-            for dataset_name in dataset_names
-        },
     }
     return (final, metadata) if return_metadata else final
 
@@ -555,12 +531,9 @@ def build_hf_dataset(
         composition=spec.composition,
         method_weights=dict(spec.method_weights) or None,
         samples_per_source=spec.samples_per_source,
-        train_partitions=list(spec.train_partitions) or None,
         pair_policy=spec.pair_policy,
         reuse_limit=spec.reuse_limit,
         downsample_size=spec.downsample_size,
-        heldout_ratio=spec.heldout_ratio,
-        test_ratio_within_heldout=spec.test_ratio_within_heldout,
         score_names=list(spec.score_names) or None,
         score_run_ids=list(spec.score_run_ids) or None,
         seed=spec.seed,

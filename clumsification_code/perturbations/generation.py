@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 import gc
+import json
 import re
 from pathlib import Path
 from typing import Any, Sequence
@@ -13,9 +14,7 @@ from clumsification_code.data.candidate_identity import (
     make_candidate_id,
     make_original_candidate_id,
 )
-from clumsification_code.data.io import canonical_json_hash
 from clumsification_code.data.repository import DatasetRepository
-from clumsification_code.data.partitioning import PARTITION_FIELD
 from clumsification_code.data.schemas import (
     CandidateRecord,
     GenerationSpec,
@@ -325,20 +324,19 @@ class PerturbationGenerationService:
         ):
             raise ValueError("source_partitions must be a non-empty sequence of names")
         originals = self.repository.read_originals()
-        partition_by_original = {
-            record.base_text_id: record.metadata.get(PARTITION_FIELD)
-            for record in originals
-        }
+        partition_by_original = self.repository.read_split_assignments()
+        if selected_partitions is not None and partition_by_original is None:
+            raise FileNotFoundError(
+                "source_partitions requires split_assignments.jsonl"
+            )
 
         def is_selected(base_text_id: str) -> bool:
             if selected_partitions is None:
                 return True
+            assert partition_by_original is not None
             partition = partition_by_original.get(base_text_id)
             if not isinstance(partition, str) or not partition:
-                raise ValueError(
-                    f"Original source {base_text_id!r} has no valid "
-                    f"{PARTITION_FIELD!r} assignment"
-                )
+                raise ValueError(f"Original source {base_text_id!r} has no valid split assignment")
             return partition in selected_partitions
 
         if source_layer == 0:
@@ -431,6 +429,10 @@ class PerturbationGenerationService:
                 "run_id": run_id,
             }
         )
+        # ``seed`` defines the deterministic assignment and remains immutable
+        # across resumed runs. ``sampling_seed`` controls model generation and
+        # may advance for a retry without changing that assignment.
+        generation_seed = int(method_config.get("sampling_seed", method_config["seed"]))
         persisted_config = {
             key: value for key, value in method_config.items() if key != "store"
         }
@@ -452,7 +454,7 @@ class PerturbationGenerationService:
                 raise ValueError("max_attempts must be at least 1")
             method_config["max_attempts"] = max_attempts
             persisted_config["max_attempts"] = max_attempts
-        canonical_json_hash(persisted_config)
+        json.dumps(persisted_config, ensure_ascii=False, allow_nan=False, sort_keys=True)
         destination = self.repository.layer_path(method, run_id, resolved_target)
         identity = (method, run_id, resolved_target)
         existing_entry = next(
@@ -505,9 +507,10 @@ class PerturbationGenerationService:
             if len(existing_parent_ids) != len(set(existing_parent_ids)):
                 raise ValueError("Existing retry layer has duplicate parent candidates")
             retry_round = len(existing_entry.config.get("retry_history", [])) + 1
-            # A retry must explore a different deterministic trajectory while the
-            # persisted request seed remains the stable identity of the layer.
-            method_config["seed"] = int(method_config["seed"]) + retry_round
+            # A resumed run must explore a different model trajectory without
+            # changing the immutable assignment seed.
+            generation_seed += retry_round
+            method_config["sampling_seed"] = generation_seed
         existing_parent_ids = {record.parent_candidate_id for record in existing_candidates}
         items = [
             item for item in all_items if str(item.candidate_id) not in existing_parent_ids
@@ -571,7 +574,7 @@ class PerturbationGenerationService:
                 ]
                 # A distinct sampling seed prevents a newly constructed vLLM
                 # engine from deterministically reproducing the failed answer.
-                adapter.config["sampling_seed"] = int(method_config["seed"]) + attempt
+                adapter.config["sampling_seed"] = generation_seed + attempt
                 replacements = list(adapter.generate(pending, runtime))
                 record_context_stats()
                 replacement_by_parent = {
@@ -727,8 +730,6 @@ class PerturbationGenerationService:
                     generator=result.generator,
                     seed=result.seed,
                     prompt_version=result.prompt_version,
-                    prompt_hash=result.prompt_hash,
-                    catalog_hash=result.catalog_hash,
                     metadata=dict(result.metadata),
                 )
             )
@@ -760,7 +761,7 @@ class PerturbationGenerationService:
                 {
                     "round": retry_round,
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "effective_seed": int(method_config["seed"]),
+                    "effective_seed": generation_seed,
                     "attempted_input_count": len(items),
                     "recovered_output_count": len(candidates),
                     "remaining_failure_count": len(skipped_ids),

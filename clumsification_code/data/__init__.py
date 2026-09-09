@@ -9,7 +9,6 @@ from .schemas import (
     OriginalRecord,
     PerturbationManifest,
     ScoreRecord,
-    WorkflowConfig,
 )
 from .repository import DatasetRepository
 
@@ -29,6 +28,5 @@ __all__ = [
     "OriginalRecord",
     "PerturbationManifest",
     "ScoreRecord",
-    "WorkflowConfig",
     "build_hf_dataset",
 ]

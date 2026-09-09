@@ -10,13 +10,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .candidate_identity import make_original_candidate_id
-from .io import (
-    canonical_json_hash,
-    read_json,
-    read_jsonl,
-    sha256_file,
-    write_json_atomic,
-    write_jsonl_atomic,
+from .io import read_json, read_jsonl, write_json_atomic, write_jsonl_atomic
+from .workflow_splitting import (
+    DEFAULT_SPLIT_ASSIGNMENT_FILENAME,
+    load_split_assignments,
 )
 from .schemas import (
     CandidateRecord,
@@ -57,6 +54,25 @@ class DatasetRepository:
     @property
     def original_path(self) -> Path:
         return self.dataset_dir / "original.jsonl"
+
+    @property
+    def split_assignments_path(self) -> Path:
+        return self.dataset_dir / DEFAULT_SPLIT_ASSIGNMENT_FILENAME
+
+    def read_split_assignments(self) -> dict[str, str] | None:
+        """Read the preferred source-level split file when it is present."""
+        if not self.split_assignments_path.is_file():
+            return None
+        assignments = load_split_assignments(self.split_assignments_path)
+        values = {assignment.base_text_id: assignment.split for assignment in assignments}
+        source_ids = {record.base_text_id for record in self.read_originals()}
+        if set(values) != source_ids:
+            raise ValueError(
+                f"Split assignment file does not match originals: "
+                f"missing={len(source_ids - set(values))}, "
+                f"unexpected={len(set(values) - source_ids)}"
+            )
+        return values
 
     @property
     def perturbation_root(self) -> Path:
@@ -182,9 +198,9 @@ class DatasetRepository:
         if not overwrite and any(path.exists() for path in destinations):
             existing = next(path for path in destinations if path.exists())
             raise FileExistsError(f"Score run output already exists: {existing}")
-        canonical_json_hash(metadata)
+        json.dumps(metadata, ensure_ascii=False, allow_nan=False, sort_keys=True)
         for error in error_values:
-            canonical_json_hash(error)
+            json.dumps(error, ensure_ascii=False, allow_nan=False, sort_keys=True)
         write_jsonl_atomic(score_path, [record.to_row() for record in values], overwrite=overwrite)
         write_jsonl_atomic(error_path, error_values, overwrite=overwrite)
         write_json_atomic(metadata_path, metadata, overwrite=overwrite)
@@ -293,14 +309,10 @@ class DatasetRepository:
     def read_candidates(
         self,
         entry: LayerManifestEntry,
-        *,
-        verify_hash: bool = True,
     ) -> tuple[CandidateRecord, ...]:
         path = self._entry_path(entry)
         if not path.is_file():
             raise FileNotFoundError(f"Manifest references a missing layer: {path}")
-        if verify_hash and sha256_file(path) != entry.content_hash:
-            raise ValueError(f"Layer checksum does not match manifest: {path}")
         records = tuple(CandidateRecord.from_row(row) for row in read_jsonl(path))
         if len(records) != entry.output_count:
             raise ValueError(
@@ -423,7 +435,6 @@ class DatasetRepository:
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("Candidate IDs must be unique within a layer")
 
-        config_hash = canonical_json_hash(config)
         rows = [record.to_row() for record in values]
         for row in rows:
             json.dumps(row, ensure_ascii=False, allow_nan=False, sort_keys=True)
@@ -452,8 +463,6 @@ class DatasetRepository:
                 source_method=source_method,
                 source_run_id=source_run_id,
                 config=dict(config),
-                config_hash=config_hash,
-                content_hash=sha256_file(destination),
                 input_count=input_count,
                 output_count=len(values),
                 created_at_utc=datetime.now(timezone.utc).isoformat(),

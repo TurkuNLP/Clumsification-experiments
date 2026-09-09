@@ -7,7 +7,9 @@ evaluate candidate-only text quality scorers.
 
 ```text
 custom original.jsonl
-  -> canonical perturbation repository and manifest
+  -> frozen LLM assignment manifest
+  -> four independent layer-1 perturbation workflows
+  -> shared source-level split manifest
   -> optional candidate score runs
   -> source-safe HF DatasetDict
   -> regression or pairwise FE training rows
@@ -32,10 +34,10 @@ to be 200--20,000 characters and satisfy Propella
 quality filter then retained only valid PASS assessments with a substantial
 high-quality section.
 
-The corpus has immutable source-level partitions: 15,000 `dev`, 15,000 `test`,
-and 54,554 `train_01` documents. Assignment uses seed 42 and document
-character-length deciles. The import and partition manifests retain input/output
-hashes, outcome counts, and hashes of the source IDs assigned to each partition.
+The source corpus itself has no split fields. Once all four independent layer-1
+workflows have completed, `split_assignments.jsonl` assigns every source to one
+of 15,000 `dev`, 15,000 `test`, or 54,554 `train` entries. The assignment uses
+source length and the realized workflow characteristics.
 
 ## Canonical repository
 
@@ -44,6 +46,8 @@ For each custom dataset:
 ```text
 data/custom_datasets/<dataset>/
   original.jsonl
+  perturbation_assignments.jsonl
+  split_assignments.jsonl
   perturbations/
     perturbation_manifest.json
     <method>/<run_id>/<target_layer>.jsonl
@@ -54,7 +58,7 @@ data/custom_datasets/<dataset>/
 ```
 
 The manifest lists every committed method/run/layer, its source layer, source
-method and run, configuration hash, content hash, counts, and output path.
+method and run, configuration, counts, and output path.
 Candidate records carry:
 
 - dataset and stable base-text identity;
@@ -67,22 +71,23 @@ Candidate records carry:
 An original is represented as a stable candidate at layer 0. Every perturbed
 candidate has exactly one parent. Repository validation rejects missing
 parents, cross-document ancestry, duplicate candidate IDs, path/provenance
-disagreement, and content-hash mismatches.
+disagreement.
 
 ## Perturbation layer
 
 `clumsification_code/perturbations/` contains the reusable method registry and
 generation service. `scripts/generate_perturbations.py` is the single-layer
-client; `scripts/prepare_dataset.py` can execute several declared generations.
+client. `scripts/plan_llm_assignments.py` freezes the LLM assignments before
+generation, and `scripts/assign_workflow_splits.py` creates the shared split
+manifest afterward.
 
 Canonical LLM method names are `llm_single`, `llm_sampled`; the only active
 traditional names are `trad_single` and `trad_sampled`. Both sample from the
 same five-operation mix: UniEval-style repetition, deletion, and shuffle;
 agreement corruption; and random same-lemma morphology. LLM implementations share a
-runner boundary and load vLLM only when needed. The sampled method uses a
-versioned JSONL edit catalog and deterministically samples, for each
-candidate, the edit count, target dimensions, operations, and severity from
-its stable seed.
+runner boundary and load vLLM only when needed. LLM edit count, operations,
+severity, and derived dimensions are selected in the frozen assignment file;
+retries retain those assignments and only change model-generation randomness.
 
 Traditional perturbation is multilingual: English morphology uses
 Lemminflect and other supported languages use UniMorph. The registry exposes
@@ -116,7 +121,7 @@ does not use historical layer directories. `HFBuildSpec` controls:
 - composition policy and method weights;
 - pair policy and reuse limit;
 - scoring methods and score runs;
-- source-safe split ratios, downsampling, and seed.
+- the shared source-level split manifest, downsampling, and seed.
 
 Splitting occurs on `(dataset_name, base_text_id)` before composition and
 pairing. This also applies to cross-source unmatched pairs, so all candidates
@@ -126,9 +131,9 @@ Grouped HF rows contain aligned arrays for text, layer, candidate ID, method,
 run, parent ID, source layer/method/run, and requested scores. Exact provenance
 therefore survives selection and shuffling.
 
-`scripts/build_hf_dataset.py` and the HF stage of
-`scripts/prepare_dataset.py` call the same `build_hf_dataset(HFBuildSpec, ...)`
-service. CLI and JSON configuration are two front ends to one implementation.
+`scripts/build_hf_dataset.py` calls `build_hf_dataset(HFBuildSpec, ...)` after
+the split manifest exists. CLI and JSON configuration are two front ends to one
+implementation.
 
 ## Training boundary
 
@@ -174,37 +179,12 @@ sbatch updated_sbatch_jobs/train_fe_pairwise_full.sh \
   outputs/fe_qwen3_unieval_pairwise_full
 ```
 
-### Staged one-method pilot
-
-For one-method pilots, `updated_sbatch_jobs/train_fe_pairwise_pilot.sh` trains
-on the fixed `train_01` source partition. In the current English corpus this
-is 54,554 sources, alongside separate 15,000-source `dev` and `test`
-source-text partitions. With one original and one selected perturbation per
-source, the job executes 390 updates (49,920 pairs)
-and saves five checkpoints at 9,984-pair intervals. It uses FlashAttention 2,
-32 train pairs/GPU, and 48 evaluation pairs/GPU. Validation begins after 20k
-pairs and stopping requires three saved checkpoints without at least a 0.003
-pairwise-accuracy gain.
-
-```bash
-sbatch updated_sbatch_jobs/train_fe_pairwise_pilot.sh \
-  data/hf_datasets/en/unieval_pilot_50k \
-  outputs/fe_qwen3_unieval_pilot_50k
-```
-
 ## Configuration contracts
 
-`clumsification_code/data/schemas.py` defines versioned original, candidate,
-score, manifest, generation, workflow, and HF-build contracts. Unknown config
-fields are rejected. Example configs live under `configs/` and the complete
-field descriptions are in `docs/PERTURBATION_CONFIGS.md`.
-
-## Legacy boundary
-
-`scripts/import_legacy_dataset.py` is the only supported route from historical
-layer folders into the canonical repository. Legacy readers and deprecated
-experiment scripts are not used by generation, scoring, HF building, training,
-or evaluation. They are moved to ignored local archive folders during cleanup.
+`clumsification_code/data/schemas.py` defines original, candidate, score,
+manifest, generation, and HF-build contracts. Unknown config fields are
+rejected. The complete field descriptions are in
+`docs/PERTURBATION_CONFIGS.md`.
 
 ## Source-tree policy
 

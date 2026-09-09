@@ -17,7 +17,6 @@ ORIGINAL_SCHEMA_VERSION = 1
 CANDIDATE_SCHEMA_VERSION = 1
 SCORE_SCHEMA_VERSION = 3
 MANIFEST_SCHEMA_VERSION = 1
-WORKFLOW_SCHEMA_VERSION = 1
 
 PERTURBATION_SOURCES = frozenset({"LLM", "trad"})
 COMPOSITION_POLICIES = frozenset(
@@ -162,8 +161,6 @@ class CandidateRecord:
     generator: str | None = None
     seed: int | None = None
     prompt_version: str | None = None
-    prompt_hash: str | None = None
-    catalog_hash: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -198,7 +195,7 @@ class CandidateRecord:
             _integer(self.edit_count, "edit_count", minimum=0)
             if self.edit_count != len(self.perturbation_edits):
                 raise ValueError("edit_count must equal the number of perturbation_edits")
-        for name in ("severity", "generator", "prompt_version", "prompt_hash", "catalog_hash"):
+        for name in ("severity", "generator", "prompt_version"):
             object.__setattr__(self, name, _optional_string(getattr(self, name), name))
         if self.seed is not None and (isinstance(self.seed, bool) or not isinstance(self.seed, int)):
             raise ValueError("seed must be an integer or null")
@@ -221,7 +218,6 @@ class CandidateRecord:
         known = required | {
             "schema_version", "source_method", "source_run_id", "perturbation_edits",
             "target_dimensions", "severity", "edit_count", "generator", "seed", "prompt_version",
-            "prompt_hash", "catalog_hash",
         }
         return cls(
             dataset_name=row["dataset_name"],
@@ -246,8 +242,6 @@ class CandidateRecord:
             generator=row.get("generator"),
             seed=row.get("seed"),
             prompt_version=row.get("prompt_version"),
-            prompt_hash=row.get("prompt_hash"),
-            catalog_hash=row.get("catalog_hash"),
             metadata={key: item for key, item in row.items() if key not in known},
         )
 
@@ -275,8 +269,6 @@ class CandidateRecord:
             "generator": self.generator,
             "seed": self.seed,
             "prompt_version": self.prompt_version,
-            "prompt_hash": self.prompt_hash,
-            "catalog_hash": self.catalog_hash,
         }
 
 
@@ -369,14 +361,12 @@ class LayerManifestEntry:
     source_method: str | None
     source_run_id: str | None
     config: dict[str, Any]
-    config_hash: str
-    content_hash: str
     input_count: int
     output_count: int
     created_at_utc: str
 
     def __post_init__(self) -> None:
-        for name in ("method", "run_id", "path", "config_hash", "content_hash", "created_at_utc"):
+        for name in ("method", "run_id", "path", "created_at_utc"):
             object.__setattr__(self, name, _nonempty(getattr(self, name), name))
         _integer(self.source_layer, "source_layer", minimum=0)
         _integer(self.target_layer, "target_layer", minimum=1)
@@ -404,8 +394,6 @@ class LayerManifestEntry:
             "source_method": self.source_method,
             "source_run_id": self.source_run_id,
             "config": dict(self.config),
-            "config_hash": self.config_hash,
-            "content_hash": self.content_hash,
             "input_count": self.input_count,
             "output_count": self.output_count,
             "created_at_utc": self.created_at_utc,
@@ -415,8 +403,8 @@ class LayerManifestEntry:
     def from_dict(cls, value: Mapping[str, Any]) -> "LayerManifestEntry":
         allowed = {
             "method", "run_id", "target_layer", "path", "source_layer",
-            "source_method", "source_run_id", "config", "config_hash",
-            "content_hash", "input_count", "output_count", "created_at_utc",
+            "source_method", "source_run_id", "config", "input_count",
+            "output_count", "created_at_utc",
         }
         _reject_unknown(value, allowed, "manifest layer")
         missing = sorted(allowed - {"source_method", "source_run_id"} - set(value))
@@ -431,8 +419,6 @@ class LayerManifestEntry:
             source_method=value.get("source_method"),
             source_run_id=value.get("source_run_id"),
             config=_mapping(value["config"], "manifest layer config"),
-            config_hash=value["config_hash"],
-            content_hash=value["content_hash"],
             input_count=value["input_count"],
             output_count=value["output_count"],
             created_at_utc=value["created_at_utc"],
@@ -550,10 +536,7 @@ class HFBuildSpec:
     samples_per_source: int = 1
     pair_policy: str = "none"
     reuse_limit: int = 5
-    train_partitions: tuple[int, ...] = ()
     downsample_size: int | None = None
-    heldout_ratio: float = 0.3
-    test_ratio_within_heldout: float = 0.5
     score_names: tuple[str, ...] = ()
     score_run_ids: tuple[str, ...] = ()
     seed: int = 42
@@ -563,8 +546,7 @@ class HFBuildSpec:
         allowed = {
             "output_name", "datasets", "include_methods", "include_runs",
             "include_layers", "composition", "method_weights", "samples_per_source",
-            "pair_policy", "reuse_limit", "train_partitions", "downsample_size", "heldout_ratio",
-            "test_ratio_within_heldout", "score_names", "seed",
+            "pair_policy", "reuse_limit", "downsample_size", "score_names", "seed",
             "score_run_ids",
         }
         _reject_unknown(value, allowed, "hf")
@@ -585,10 +567,7 @@ class HFBuildSpec:
             samples_per_source=value.get("samples_per_source", 1),
             pair_policy=value.get("pair_policy", "none"),
             reuse_limit=value.get("reuse_limit", 5),
-            train_partitions=tuple(value.get("train_partitions", ())),
             downsample_size=value.get("downsample_size"),
-            heldout_ratio=value.get("heldout_ratio", 0.3),
-            test_ratio_within_heldout=value.get("test_ratio_within_heldout", 0.5),
             score_names=_string_tuple(value.get("score_names"), "hf.score_names"),
             score_run_ids=_string_tuple(value.get("score_run_ids"), "hf.score_run_ids"),
             seed=value.get("seed", 42),
@@ -608,82 +587,13 @@ class HFBuildSpec:
             raise ValueError("hf.include_layers must not contain duplicates")
         _integer(self.samples_per_source, "hf.samples_per_source", minimum=1)
         _integer(self.reuse_limit, "hf.reuse_limit", minimum=1)
-        for partition in self.train_partitions:
-            _integer(partition, "hf.train_partitions", minimum=1)
-        if len(self.train_partitions) != len(set(self.train_partitions)):
-            raise ValueError("hf.train_partitions must not contain duplicates")
-        if self.train_partitions and self.train_partitions != tuple(
-            range(1, len(self.train_partitions) + 1)
-        ):
-            raise ValueError("hf.train_partitions must be the contiguous prefix 1..N")
-        if self.train_partitions and self.downsample_size is not None:
-            raise ValueError("hf.downsample_size cannot be combined with hf.train_partitions")
         if self.downsample_size is not None:
             _integer(self.downsample_size, "hf.downsample_size", minimum=3)
-        if (
-            isinstance(self.heldout_ratio, bool)
-            or not isinstance(self.heldout_ratio, (int, float))
-            or isinstance(self.test_ratio_within_heldout, bool)
-            or not isinstance(self.test_ratio_within_heldout, (int, float))
-            or not 0 < self.heldout_ratio < 1
-            or not 0 < self.test_ratio_within_heldout < 1
-        ):
-            raise ValueError("HF split ratios must be between 0 and 1")
         if any(weight < 0 or not math.isfinite(weight) for weight in self.method_weights.values()):
             raise ValueError("HF method weights must be finite and non-negative")
         if self.composition == "weighted" and not any(self.method_weights.values()):
             raise ValueError("Weighted composition requires at least one positive method weight")
         _integer(self.seed, "hf.seed", minimum=0)
-
-
-@dataclass(frozen=True)
-class WorkflowConfig:
-    """Complete versioned configuration for generation and optional HF export."""
-
-    dataset: str
-    generations: tuple[GenerationSpec, ...] = ()
-    hf: HFBuildSpec | None = None
-    dataset_root: str = "data/custom_datasets"
-    seed: int = 42
-    schema_version: int = WORKFLOW_SCHEMA_VERSION
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "WorkflowConfig":
-        allowed = {"schema_version", "dataset", "dataset_root", "seed", "generations", "hf"}
-        _reject_unknown(value, allowed, "workflow")
-        if "dataset" not in value:
-            raise ValueError("Workflow requires dataset")
-        generation_values = value.get("generations", [])
-        if not isinstance(generation_values, list):
-            raise ValueError("workflow.generations must be an array")
-        hf_value = value.get("hf")
-        if hf_value is not None and not isinstance(hf_value, Mapping):
-            raise ValueError("workflow.hf must be an object")
-        if any(not isinstance(item, Mapping) for item in generation_values):
-            raise ValueError("Every workflow generation must be an object")
-        workflow_seed = value.get("seed", 42)
-        resolved_hf = None
-        if hf_value is not None:
-            resolved_hf = dict(hf_value)
-            resolved_hf.setdefault("datasets", [value["dataset"]])
-            resolved_hf.setdefault("seed", workflow_seed)
-        result = cls(
-            dataset=value["dataset"],
-            generations=tuple(GenerationSpec.from_dict(item) for item in generation_values),
-            hf=HFBuildSpec.from_dict(resolved_hf) if resolved_hf is not None else None,
-            dataset_root=value.get("dataset_root", "data/custom_datasets"),
-            seed=workflow_seed,
-            schema_version=value.get("schema_version", WORKFLOW_SCHEMA_VERSION),
-        )
-        result.validate()
-        return result
-
-    def validate(self) -> None:
-        _nonempty(self.dataset, "workflow.dataset")
-        _nonempty(self.dataset_root, "workflow.dataset_root")
-        if self.schema_version != WORKFLOW_SCHEMA_VERSION:
-            raise ValueError(f"Unsupported workflow schema_version: {self.schema_version}")
-        _integer(self.seed, "workflow.seed", minimum=0)
 
 
 __all__ = [
@@ -701,6 +611,4 @@ __all__ = [
     "PerturbationManifest",
     "SCORE_SCHEMA_VERSION",
     "ScoreRecord",
-    "WORKFLOW_SCHEMA_VERSION",
-    "WorkflowConfig",
 ]

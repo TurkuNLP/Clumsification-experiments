@@ -25,7 +25,5 @@
   "score_run_ids": [
     "teacher-v1"
   ],
-  "heldout_ratio": 0.3,
-  "test_ratio_within_heldout": 0.5,
   "seed": 42
 }

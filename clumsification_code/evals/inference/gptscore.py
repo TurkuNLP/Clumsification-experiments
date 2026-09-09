@@ -261,7 +261,7 @@ def merge_prompt_overrides(
 
 class LocalHFGPTScoreInferenceModel:
     """
-    Adapter expected by evaluate_model_on_benchmark.py.
+    Adapter used by the shared benchmark runner.
 
     Public method:
       score_texts(texts, device=None, batch_size=..., max_length=...) -> np.ndarray
@@ -924,7 +924,7 @@ class LocalHFGPTScoreInferenceModel:
         max_length: int = 512,
     ) -> np.ndarray:
         """
-        Adapter expected by evaluate_model_on_benchmark.py.
+        Adapter used by the shared benchmark runner.
 
         `device` is ignored because the model owns its device/device_map.
         Under tensor parallelism, all ranks must call this method with the same

@@ -67,9 +67,6 @@ _METHODS: dict[str, MethodSpec] = {
     ),
 }
 
-_DEPRECATED_ALIASES: dict[str, str] = {}
-
-
 def list_method_specs(*, implemented_only: bool = False) -> tuple[MethodSpec, ...]:
     """Return canonical methods in stable registration order."""
     specs = tuple(_METHODS.values())
@@ -79,41 +76,16 @@ def list_method_specs(*, implemented_only: bool = False) -> tuple[MethodSpec, ..
 
 
 def get_method_spec(name: str) -> MethodSpec:
-    """Resolve a canonical method name, without implicit aliases."""
-    canonical_name = _DEPRECATED_ALIASES.get(name, name)
+    """Resolve one of the four supported perturbation methods."""
     try:
-        return _METHODS[canonical_name]
+        return _METHODS[name]
     except KeyError as exc:
         valid = ", ".join(_METHODS)
         raise ValueError(f"Unknown perturbation method {name!r}; choose one of: {valid}") from exc
-
-
-def register_method(
-    name: str,
-    factory: PerturbationFactory,
-    *,
-    perturbation_source: str | None = None,
-    description: str | None = None,
-) -> MethodSpec:
-    """Attach an implementation to an existing canonical method.
-
-    New names are rejected intentionally: the canonical vocabulary should be
-    reviewed before it becomes part of dataset provenance.
-    """
-    current = get_method_spec(name)
-    updated = MethodSpec(
-        name=current.name,
-        perturbation_source=perturbation_source or current.perturbation_source,
-        description=description or current.description,
-        factory=factory,
-    )
-    _METHODS[name] = updated
-    return updated
 
 
 __all__ = [
     "MethodSpec",
     "get_method_spec",
     "list_method_specs",
-    "register_method",
 ]

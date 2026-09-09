@@ -121,45 +121,10 @@ def load_fe_model(
             map_location=map_location,
         )
 
-    head_path = os.path.join(final_dir, "fe_head.pt")
-    if not os.path.exists(head_path):
-        from clumsification_code.compat.fe_checkpoints import find_legacy_head
-
-        head_path = find_legacy_head(final_dir)
-
-    head_state = torch.load(head_path, map_location=map_location)
-    if "evaluation_head" not in head_state:
-        from clumsification_code.compat.fe_checkpoints import normalize_legacy_head_state
-
-        head_state = normalize_legacy_head_state(head_state)
-    param_dtype = param_dtype or get_preferred_param_dtype()
-
-    evaluation_head_state = head_state["evaluation_head"]
-
-    legacy_head = any(
-        key.startswith("net.0.") or key.startswith("net.3.")
-        for key in evaluation_head_state
+    raise FileNotFoundError(
+        "No supported FE checkpoint was found. Expected either a complete "
+        "FE checkpoint or a Trainer checkpoint with fe_model_config.json."
     )
-    model = FEModel(
-        model_name=final_dir,
-        hidden_dim=head_state.get("hidden_dim", 256),
-        dropout=head_state.get("dropout", 0.1),
-        attn_implementation=attn_implementation,
-        param_dtype=param_dtype,
-        legacy_head=legacy_head,
-        pooling="mean",
-    )
-
-    model.evaluation_head.load_state_dict(evaluation_head_state, strict=True)
-    model.to(dtype=param_dtype)
-
-    assert_uniform_floating_dtype(
-        model,
-        expected_dtype=param_dtype,
-        name="loaded FEModel",
-    )
-
-    return model
 
 
 def cleanup_memory() -> None:

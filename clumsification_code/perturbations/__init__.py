@@ -1,5 +1,5 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
-from .registry import MethodSpec, get_method_spec, list_method_specs, register_method
+from .registry import MethodSpec, get_method_spec, list_method_specs
 from .schemas import (
     ChatRunner,
     GenerationRuntime,
@@ -13,9 +13,6 @@ from .sampling import (
     EditCatalogEntry,
     SampledEditAssignment,
     load_edit_catalog,
-    sample_edit_assignment,
-    sample_edit_types,
-    sample_severity,
 )
 from .generation import (
     GenerationValidationError,
@@ -58,14 +55,10 @@ __all__ = [
     "PerturbationResult",
     "get_method_spec",
     "list_method_specs",
-    "register_method",
     "SEVERITIES",
     "EditCatalogEntry",
     "SampledEditAssignment",
     "load_edit_catalog",
-    "sample_edit_assignment",
-    "sample_edit_types",
-    "sample_severity",
     "PerturbationGenerationService",
     "GenerationValidationError",
     "generate_layer",

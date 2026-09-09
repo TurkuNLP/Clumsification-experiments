@@ -54,6 +54,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--method-config", default=None)
+    parser.add_argument(
+        "--assignment-file",
+        type=Path,
+        default=None,
+        help=(
+            "Frozen LLM assignment JSONL created by plan_llm_assignments.py. "
+            "When supplied, its matching method rows replace runtime sampling."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -103,6 +112,9 @@ def main() -> None:
                 "n_jobs": args.n_jobs,
                 "allow_unchanged": args.allow_unchanged,
                 "max_retries": args.max_retries,
+                "assignment_file": (
+                    str(args.assignment_file) if args.assignment_file is not None else None
+                ),
             }.items()
             if value is not None
         }

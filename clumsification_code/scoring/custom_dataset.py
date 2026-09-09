@@ -90,12 +90,30 @@ def load_score_tasks(
     seed: int,
     include_originals: bool = True,
     reference_policy: str = "original",
+    source_partitions: Iterable[str] | None = None,
 ) -> tuple[list[ScoreTask], list[str]]:
     """Load manifest-selected canonical candidates and their exact references."""
     if reference_policy not in {"original", "parent"}:
         raise ValueError("reference_policy must be 'original' or 'parent'")
     repository.validate_lineage()
     originals = {record.base_text_id: record for record in repository.read_originals()}
+
+    if source_partitions is not None:
+        requested_partitions = set(source_partitions)
+        if not requested_partitions:
+            raise ValueError("source_partitions must not be empty when supplied")
+        partition_by_original = repository.read_split_assignments()
+        if partition_by_original is None:
+            raise FileNotFoundError(
+                "source_partitions requires split_assignments.jsonl"
+            )
+        originals = {
+            base_text_id: record
+            for base_text_id, record in originals.items()
+            if partition_by_original.get(base_text_id) in requested_partitions
+        }
+        if not originals:
+            raise ValueError("No originals match the requested source_partitions")
 
     selected_ids = select_original_ids(
         originals,
@@ -378,6 +396,7 @@ def score_custom_dataset(
     target_layers: Iterable[int] | None = None,
     include_originals: bool = True,
     reference_policy: str = "original",
+    source_partitions: Iterable[str] | None = None,
     overwrite: bool = False,
     dataset_root: Path = Path("data/custom_datasets"),
 ) -> dict:
@@ -414,19 +433,8 @@ def score_custom_dataset(
         seed=seed,
         include_originals=include_originals,
         reference_policy=reference_policy,
+        source_partitions=source_partitions,
     )
-    selected_layer_hashes = {
-        f"{entry.method}:{entry.run_id}:{entry.target_layer}": {
-            "content_hash": entry.content_hash,
-            "config_hash": entry.config_hash,
-        }
-        for entry in repository.list_layers(
-            methods=methods,
-            run_ids=perturbation_run_ids,
-            target_layers=target_layers,
-        )
-    }
-
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
         scorer_config = {
@@ -666,7 +674,6 @@ def score_custom_dataset(
         "seed": seed,
         "selected_original_ids": selected_ids,
         "num_selected_originals": len(selected_ids),
-        "selected_layer_hashes": selected_layer_hashes,
         "num_candidate_tasks": len(tasks),
         "num_successful_scores": len(score_records),
         "num_failures": len(error_rows),

@@ -15,22 +15,36 @@ The perturbation workflow supports:
 - leakage-safe Hugging Face datasets with configurable mixtures and pairs.
 
 The fixed English source corpus, `nemotron-cc-high-propella-custom-eng`, has
-84,554 custom-vLLM-filtered documents partitioned source-wise into 15,000 dev,
-15,000 test, and 54,554 training documents. Its full filtering and partition
-provenance is documented in the perturbation workflow guide.
+84,554 custom-vLLM-filtered documents. Its shared source-level split manifest
+is created only after the four layer-1 perturbation workflows finish.
 
 ## Canonical commands
 
-Generate one perturbation layer:
+Create the frozen LLM assignment manifest, then generate all four independent
+layer-1 workflows. Pass the assignment file to both LLM commands.
 
 ```bash
+python scripts/plan_llm_assignments.py --dataset <dataset> --seed 42
+
 python scripts/generate_perturbations.py \
   --dataset <dataset> --source-layer 0 \
-  --method llm_sampled --run-id sampled-dynamic-v1 \
-  --model-path Qwen/Qwen3.5-27B
+  --method llm_sampled --run-id <run-id> \
+  --model-path Qwen/Qwen3.5-27B \
+  --assignment-file data/custom_datasets/<dataset>/perturbation_assignments.jsonl
 ```
 
-Build a Hugging Face dataset:
+After all four runs complete, generate and review the shared split manifest:
+
+```bash
+python scripts/assign_workflow_splits.py \
+  --dataset <dataset> \
+  --llm-single-run-id <run-id> \
+  --llm-sampled-run-id <run-id> \
+  --trad-single-run-id <run-id> \
+  --trad-sampled-run-id <run-id>
+```
+
+Then build a Hugging Face dataset if needed:
 
 ```bash
 python scripts/build_hf_dataset.py \
@@ -39,17 +53,8 @@ python scripts/build_hf_dataset.py \
   --include-layers 1 2
 ```
 
-For regression training, add `--exclude-layer-zero` to omit original texts
-from the flattened train/dev/test rows. LLM generation uses the historical
-text-length buckets and derives the context and output limits automatically
-for each bucket.
-
-Run generation and HF construction from one configuration:
-
-```bash
-python scripts/prepare_dataset.py run-all \
-  --config configs/workflow.example.json
-```
+LLM generation derives context and output limits automatically from source
+length.
 
 Score selected candidates for regression supervision:
 
