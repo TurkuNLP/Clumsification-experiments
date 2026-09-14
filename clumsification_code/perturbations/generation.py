@@ -14,6 +14,7 @@ from clumsification_code.data.candidate_identity import (
     make_candidate_id,
     make_original_candidate_id,
 )
+from clumsification_code.data.io import read_json, write_json_atomic
 from clumsification_code.data.repository import DatasetRepository
 from clumsification_code.data.schemas import (
     CandidateRecord,
@@ -37,6 +38,8 @@ class GenerationValidationError(ValueError):
 
 LEGACY_TEXT_BUCKETS = (512, 1024, 2048, 4096, 8192, 16384)
 LEGACY_PROMPT_OVERHEAD = 512
+_ACTIVE_VLLM_ENGINE: Any | None = None
+_ACTIVE_VLLM_ENGINE_KEY: tuple[str, int, int] | None = None
 
 # These fields describe the outcome of a generation attempt rather than its
 # reproducible request configuration.  They must not make a retry of the same
@@ -54,6 +57,12 @@ _ATTEMPT_AUDIT_FIELDS = frozenset(
         "retry_round",
         "unresolved_failure_count",
         "unresolved_failures",
+        "n_jobs",
+        "attempted_parent_ids",
+        "failed_parent_ids",
+        "completed_input_count",
+        "generation_complete",
+        "max_output_char_tolerance",
     }
 )
 
@@ -259,14 +268,27 @@ def run_vllm(
             prompt_tokens=entry["prompt_tokens"],
             required_tokens=entry["required_tokens"],
         )
+    global _ACTIVE_VLLM_ENGINE, _ACTIVE_VLLM_ENGINE_KEY
     for bucket, group in groups.items():
         indices = group["indices"]
-        llm = LLM(
-            model=model_path,
-            max_model_len=bucket,
-            tensor_parallel_size=max(1, torch.cuda.device_count()),
-            language_model_only=True,
-        )
+        tensor_parallel_size = max(1, torch.cuda.device_count())
+        engine_key = (model_path, bucket, tensor_parallel_size)
+        if _ACTIVE_VLLM_ENGINE_KEY != engine_key:
+            if "llm" in locals():
+                del llm
+            _ACTIVE_VLLM_ENGINE = None
+            _ACTIVE_VLLM_ENGINE_KEY = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _ACTIVE_VLLM_ENGINE = LLM(
+                model=model_path,
+                max_model_len=bucket,
+                tensor_parallel_size=tensor_parallel_size,
+                language_model_only=True,
+            )
+            _ACTIVE_VLLM_ENGINE_KEY = engine_key
+        llm = _ACTIVE_VLLM_ENGINE
         bucket_outputs = llm.chat(
             [prompts[index] for index in indices],
             sampling_params=SamplingParams(
@@ -276,10 +298,6 @@ def run_vllm(
         )
         for index, output in zip(indices, bucket_outputs):
             results[index] = _parse_vllm_text(output)
-        del llm
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     if any(output is None for output in results):
         raise RuntimeError("Bucketed vLLM execution did not produce every output")
     return [output if isinstance(output, SkippedGeneration) else str(output) for output in results]
@@ -288,6 +306,7 @@ def run_vllm(
 # Marker consumed by GenerationRuntime without changing the public injected
 # runner contract used by tests and downstream callers.
 run_vllm.supports_context_buckets = True
+run_vllm.supports_persistent_bucket_batches = True
 
 
 class PerturbationGenerationService:
@@ -429,9 +448,9 @@ class PerturbationGenerationService:
                 "run_id": run_id,
             }
         )
-        # ``seed`` defines the deterministic assignment and remains immutable
-        # across resumed runs. ``sampling_seed`` controls model generation and
-        # may advance for a retry without changing that assignment.
+        # ``seed`` defines the deterministic request and remains immutable
+        # across resumed runs. ``sampling_seed`` controls candidate generation
+        # and may advance for a retry without changing that request.
         generation_seed = int(method_config.get("sampling_seed", method_config["seed"]))
         persisted_config = {
             key: value for key, value in method_config.items() if key != "store"
@@ -443,11 +462,26 @@ class PerturbationGenerationService:
             if max_model_len < 1:
                 raise ValueError("LLM context limit must be positive")
             persisted_config["max_model_len"] = max_model_len
-            max_retries = int(method_config.get("max_retries", 3))
-            if max_retries < 0:
-                raise ValueError("max_retries must be non-negative")
+            max_retries = int(method_config.get("max_retries", 0))
+            if max_retries != 0:
+                raise ValueError(
+                    "LLM generation now gives each item one chance per submission; "
+                    "max_retries must be 0"
+                )
             method_config["max_retries"] = max_retries
             persisted_config["max_retries"] = max_retries
+            batch_size = int(method_config.get("batch_size", 512))
+            if batch_size < 1:
+                raise ValueError("batch_size must be a positive integer")
+            method_config["batch_size"] = batch_size
+            persisted_config["batch_size"] = batch_size
+            output_char_tolerance = int(
+                method_config.get("max_output_char_tolerance", 256)
+            )
+            if output_char_tolerance < 0:
+                raise ValueError("max_output_char_tolerance must be non-negative")
+            method_config["max_output_char_tolerance"] = output_char_tolerance
+            persisted_config["max_output_char_tolerance"] = output_char_tolerance
         elif spec.perturbation_source == "trad":
             max_attempts = int(method_config.get("max_attempts", 100))
             if max_attempts < 1:
@@ -463,19 +497,28 @@ class PerturbationGenerationService:
         )
         if retry_failed and overwrite:
             raise ValueError("retry_failed and overwrite cannot be used together")
+        progress_path = destination.with_suffix(".progress.json")
+        progress = (
+            read_json(progress_path)
+            if progress_path.exists() and not overwrite
+            else {}
+        )
+        if not isinstance(progress, dict):
+            raise ValueError(f"Invalid generation progress file: {progress_path}")
+        resumable = spec.perturbation_source == "LLM" and not overwrite
         if not retry_failed:
-            if destination.exists() or existing_entry is not None:
+            if (destination.exists() or existing_entry is not None) and not resumable:
                 raise FileExistsError(
                     "Canonical generation destination already exists for "
                     f"method={method!r}, run_id={run_id!r}, "
                     f"target_layer={resolved_target}"
                 )
-        elif existing_entry is None or not destination.exists():
+        elif existing_entry is None and not progress_path.exists():
             raise FileNotFoundError(
                 "retry_failed requires an existing canonical generation layer for "
                 f"method={method!r}, run_id={run_id!r}, target_layer={resolved_target}"
             )
-        elif (
+        elif existing_entry is not None and (
             existing_entry.source_layer != source_layer
             or existing_entry.source_method != source_method
             or existing_entry.source_run_id != resolved_source_run_id
@@ -483,6 +526,16 @@ class PerturbationGenerationService:
         ):
             raise ValueError(
                 "retry_failed request does not match the existing layer's immutable "
+                "source or generation configuration"
+            )
+        if existing_entry is not None and (
+            existing_entry.source_layer != source_layer
+            or existing_entry.source_method != source_method
+            or existing_entry.source_run_id != resolved_source_run_id
+            or _request_config(existing_entry.config) != _request_config(persisted_config)
+        ):
+            raise ValueError(
+                "Resume request does not match the existing layer's immutable "
                 "source or generation configuration"
             )
 
@@ -495,8 +548,7 @@ class PerturbationGenerationService:
         )
         existing_candidates: list[CandidateRecord] = []
         retry_round = 0
-        if retry_failed:
-            assert existing_entry is not None
+        if existing_entry is not None and not overwrite:
             if existing_entry.input_count != len(all_items):
                 raise ValueError(
                     "retry_failed source selection does not match the existing layer's "
@@ -506,16 +558,32 @@ class PerturbationGenerationService:
             existing_parent_ids = [record.parent_candidate_id for record in existing_candidates]
             if len(existing_parent_ids) != len(set(existing_parent_ids)):
                 raise ValueError("Existing retry layer has duplicate parent candidates")
-            retry_round = len(existing_entry.config.get("retry_history", [])) + 1
+        if retry_failed:
+            retry_round = len((existing_entry.config if existing_entry else {}).get("retry_history", [])) + 1
             # A resumed run must explore a different model trajectory without
             # changing the immutable assignment seed.
             generation_seed += retry_round
             method_config["sampling_seed"] = generation_seed
         existing_parent_ids = {record.parent_candidate_id for record in existing_candidates}
-        items = [
-            item for item in all_items if str(item.candidate_id) not in existing_parent_ids
-        ]
-        if retry_failed and not items:
+        attempted_parent_ids = set(progress.get("attempted_parent_ids", []))
+        failed_parent_ids = set(progress.get("failed_parent_ids", []))
+        if existing_entry is not None:
+            attempted_parent_ids.update(existing_entry.config.get("attempted_parent_ids", []))
+            failed_parent_ids.update(existing_entry.config.get("failed_parent_ids", []))
+        attempted_parent_ids.update(existing_parent_ids)
+        # The canonical layer is committed before the advisory progress file.
+        # If cancellation leaves that sidecar stale, a canonical success wins.
+        failed_parent_ids.difference_update(existing_parent_ids)
+        if retry_failed:
+            selected_parent_ids = failed_parent_ids
+        else:
+            selected_parent_ids = {
+                str(item.candidate_id) for item in all_items
+            } - attempted_parent_ids
+        items = [item for item in all_items if str(item.candidate_id) in selected_parent_ids]
+        if not items:
+            if existing_entry is None:
+                raise ValueError("No inputs are eligible for this generation mode")
             return existing_entry
         parent_base_ids: dict[str, str] = {}
         for item in items:
@@ -527,6 +595,51 @@ class PerturbationGenerationService:
         adapter = spec.create(method_config)
         runtime = GenerationRuntime(chat_runner=self.llm_runner)
         context_bucket_counts: dict[str, int] = defaultdict(int)
+        generation_batches: list[list[PerturbationInput]] | None = None
+
+        # Keep consecutive checkpoint batches inside one context bucket.  The
+        # built-in runner can therefore retain that bucket's vLLM engine while
+        # still committing at most ``batch_size`` items at a time.
+        if (
+            spec.perturbation_source == "LLM"
+            and getattr(self.llm_runner, "supports_persistent_bucket_batches", False)
+            and hasattr(adapter, "build_prompts")
+        ):
+            prompt_items = [
+                item.metadata
+                | {
+                    "base_text_id": item.base_text_id,
+                    "candidate_id": item.candidate_id,
+                    "text": item.text,
+                }
+                for item in items
+            ]
+            prompts = adapter.build_prompts(prompt_items)
+            planned_groups, planned_skipped = _plan_legacy_bucket_groups(
+                str(method_config.get("model") or method_config.get("model_path")),
+                prompts,
+                max_model_len=int(method_config.get("max_model_len", 32768)),
+            )
+            ordered_indices = [
+                index
+                for group in planned_groups.values()
+                for index in group["indices"]
+            ]
+            ordered_indices.extend(entry["prompt_index"] for entry in planned_skipped)
+            if len(ordered_indices) != len(items) or len(set(ordered_indices)) != len(items):
+                raise RuntimeError("Context-bucket planning did not preserve every input")
+            generation_batches = []
+            for group in planned_groups.values():
+                bucket_items = [items[index] for index in group["indices"]]
+                generation_batches.extend(
+                    bucket_items[start : start + batch_size]
+                    for start in range(0, len(bucket_items), batch_size)
+                )
+            skipped_items = [items[entry["prompt_index"]] for entry in planned_skipped]
+            generation_batches.extend(
+                skipped_items[start : start + batch_size]
+                for start in range(0, len(skipped_items), batch_size)
+            )
 
         def record_context_stats() -> None:
             stats = getattr(self.llm_runner, "last_context_stats", None)
@@ -535,256 +648,199 @@ class PerturbationGenerationService:
             for bucket, count in stats.get("bucket_counts", {}).items():
                 context_bucket_counts[str(bucket)] += int(count)
 
-        results = list(adapter.generate(items, runtime))
-        record_context_stats()
-
-        retry_counts: dict[str, int] = defaultdict(int)
-        if spec.perturbation_source == "LLM" and max_retries:
-            for attempt in range(1, max_retries + 1):
-                retry_parent_ids: set[str] = set()
-                for result in results:
-                    parent_id = str(result.parent_candidate_id)
-                    item = input_by_parent.get(parent_id)
-                    if item is None or isinstance(result.text, SkippedGeneration):
-                        continue
-                    invalid = not isinstance(result.text, str) or not result.text.strip()
-                    if (
-                        not invalid
-                        and not allow_unchanged
-                        and result.text.strip() == item.text.strip()
-                    ):
-                        invalid = True
-                    max_output_chars = result.metadata.get("max_output_chars")
-                    if max_output_chars is not None:
-                        if (
-                            isinstance(max_output_chars, bool)
-                            or not isinstance(max_output_chars, int)
-                            or max_output_chars < 1
-                        ):
-                            raise GenerationValidationError(
-                                "max_output_chars must be a positive integer"
-                            )
-                        invalid = invalid or len(result.text) > max_output_chars
-                    if invalid:
-                        retry_parent_ids.add(parent_id)
-                if not retry_parent_ids:
-                    break
-                pending = [
-                    item for item in items if str(item.candidate_id) in retry_parent_ids
-                ]
-                # A distinct sampling seed prevents a newly constructed vLLM
-                # engine from deterministically reproducing the failed answer.
-                adapter.config["sampling_seed"] = generation_seed + attempt
-                replacements = list(adapter.generate(pending, runtime))
-                record_context_stats()
-                replacement_by_parent = {
-                    str(result.parent_candidate_id): result for result in replacements
-                }
-                if set(replacement_by_parent) != retry_parent_ids:
-                    raise ValueError("LLM retry did not return exactly one result per input")
-                results = [
-                    replacement_by_parent.get(str(result.parent_candidate_id), result)
-                    for result in results
-                ]
-                for parent_id in retry_parent_ids:
-                    retry_counts[parent_id] += 1
         candidate_counts: dict[str, int] = defaultdict(int)
         for record in existing_candidates:
             candidate_counts[record.parent_candidate_id] = max(
                 candidate_counts[record.parent_candidate_id], record.candidate_index + 1
             )
-        candidates = []
-        skipped_over_length: list[dict[str, Any]] = []
-        skipped_invalid_output: list[dict[str, Any]] = []
-        for result in results:
-            parent_id = result.parent_candidate_id
-            if parent_id not in parent_base_ids:
-                raise ValueError("Generated result references an unknown parent candidate")
-            if isinstance(result.text, SkippedGeneration):
-                skipped_over_length.append(
-                    {
+        candidates: list[CandidateRecord] = []
+        persisted_failures = [
+            *(existing_entry.config.get("unresolved_failures", []) if existing_entry else []),
+            *progress.get("failures", []),
+        ]
+        failure_records: dict[str, dict[str, Any]] = {
+            str(entry["parent_candidate_id"]): dict(entry)
+            for entry in persisted_failures
+            if (
+                isinstance(entry, dict)
+                and "parent_candidate_id" in entry
+                and str(entry["parent_candidate_id"]) in failed_parent_ids
+            )
+        }
+        last_entry = existing_entry
+        effective_batch_size = batch_size if spec.perturbation_source == "LLM" else len(items)
+        if generation_batches is None:
+            generation_batches = [
+                items[start : start + effective_batch_size]
+                for start in range(0, len(items), effective_batch_size)
+            ]
+        for batch in generation_batches:
+            batch_parent_ids = {str(item.candidate_id) for item in batch}
+            batch_input_by_parent = {str(item.candidate_id): item for item in batch}
+            results = list(adapter.generate(batch, runtime))
+            record_context_stats()
+            if {str(result.parent_candidate_id) for result in results} != batch_parent_ids:
+                raise ValueError("Generation batch did not return exactly one result per input")
+            batch_candidates: list[CandidateRecord] = []
+            batch_failures: dict[str, dict[str, Any]] = {}
+            for result in results:
+                parent_id = str(result.parent_candidate_id)
+                item = batch_input_by_parent[parent_id]
+                failure: dict[str, Any] | None = None
+                if isinstance(result.text, SkippedGeneration):
+                    failure = {
                         "parent_candidate_id": parent_id,
+                        "reason": "over_length",
                         "prompt_tokens": result.text.prompt_tokens,
                         "required_tokens": result.text.required_tokens,
                     }
-                )
-                continue
-            if isinstance(result.text, SkippedPerturbation):
-                skipped_invalid_output.append(
-                    {
+                elif isinstance(result.text, SkippedPerturbation):
+                    failure = {
                         "parent_candidate_id": parent_id,
                         "reason": result.text.reason,
-                        "retry_attempts": result.text.attempts - 1,
                         "attempts": result.text.attempts,
                     }
+                elif not isinstance(result.text, str) or not result.text.strip():
+                    failure = {"parent_candidate_id": parent_id, "reason": "empty_output"}
+                elif not allow_unchanged and result.text.strip() == str(item.text).strip():
+                    failure = {"parent_candidate_id": parent_id, "reason": "unchanged_output"}
+                max_output_chars = result.metadata.get("max_output_chars")
+                if max_output_chars is not None:
+                    if (
+                        isinstance(max_output_chars, bool)
+                        or not isinstance(max_output_chars, int)
+                        or max_output_chars < 1
+                    ):
+                        raise GenerationValidationError("max_output_chars must be a positive integer")
+                    if failure is None and len(result.text) > max_output_chars:
+                        failure = {
+                            "parent_candidate_id": parent_id,
+                            "reason": "max_output_chars_exceeded",
+                            "output_chars": len(result.text),
+                            "max_output_chars": max_output_chars,
+                        }
+                expected = (
+                    self.repository.dataset_name, method, spec.perturbation_source,
+                    run_id, source_layer, source_method, resolved_source_run_id,
+                    resolved_target,
                 )
-                continue
-            if result.base_text_id != parent_base_ids[parent_id]:
-                raise ValueError("Generated result and parent have different base_text_id values")
-            expected = (
-                self.repository.dataset_name,
-                method,
-                spec.perturbation_source,
-                run_id,
-                source_layer,
-                source_method,
-                resolved_source_run_id,
-                resolved_target,
-            )
-            actual = (
-                result.dataset_name,
-                result.perturbation_method,
-                result.perturbation_source,
-                result.run_id,
-                result.source_layer,
-                result.source_method,
-                result.source_run_id,
-                result.target_layer,
-            )
-            if actual != expected:
-                raise GenerationValidationError(
-                    "Generated result provenance does not match the request"
+                actual = (
+                    result.dataset_name, result.perturbation_method,
+                    result.perturbation_source, result.run_id, result.source_layer,
+                    result.source_method, result.source_run_id, result.target_layer,
                 )
-            if not isinstance(result.text, str) or not result.text.strip():
-                skipped_invalid_output.append(
-                    {
-                        "parent_candidate_id": parent_id,
-                        "reason": "empty_output",
-                        "retry_attempts": retry_counts.get(parent_id, 0),
-                    }
-                )
-                continue
-            source_text = input_by_parent[parent_id].text
-            if not allow_unchanged and result.text.strip() == source_text.strip():
-                skipped_invalid_output.append(
-                    {
-                        "parent_candidate_id": parent_id,
-                        "reason": "unchanged_output",
-                        "retry_attempts": retry_counts.get(parent_id, 0),
-                    }
-                )
-                continue
-            max_output_chars = result.metadata.get("max_output_chars")
-            if max_output_chars is not None:
-                if (
-                    isinstance(max_output_chars, bool)
-                    or not isinstance(max_output_chars, int)
-                    or max_output_chars < 1
-                ):
-                    raise GenerationValidationError(
-                        "max_output_chars must be a positive integer"
-                    )
-                if len(result.text) > max_output_chars:
-                    retry_attempts = retry_counts.get(parent_id, 0)
-                    if retry_attempts < 3:
-                        skipped_invalid_output.append(
-                            {
-                                "parent_candidate_id": parent_id,
-                                "reason": "max_output_chars_exceeded",
-                                "output_chars": len(result.text),
-                                "max_output_chars": max_output_chars,
-                                "retry_attempts": retry_attempts,
-                            }
-                        )
-                        continue
-                    # Preserve otherwise valid samples after three retries
-                    # have failed the model-controlled length constraint. This
-                    # avoids systematic loss of valid candidates in large runs
-                    # while keeping the exception explicit in candidate data.
-                    result.metadata = {
-                        **result.metadata,
-                        "length_limit_exceeded": True,
-                        "output_chars": len(result.text),
-                        "max_output_chars": max_output_chars,
-                        "retry_attempts": retry_attempts,
-                    }
-            candidate_index = candidate_counts[parent_id]
-            candidate_counts[parent_id] += 1
-            candidates.append(
-                CandidateRecord(
-                    dataset_name=result.dataset_name,
-                    base_text_id=result.base_text_id,
-                    candidate_id=make_candidate_id(
+                if actual != expected or result.base_text_id != item.base_text_id:
+                    raise GenerationValidationError("Generated result provenance does not match the request")
+                if failure is not None:
+                    batch_failures[parent_id] = failure
+                    continue
+                candidate_index = candidate_counts[parent_id]
+                candidate_counts[parent_id] += 1
+                batch_candidates.append(
+                    CandidateRecord(
                         dataset_name=result.dataset_name,
-                        perturbation_method=method,
-                        run_id=run_id,
                         base_text_id=result.base_text_id,
+                        candidate_id=make_candidate_id(
+                            dataset_name=result.dataset_name,
+                            perturbation_method=method,
+                            run_id=run_id,
+                            base_text_id=result.base_text_id,
+                            target_layer=resolved_target,
+                            parent_candidate_id=parent_id,
+                            candidate_index=candidate_index,
+                        ),
+                        candidate_index=candidate_index,
+                        text=result.text,
+                        perturbation_method=method,
+                        perturbation_source=spec.perturbation_source,
+                        run_id=run_id,
+                        source_layer=source_layer,
+                        source_method=source_method,
+                        source_run_id=resolved_source_run_id,
                         target_layer=resolved_target,
                         parent_candidate_id=parent_id,
-                        candidate_index=candidate_index,
-                    ),
-                    candidate_index=candidate_index,
-                    text=result.text,
-                    perturbation_method=method,
-                    perturbation_source=spec.perturbation_source,
-                    run_id=run_id,
-                    source_layer=source_layer,
-                    source_method=source_method,
-                    source_run_id=resolved_source_run_id,
-                    target_layer=resolved_target,
-                    parent_candidate_id=parent_id,
-                    perturbation_edits=tuple(result.perturbation_edits),
-                    target_dimensions=tuple(result.target_dimensions),
-                    severity=result.severity,
-                    edit_count=result.edit_count,
-                    generator=result.generator,
-                    seed=result.seed,
-                    prompt_version=result.prompt_version,
-                    metadata=dict(result.metadata),
+                        perturbation_edits=tuple(result.perturbation_edits),
+                        target_dimensions=tuple(result.target_dimensions),
+                        severity=result.severity,
+                        edit_count=result.edit_count,
+                        generator=result.generator,
+                        seed=result.seed,
+                        prompt_version=result.prompt_version,
+                        metadata=dict(result.metadata),
+                    )
                 )
-            )
-        skipped_ids = {
-            entry["parent_candidate_id"]
-            for entry in [*skipped_over_length, *skipped_invalid_output]
-        }
-        expected_parent_ids = {str(item.candidate_id) for item in all_items}
-        if set(candidate_counts) | skipped_ids != expected_parent_ids:
-            missing = len(expected_parent_ids - set(candidate_counts) - skipped_ids)
-            raise ValueError(f"Generated layer has no candidate for {missing} input parent(s)")
-        if skipped_over_length:
-            persisted_config["skipped_over_length_count"] = len(skipped_over_length)
-            persisted_config["skipped_over_length"] = skipped_over_length
-        if skipped_invalid_output:
-            persisted_config["skipped_invalid_output_count"] = len(
-                skipped_invalid_output
-            )
-            persisted_config["skipped_invalid_output"] = skipped_invalid_output
-        if retry_counts:
-            persisted_config["retried_input_count"] = len(retry_counts)
-            persisted_config["retry_attempt_count"] = sum(retry_counts.values())
-        if spec.perturbation_source == "LLM" and context_bucket_counts:
-            persisted_config["bucket_counts"] = dict(context_bucket_counts)
-        merged_candidates = [*existing_candidates, *candidates]
-        if retry_failed:
-            retry_history = list(existing_entry.config.get("retry_history", []))
-            retry_history.append(
+            candidates.extend(batch_candidates)
+            attempted_parent_ids.update(batch_parent_ids)
+            failed_parent_ids.difference_update(batch_parent_ids)
+            failed_parent_ids.update(batch_failures)
+            for parent_id in batch_parent_ids:
+                failure_records.pop(parent_id, None)
+            failure_records.update(batch_failures)
+            merged_candidates = [*existing_candidates, *candidates]
+            completed_count = len(attempted_parent_ids)
+            checkpoint_config = dict(persisted_config)
+            checkpoint_config.update(
                 {
-                    "round": retry_round,
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "effective_seed": generation_seed,
-                    "attempted_input_count": len(items),
-                    "recovered_output_count": len(candidates),
-                    "remaining_failure_count": len(skipped_ids),
+                    "attempted_parent_ids": sorted(attempted_parent_ids),
+                    "failed_parent_ids": sorted(failed_parent_ids),
+                    "completed_input_count": completed_count,
+                    "generation_complete": completed_count == len(all_items),
+                    "unresolved_failure_count": len(failed_parent_ids),
                 }
             )
-            persisted_config["retry_history"] = retry_history
-            persisted_config["retry_round"] = retry_round
-            unresolved = [*skipped_over_length, *skipped_invalid_output]
-            if unresolved:
-                persisted_config["unresolved_failure_count"] = len(unresolved)
-                persisted_config["unresolved_failures"] = unresolved
-        return self.repository.write_candidate_layer(
-            merged_candidates,
-            method=method,
-            run_id=run_id,
-            target_layer=resolved_target,
-            source_layer=source_layer,
-            source_method=source_method,
-            source_run_id=resolved_source_run_id,
-            config=persisted_config,
-            input_count=len(all_items),
-            overwrite=overwrite or retry_failed,
-        )
+            if failure_records:
+                checkpoint_config["unresolved_failures"] = [
+                    failure_records[key] for key in sorted(failure_records)
+                ]
+            if context_bucket_counts:
+                checkpoint_config["bucket_counts"] = dict(context_bucket_counts)
+            if retry_failed:
+                retry_history = list(
+                    (existing_entry.config if existing_entry else {}).get("retry_history", [])
+                )
+                checkpoint_config["retry_history"] = [
+                    *retry_history,
+                    {
+                        "round": retry_round,
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "effective_seed": generation_seed,
+                        "attempted_input_count": len(items),
+                        "recovered_output_count": len(candidates),
+                        "remaining_failure_count": len(failed_parent_ids),
+                    },
+                ]
+                checkpoint_config["retry_round"] = retry_round
+            progress_value = {
+                "schema_version": 1,
+                "attempted_parent_ids": sorted(attempted_parent_ids),
+                "failed_parent_ids": sorted(failed_parent_ids),
+                "failures": [failure_records[key] for key in sorted(failure_records)],
+                "input_count": len(all_items),
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            last_entry = self.repository.write_candidate_layer(
+                merged_candidates,
+                method=method,
+                run_id=run_id,
+                target_layer=resolved_target,
+                source_layer=source_layer,
+                source_method=source_method,
+                source_run_id=resolved_source_run_id,
+                config=checkpoint_config,
+                input_count=len(all_items),
+                overwrite=True,
+            )
+            # The canonical layer is committed first. If cancellation lands
+            # between these two atomic writes, its manifest remains sufficient
+            # to resume without losing a successful result.
+            write_json_atomic(progress_path, progress_value, overwrite=True)
+            print(
+                f"Checkpoint: attempted={completed_count}/{len(all_items)}, "
+                f"successful={len(merged_candidates)}, failed={len(failed_parent_ids)}",
+                flush=True,
+            )
+        assert last_entry is not None
+        return last_entry
 
 
 def load_source_items(

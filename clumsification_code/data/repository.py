@@ -66,11 +66,11 @@ class DatasetRepository:
         assignments = load_split_assignments(self.split_assignments_path)
         values = {assignment.base_text_id: assignment.split for assignment in assignments}
         source_ids = {record.base_text_id for record in self.read_originals()}
-        if set(values) != source_ids:
+        unexpected = set(values) - source_ids
+        if unexpected:
             raise ValueError(
-                f"Split assignment file does not match originals: "
-                f"missing={len(source_ids - set(values))}, "
-                f"unexpected={len(set(values) - source_ids)}"
+                f"Split assignment file contains unknown originals: "
+                f"unexpected={len(unexpected)}"
             )
         return values
 
@@ -413,8 +413,6 @@ class DatasetRepository:
         overwrite: bool = False,
     ) -> LayerManifestEntry:
         values = list(records)
-        if not values:
-            raise ValueError("Cannot write an empty candidate layer")
         if input_count < 0:
             raise ValueError("input_count must be non-negative")
         expected = (self.dataset_name, method, run_id, target_layer)

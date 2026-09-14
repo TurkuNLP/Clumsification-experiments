@@ -96,10 +96,30 @@ def write_jsonl_atomic(
     return destination
 
 
+def append_jsonl_durable(path: str | Path, rows: Iterable[dict[str, Any]]) -> Path:
+    """Append JSONL rows and fsync them before reporting success.
+
+    This is intended for in-progress artifacts.  Callers publish their final
+    canonical file separately once every chunk has succeeded.
+    """
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            json.dump(
+                dict(row), handle, ensure_ascii=False, allow_nan=False, sort_keys=True
+            )
+            handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return destination
+
+
 __all__ = [
     "default_formatted_dataset_path",
     "read_json",
     "read_jsonl",
+    "append_jsonl_durable",
     "write_json_atomic",
     "write_jsonl_atomic",
 ]

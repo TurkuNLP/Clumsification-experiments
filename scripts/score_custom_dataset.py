@@ -34,6 +34,7 @@ def main():
         seed=args.seed,
         language=args.language,
         batch_size=args.batch_size,
+        scoring_chunk_size=args.scoring_chunk_size,
         model_name=args.base_model,
         bleurt_checkpoint=args.bleurt_checkpoint,
         metricx_model_name=args.metricx_model_name,

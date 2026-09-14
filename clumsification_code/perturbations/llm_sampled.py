@@ -177,14 +177,25 @@ class SampledLLMMethod:
         return self._planned_assignment_for_item(item, seed=seed)
 
     def build_requests(self, items: Sequence[Mapping[str, Any]]) -> list[SampledPromptRequest]:
-        return [
-            SampledPromptRequest(
-                messages=render_sampled_messages(item, assignment_for_item := self.assignment_for_item(item, index=index)),
-                assignment=assignment_for_item,
-                prompt_version=self.prompt_version,
+        requests = []
+        tolerance = int(self.config.get("max_output_char_tolerance", 256))
+        for index, item in enumerate(items):
+            assignment = self.assignment_for_item(item, index=index)
+            text = str(item.get("text", "")).replace("\n", " ")
+            base_limit = int(
+                item.get("max_length")
+                or min(int(len(text) * 1.1), len(text) + 500)
             )
-            for index, item in enumerate(items)
-        ]
+            requests.append(
+                SampledPromptRequest(
+                    messages=render_sampled_messages(
+                        item, assignment, max_length=base_limit + tolerance
+                    ),
+                    assignment=assignment,
+                    prompt_version=self.prompt_version,
+                )
+            )
+        return requests
 
     def build_prompts(self, items: Sequence[Mapping[str, Any]]) -> list[list[dict[str, str]]]:
         return [request.messages for request in self.build_requests(items)]
@@ -230,10 +241,18 @@ class SampledLLMMethod:
                 prompt_version=request.prompt_version,
                 method_config=dict(self.config),
                 metadata={
+                    "base_max_output_chars": int(
+                        item.metadata.get("max_length")
+                        or min(int(len(item.text.replace("\n", " ")) * 1.1), len(item.text.replace("\n", " ")) + 500)
+                    ),
+                    "max_output_char_tolerance": int(
+                        self.config.get("max_output_char_tolerance", 256)
+                    ),
                     "max_output_chars": int(
                         item.metadata.get("max_length")
                         or min(int(len(item.text.replace("\n", " ")) * 1.1), len(item.text.replace("\n", " ")) + 500)
                     )
+                    + int(self.config.get("max_output_char_tolerance", 256)),
                 },
             )
             for item, output, request in zip(items, outputs, requests)

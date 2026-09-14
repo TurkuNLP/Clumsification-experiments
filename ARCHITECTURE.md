@@ -34,10 +34,14 @@ to be 200--20,000 characters and satisfy Propella
 quality filter then retained only valid PASS assessments with a substantial
 high-quality section.
 
-The source corpus itself has no split fields. Once all four independent layer-1
-workflows have completed, `split_assignments.jsonl` assigns every source to one
-of 15,000 `dev`, 15,000 `test`, or 54,554 `train` entries. The assignment uses
-source length and the realized workflow characteristics.
+The source corpus itself has no split fields. `split_assignments.jsonl` assigns
+60,000 sources with outputs from every independent layer-1 workflow to 50,000
+`train`, 5,000 `dev`, and 5,000 `test` entries. Sources without a completed
+output are left unassigned. The assignment uses source length and realized
+workflow characteristics. This is a required gate before any HF build,
+including a build that selects only one method such as `trad_single`;
+`perturbation_assignments.jsonl` is an LLM-generation plan, not a substitute
+for this split manifest.
 
 ## Canonical repository
 
@@ -85,7 +89,11 @@ Canonical LLM method names are `llm_single`, `llm_sampled`; the only active
 traditional names are `trad_single` and `trad_sampled`. Both sample from the
 same five-operation mix: UniEval-style repetition, deletion, and shuffle;
 agreement corruption; and random same-lemma morphology. LLM implementations share a
-runner boundary and load vLLM only when needed. LLM edit count, operations,
+runner boundary and load vLLM only when needed. Context buckets are split into
+checkpoint batches (512 items by default); the engine is retained across
+batches in the same bucket, and successful candidates plus failure identities
+are persisted after every batch. A normal resubmission continues unattempted
+inputs, while `--retry-failed` selects only recorded failures. LLM edit count, operations,
 severity, and derived dimensions are selected in the frozen assignment file;
 retries retain those assignments and only change model-generation randomness.
 
@@ -131,9 +139,11 @@ Grouped HF rows contain aligned arrays for text, layer, candidate ID, method,
 run, parent ID, source layer/method/run, and requested scores. Exact provenance
 therefore survives selection and shuffling.
 
-`scripts/build_hf_dataset.py` calls `build_hf_dataset(HFBuildSpec, ...)` after
-the split manifest exists. CLI and JSON configuration are two front ends to one
-implementation.
+`scripts/build_hf_dataset.py` calls `build_hf_dataset(HFBuildSpec, ...)` only
+after the split manifest exists and covers every selected source. CLI and JSON
+configuration are two front ends to one implementation. Consequently, the
+current canonical split planner deliberately cannot produce a traditional-only
+HF dataset before the two LLM layer-1 workflows have also completed.
 
 ## Training boundary
 
@@ -153,6 +163,13 @@ audit metadata, never inference inputs.
 the Hugging Face Trainer. Evaluation adapters under
 `clumsification_code/evals/` expose shared candidate-scoring interfaces to the
 benchmark runner.
+
+Human-labeled model selection is isolated from both training and final
+evaluation. `run_benchmark --evaluation-role external-dev` scores only ELLIPSE
+train, JFLEG validation, and CoheSentia train, records their frozen provenance,
+and writes to `data/evals/external_dev/`. The ordinary `final` role loads the
+official ELLIPSE test split and the rest of the untouched English suite, writing
+to `data/evals/final/`. Story Cloze train is optional and diagnostic-only.
 
 ### Full pairwise training recipe
 

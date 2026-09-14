@@ -54,6 +54,8 @@ extract_jsons_P.py
 mans_roc.json
 OpenAI_lib.py
 
+annotation_demo
+
 # C extensions
 *.so
 

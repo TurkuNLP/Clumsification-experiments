@@ -1,6 +1,7 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import datasets
@@ -15,9 +16,14 @@ from clumsification_code.evals.nlg_eval_loader import (
 from clumsification_code.evals.standalone_benchmarks import (
     DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     DEFAULT_COHESENTIA_PATH,
+    DEFAULT_COHESENTIA_TRAIN_PATH,
     DEFAULT_ELLIPSE_PATH,
+    DEFAULT_ELLIPSE_TRAIN_PATH,
+    iter_cohesentia_records,
+    iter_ellipse_records,
     iter_standalone_records,
 )
+from clumsification_code.evals.external_dev import audit_external_dev_splits
 from clumsification_code.evals.inference.base import TextScorer
 from clumsification_code.evals.multilingual_benchmarks import (
     iter_basse_records,
@@ -47,6 +53,8 @@ def score_scalar_aspect(
     result_name: str,
     batch_size: int,
     max_length: int,
+    group_ids: Optional[List[str]] = None,
+    bootstrap_samples: int = 0,
 ) -> Dict[str, Any]:
     maybe_set_prompt_context(model, task_name, aspect)
 
@@ -57,7 +65,13 @@ def score_scalar_aspect(
         max_length=max_length,
     )
 
-    return correlation_bundle(labels, preds, result_name)
+    return correlation_bundle(
+        labels,
+        preds,
+        result_name,
+        group_ids=group_ids,
+        bootstrap_samples=bootstrap_samples,
+    )
 
 
 def eval_pairwise_preference_dataset(
@@ -72,6 +86,8 @@ def eval_pairwise_preference_dataset(
     batch_size: int,
     max_length: int,
     human_ties: Optional[List[bool]] = None,
+    group_ids: Optional[List[str]] = None,
+    bootstrap_samples: int = 0,
 ) -> Optional[Dict[str, Any]]:
     if len(preferred_texts) != len(dispreferred_texts):
         raise ValueError(
@@ -80,6 +96,8 @@ def eval_pairwise_preference_dataset(
         )
     if human_ties is not None and len(human_ties) != len(preferred_texts):
         raise ValueError(f"{name}: human tie mask length mismatch")
+    if group_ids is not None and len(group_ids) != len(preferred_texts):
+        raise ValueError(f"{name}: group_ids length mismatch")
 
     clean_text = getattr(data, "clean_text", None)
     if not callable(clean_text):
@@ -87,19 +105,23 @@ def eval_pairwise_preference_dataset(
 
     pairs = []
     tie_values = human_ties if human_ties is not None else [False] * len(preferred_texts)
-    for p, d, tie in zip(preferred_texts, dispreferred_texts, tie_values):
+    group_values = group_ids if group_ids is not None else [None] * len(preferred_texts)
+    for p, d, tie, group_id in zip(
+        preferred_texts, dispreferred_texts, tie_values, group_values
+    ):
         p = clean_text(p)
         d = clean_text(d)
         if p and d:
-            pairs.append((p, d, bool(tie)))
+            pairs.append((p, d, bool(tie), group_id))
 
     if not pairs:
         print(f"{name}: no valid preference pairs.")
         return None
 
-    preferred_texts = [p for p, _, _ in pairs]
-    dispreferred_texts = [d for _, d, _ in pairs]
-    human_ties = [tie for _, _, tie in pairs]
+    preferred_texts = [p for p, _, _, _ in pairs]
+    dispreferred_texts = [d for _, d, _, _ in pairs]
+    human_ties = [tie for _, _, tie, _ in pairs]
+    retained_group_ids = [group_id for _, _, _, group_id in pairs]
 
     maybe_set_prompt_context(model, task_name, aspect)
 
@@ -116,6 +138,8 @@ def eval_pairwise_preference_dataset(
         dispreferred_scores=all_scores[n:],
         human_ties=human_ties,
         name=name,
+        group_ids=retained_group_ids if group_ids is not None else None,
+        bootstrap_samples=bootstrap_samples,
     )
 
     print(
@@ -126,6 +150,133 @@ def eval_pairwise_preference_dataset(
     )
 
     return metrics
+
+
+def run_external_dev_suite(
+    *,
+    model: TextScorer,
+    device,
+    batch_size: int,
+    max_length: int,
+    ellipse_path=DEFAULT_ELLIPSE_TRAIN_PATH,
+    cohesentia_path=DEFAULT_COHESENTIA_TRAIN_PATH,
+    include_story_cloze_diagnostic: bool = False,
+    max_records_per_dimension: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run the human-labeled, non-test checkpoint-selection panel.
+
+    This route is deliberately separate from ``run_standard_benchmark_suite``.
+    It scores only author-defined non-test data and never invokes a final-suite
+    scoring loader. The provenance audit reads frozen final identifiers and
+    checksums only to enforce disjointness. Story Cloze train is optional and
+    diagnostic-only.
+    """
+    if max_records_per_dimension is not None and max_records_per_dimension < 1:
+        raise ValueError("max_records_per_dimension must be positive when provided")
+    if Path(ellipse_path).resolve() != DEFAULT_ELLIPSE_TRAIN_PATH.resolve():
+        raise ValueError(
+            "External development requires the audited ELLIPSE train path: "
+            f"{DEFAULT_ELLIPSE_TRAIN_PATH}"
+        )
+    if Path(cohesentia_path).resolve() != DEFAULT_COHESENTIA_TRAIN_PATH.resolve():
+        raise ValueError(
+            "External development requires the audited CoheSentia train path: "
+            f"{DEFAULT_COHESENTIA_TRAIN_PATH}"
+        )
+
+    audit_report = audit_external_dev_splits()
+    results: Dict[str, Any] = {
+        "external_dev__provenance": audit_report,
+        "external_dev__selection_datasets": ["ELLIPSE", "JFLEG", "CoheSentia"],
+    }
+
+    scalar_groups = {
+        "ELLIPSE_train": list(
+            iter_ellipse_records(ellipse_path, split_name="train")
+        ),
+        "CoheSentia_train": list(
+            iter_cohesentia_records(cohesentia_path, split_name="train")
+        ),
+    }
+    for dataset_name, dataset_records in scalar_groups.items():
+        by_aspect: Dict[str, List[Dict[str, Any]]] = {}
+        for record in dataset_records:
+            by_aspect.setdefault(str(record["aspect"]), []).append(record)
+        for aspect, records in by_aspect.items():
+            if max_records_per_dimension is not None:
+                records = records[:max_records_per_dimension]
+            result_name = f"external_dev__{dataset_name}__{aspect}"
+            results.update(
+                score_scalar_aspect(
+                    model=model,
+                    device=device,
+                    texts=[str(record["text"]) for record in records],
+                    labels=[float(record["human_score"]) for record in records],
+                    task_name=str(records[0]["task_family"]),
+                    aspect=aspect,
+                    result_name=result_name,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    group_ids=[str(record["source_id"]) for record in records],
+                    bootstrap_samples=1000,
+                )
+            )
+            results[f"{result_name}__n_sources"] = len(
+                {str(record["source_id"]) for record in records}
+            )
+
+    jfleg_records = data.load_jfleg_preference_records(split="validation")
+    jfleg_sources = {str(record["source_id"]) for record in jfleg_records}
+    if len(jfleg_records) != 2593 or len(jfleg_sources) != 719:
+        raise ValueError(
+            "Pinned JFLEG validation split changed after filtering: expected "
+            f"2593 pairs from 719 sources, observed {len(jfleg_records)} pairs "
+            f"from {len(jfleg_sources)} sources"
+        )
+    if max_records_per_dimension is not None:
+        jfleg_records = jfleg_records[:max_records_per_dimension]
+    jfleg_name = "external_dev__JFLEG_validation__correction_preference"
+    jfleg_metrics = eval_pairwise_preference_dataset(
+        name=jfleg_name,
+        model=model,
+        device=device,
+        preferred_texts=[str(record["preferred_text"]) for record in jfleg_records],
+        dispreferred_texts=[str(record["dispreferred_text"]) for record in jfleg_records],
+        task_name="jfleg",
+        aspect="grammar",
+        batch_size=batch_size,
+        max_length=max_length,
+        group_ids=[str(record["source_id"]) for record in jfleg_records],
+        bootstrap_samples=1000,
+    )
+    results.update(flatten_preference_metrics(jfleg_name, jfleg_metrics))
+    results[f"{jfleg_name}__n_sources"] = len(
+        {str(record["source_id"]) for record in jfleg_records}
+    )
+    results[f"{jfleg_name}__revision"] = data.JFLEG_REVISION
+
+    if include_story_cloze_diagnostic:
+        preferred, dispreferred = data.load_story_cloze_preference_pairs(split="train")
+        if max_records_per_dimension is not None:
+            preferred = preferred[:max_records_per_dimension]
+            dispreferred = dispreferred[:max_records_per_dimension]
+        diagnostic_name = "diagnostic__StoryCloze_train__ending_preference"
+        diagnostic_metrics = eval_pairwise_preference_dataset(
+            name=diagnostic_name,
+            model=model,
+            device=device,
+            preferred_texts=preferred,
+            dispreferred_texts=dispreferred,
+            task_name="story_cloze",
+            aspect="coherence",
+            batch_size=batch_size,
+            max_length=max_length,
+        )
+        results.update(
+            flatten_preference_metrics(diagnostic_name, diagnostic_metrics)
+        )
+
+    return results
 
 
 def run_standard_benchmark_suite(

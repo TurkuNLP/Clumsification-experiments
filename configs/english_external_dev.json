@@ -1,0 +1,82 @@
+{
+  "manifest_version": 1,
+  "role": "human_labeled_external_development",
+  "selection_datasets": [
+    {
+      "name": "ELLIPSE",
+      "split": "train",
+      "path": "data/benchmarks/ellipse/ELLIPSE_Final_github_train.csv",
+      "source_revision": "dc3b8f0b3b4332fc9f64302c4ccfc4ed582f4b43",
+      "source_count": 3911,
+      "sha256": "782344e99668a3ff508d7410c0eb6e36da70f3b28f81c96e367f1ca04924b06c",
+      "metrics": ["grammar_spearman", "cohesion_spearman"]
+    },
+    {
+      "name": "JFLEG",
+      "split": "validation",
+      "dataset": "jhu-clsp/jfleg",
+      "source_revision": "9b11261ccea2a5b33619af75f11d1607081c21e2",
+      "source_count_before_filtering": 755,
+      "source_count_after_filtering": 719,
+      "pair_count_after_filtering": 2593,
+      "metrics": ["correction_preference_strict_accuracy"]
+    },
+    {
+      "name": "CoheSentia",
+      "split": "train",
+      "path": "data/benchmarks/CohesentiaTrainData.json",
+      "source_revision": "891891af4d38518df2f305fa20a12bc9e63fd2e3",
+      "source_count": 434,
+      "sha256": "1e7a6041e8e9237ce2ad327fd828d0fe565c074d11aff6a9fde3ed71d1b0c4aa",
+      "metrics": ["coherence_holistic_spearman", "coherence_incremental_spearman"]
+    }
+  ],
+  "diagnostic_only": [
+    {
+      "name": "StoryCloze",
+      "split": "train",
+      "metric": "ending_preference_accuracy",
+      "selection_weight": 0
+    }
+  ],
+  "final_holdouts": [
+    {
+      "name": "ELLIPSE",
+      "split": "test",
+      "path": "data/benchmarks/ellipse/ELLIPSE_Final_github_test.csv",
+      "source_count": 2571,
+      "sha256": "7e990c6392a9df9554d15bdd22f0b568d19095cd6676ad39cb1eaa69c977ed7a"
+    },
+    {
+      "name": "JFLEG",
+      "split": "test",
+      "source_count_before_filtering": 748,
+      "source_count_after_filtering": 715,
+      "pair_count_after_filtering": 2582,
+      "source_text_overlap_with_validation": 0
+    },
+    {
+      "name": "CoheSentia",
+      "split": "test",
+      "path": "data/benchmarks/CohesentiaTestData.json",
+      "source_count": 49,
+      "sha256": "691b3b519c82cbe53fd8cae85cd67736535e31309a3afa2634b44c09a73a2331"
+    },
+    {
+      "name": "StoryCloze",
+      "split": "eval"
+    },
+    {
+      "name": "StoryCloze",
+      "split": "test",
+      "role": "confirmation_holdout"
+    }
+  ],
+  "selection_rule": {
+    "unit": "dataset",
+    "weighting": "equal_dataset_weight",
+    "within_dataset": "mean_dimension_rank",
+    "across_datasets": "mean_dataset_rank",
+    "tie_breakers": ["best_worst_dataset_rank", "cross_seed_consistency"]
+  }
+}

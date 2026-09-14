@@ -13,7 +13,16 @@ from typing import Dict, Iterator, List, Mapping, Optional
 # These are the repository-local evaluation files that are intentionally kept
 # outside NLG-eval.  Centralizing them prevents different runners from silently
 # using different copies of the same benchmark.
-DEFAULT_ELLIPSE_PATH = Path("data/benchmarks/ELLIPSE.csv")
+DEFAULT_ELLIPSE_TRAIN_PATH = Path(
+    "data/benchmarks/ellipse/ELLIPSE_Final_github_train.csv"
+)
+DEFAULT_ELLIPSE_TEST_PATH = Path(
+    "data/benchmarks/ellipse/ELLIPSE_Final_github_test.csv"
+)
+# The standard English suite is final evaluation, so its default must point to
+# the author-defined test partition.  Keep the old name as a compatibility
+# alias while making the scientific role explicit at the definitions above.
+DEFAULT_ELLIPSE_PATH = DEFAULT_ELLIPSE_TEST_PATH
 DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH = Path(
     "data/benchmarks/human-chatgpt-argumentative-essays.csv"
 )
@@ -22,6 +31,7 @@ DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH = Path(
 # ArgEssay corpus.
 DEFAULT_ARGESSAY_PATH = DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH
 DEFAULT_COHESENTIA_PATH = Path("data/benchmarks/CohesentiaTestData.json")
+DEFAULT_COHESENTIA_TRAIN_PATH = Path("data/benchmarks/CohesentiaTrainData.json")
 DEFAULT_MTEB_SUMMEVAL_DATASET = "mteb/summeval"
 
 
@@ -34,13 +44,20 @@ def _number(value: object) -> Optional[float]:
     return result if math.isfinite(result) else None
 
 
-def iter_ellipse_records(path: Path) -> Iterator[Dict[str, object]]:
+def iter_ellipse_records(
+    path: Path,
+    *,
+    split_name: str = "test",
+) -> Iterator[Dict[str, object]]:
     """Yield ELLIPSE records with one normalized record per essay."""
     with Path(path).open(encoding="utf-8", newline="") as handle:
         for row_number, row in enumerate(csv.DictReader(handle), start=2):
             text = (row.get("full_text") or "").strip()
             if not text:
                 continue
+            essay_id = (row.get("text_id_kaggle") or "").strip()
+            if not essay_id:
+                raise ValueError(f"ELLIPSE row {row_number} has no text_id_kaggle")
             # ELLIPSE supplies several language-quality dimensions.  Only
             # grammar and cohesion are in the primary fluency suite.
             for aspect, column, category in (
@@ -51,7 +68,8 @@ def iter_ellipse_records(path: Path) -> Iterator[Dict[str, object]]:
                 if score is None:
                     continue
                 yield {
-                    "id": f"ELLIPSE:{row_number}",
+                    "id": f"ELLIPSE:{split_name}:{essay_id}:{aspect}",
+                    "source_id": essay_id,
                     "source": None,
                     "text": text,
                     "human_scores": [score],
@@ -64,6 +82,7 @@ def iter_ellipse_records(path: Path) -> Iterator[Dict[str, object]]:
                     "task_family": "essays",
                     "fluency_categories": (category,),
                     "label_type": "scalar",
+                    "split": split_name,
                 }
 
 
@@ -107,8 +126,12 @@ def iter_human_chatgpt_essay_records(path: Path) -> Iterator[Dict[str, object]]:
                     }
 
 
-def iter_cohesentia_records(path: Path) -> Iterator[Dict[str, object]]:
-    """Yield evaluation-only holistic and incremental CoheSentia records."""
+def iter_cohesentia_records(
+    path: Path,
+    *,
+    split_name: str = "test",
+) -> Iterator[Dict[str, object]]:
+    """Yield holistic and incremental CoheSentia records."""
     with Path(path).open(encoding="utf-8") as handle:
         data = json.load(handle)
     entries = data.values() if isinstance(data, dict) else data
@@ -120,12 +143,14 @@ def iter_cohesentia_records(path: Path) -> Iterator[Dict[str, object]]:
         text = str(entry.get("Text", "")).strip()
         if not text:
             continue
+        story_id = str(entry.get("StoryID", index))
         for aspect, key in (("coherence_holistic", "HolisticData"), ("coherence_incremental", "IncrementalData")):
             score = _number(entry.get(key, {}).get("consensus_score"))
             if score is None:
                 continue
             yield {
-                "id": f"CoheSentia:{index}:{aspect}",
+                "id": f"CoheSentia:{split_name}:{story_id}:{aspect}",
+                "source_id": story_id,
                 "source": None,
                 "text": text,
                 "human_scores": [score],
@@ -138,6 +163,7 @@ def iter_cohesentia_records(path: Path) -> Iterator[Dict[str, object]]:
                 "task_family": "controlled_prose",
                 "fluency_categories": ("coherence",),
                 "label_type": "scalar",
+                "split": split_name,
             }
 
 

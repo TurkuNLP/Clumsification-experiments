@@ -2,18 +2,24 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import torch
 
-from clumsification_code.evals.benchmark_runner import run_standard_benchmark_suite
+from clumsification_code.evals.benchmark_runner import (
+    run_external_dev_suite,
+    run_standard_benchmark_suite,
+)
 from clumsification_code.evals.inference.fe import load_fe_inference_model
 from clumsification_code.evals.nlg_eval_loader import DEFAULT_NLG_EVAL_PATH
 from clumsification_code.evals.result_writer import EvalMetadata, write_results_jsonl
 from clumsification_code.evals.standalone_benchmarks import (
     DEFAULT_HUMAN_CHATGPT_ESSAYS_PATH,
     DEFAULT_COHESENTIA_PATH,
+    DEFAULT_COHESENTIA_TRAIN_PATH,
     DEFAULT_ELLIPSE_PATH,
+    DEFAULT_ELLIPSE_TRAIN_PATH,
 )
 
 _DTYPE_MAP = {
@@ -47,6 +53,15 @@ def parse_evaluation_run_name(name:str):
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--evaluation-role",
+        default="final",
+        choices=["final", "external-dev"],
+        help=(
+            "Run the untouched final suite or the separate human-labeled "
+            "non-test checkpoint-selection panel."
+        ),
+    )
     parser.add_argument(
         "--scorer",
         required=True,
@@ -83,6 +98,24 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Herbold et al. (2023) human/ChatGPT essay-comparison CSV.",
     )
     parser.add_argument("--cohesentia-path", default=str(DEFAULT_COHESENTIA_PATH))
+    parser.add_argument(
+        "--external-dev-ellipse-path",
+        default=str(DEFAULT_ELLIPSE_TRAIN_PATH),
+        help="Audited official ELLIPSE train partition used only for external development.",
+    )
+    parser.add_argument(
+        "--external-dev-cohesentia-path",
+        default=str(DEFAULT_COHESENTIA_TRAIN_PATH),
+        help="Released CoheSentia train pool used only for external development.",
+    )
+    parser.add_argument(
+        "--include-dev-story-cloze-diagnostic",
+        action="store_true",
+        help=(
+            "Also evaluate Story Cloze train as a secondary diagnostic. Its "
+            "result is excluded from checkpoint selection."
+        ),
+    )
     parser.add_argument(
         "--skip-preferences",
         action="store_true",
@@ -284,19 +317,31 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     model = build_scorer(args, device)
 
-    results = run_standard_benchmark_suite(
-        model=model,
-        device=device,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        nlg_eval_path=args.nlg_eval_path,
-        ellipse_path=args.ellipse_path,
-        human_chatgpt_essays_path=args.human_chatgpt_essays_path,
-        cohesentia_path=args.cohesentia_path,
-        skip_preferences=args.skip_preferences,
-        max_records_per_dimension=args.max_records_per_dimension,
-        include_multilingual=not args.skip_multilingual,
-    )
+    if args.evaluation_role == "external-dev":
+        results = run_external_dev_suite(
+            model=model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            ellipse_path=args.external_dev_ellipse_path,
+            cohesentia_path=args.external_dev_cohesentia_path,
+            include_story_cloze_diagnostic=args.include_dev_story_cloze_diagnostic,
+            max_records_per_dimension=args.max_records_per_dimension,
+        )
+    else:
+        results = run_standard_benchmark_suite(
+            model=model,
+            device=device,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            nlg_eval_path=args.nlg_eval_path,
+            ellipse_path=args.ellipse_path,
+            human_chatgpt_essays_path=args.human_chatgpt_essays_path,
+            cohesentia_path=args.cohesentia_path,
+            skip_preferences=args.skip_preferences,
+            max_records_per_dimension=args.max_records_per_dimension,
+            include_multilingual=not args.skip_multilingual,
+        )
 
     model_dir = (
         args.model_dir
@@ -307,17 +352,29 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
 
     if args.scorer == "fe":
-        model_name, language, pert_type, num_layers, training_ds_name = parse_evaluation_run_name(args.model_name)
+        if args.evaluation_role == "external-dev":
+            model_name = args.model_name
+            training_dataset = args.training_dataset
+            pert_type = args.perturbation_type
+            num_layers = args.num_layers
+        else:
+            model_name, language, pert_type, num_layers, training_ds_name = parse_evaluation_run_name(args.model_name)
+            training_dataset = language + "/" + training_ds_name
 
         metadata = EvalMetadata(
             model_name=model_name,
             model_dir=model_dir,
             scorer=args.scorer,
-            training_dataset=language+"/"+training_ds_name,
+            training_dataset=training_dataset,
             perturbation_type=pert_type,
             num_layers=num_layers,
             context_length=args.context_length,
-            evaluation_tracks="english" if args.skip_multilingual else "english,multilingual",
+            evaluation_tracks=(
+                "external-dev"
+                if args.evaluation_role == "external-dev"
+                else ("english" if args.skip_multilingual else "english,multilingual")
+            ),
+            evaluation_role=args.evaluation_role,
         )
 
     else:
@@ -333,10 +390,20 @@ def main(argv: Optional[list[str]] = None) -> None:
             context_length=args.context_length,
             protocol=protocol,
             rubric=rubric,
-            evaluation_tracks="english" if args.skip_multilingual else "english,multilingual",
+            evaluation_tracks=(
+                "external-dev"
+                if args.evaluation_role == "external-dev"
+                else ("english" if args.skip_multilingual else "english,multilingual")
+            ),
+            evaluation_role=args.evaluation_role,
         )
 
-    write_results_jsonl(metadata=metadata, results=results)
+    eval_dir = (
+        "data/evals/external_dev"
+        if args.evaluation_role == "external-dev"
+        else "data/evals/final"
+    )
+    write_results_jsonl(metadata=metadata, results=results, eval_dir=Path(eval_dir))
 
 
 if __name__ == "__main__":

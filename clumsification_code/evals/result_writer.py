@@ -24,6 +24,7 @@ class EvalMetadata:
     protocol: str = ""
     rubric: str = ""
     evaluation_tracks: str = "english,multilingual"
+    evaluation_role: str = "final"
 
 
 def json_sanitize(x: Any) -> Any:

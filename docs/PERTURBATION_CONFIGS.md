@@ -101,10 +101,11 @@ python scripts/generate_perturbations.py \
   --assignment-file data/custom_datasets/nemotron-cc-high-propella-custom-eng/perturbation_assignments.jsonl
 ```
 
-After all four independent workflows have completed, create one source-level
-split file. It defaults to 15,000 development sources, 15,000 test sources,
-and all remaining sources in training. It balances source length and LLM
-assignments while treating realized traditional edit types as a lighter signal.
+Create one source-level split file after the four independent workflows have
+written their outputs. It keeps only sources present in every workflow and
+defaults to 50,000 training, 5,000 development, and 5,000 test sources. It
+balances source length and realized LLM characteristics while treating
+traditional edit types as a lighter signal.
 
 ```bash
 python scripts/assign_workflow_splits.py \
@@ -118,7 +119,13 @@ python scripts/assign_workflow_splits.py \
 The result is `split_assignments.jsonl`, with one `base_text_id` and one of
 `train`, `dev`, or `test` per row. It is the only supported source of split
 membership. It applies to the original and to all workflow outputs for that
-source.
+source. It is also a hard prerequisite for `scripts/build_hf_dataset.py`.
+
+`perturbation_assignments.jsonl` is not a split file: it records only the
+preplanned LLM edit requests. In particular, having completed and scored
+`trad_single` (or either traditional workflow) does not yet permit an HF build.
+The current split planner requires the completed `llm_single`, `llm_sampled`,
+`trad_single`, and `trad_sampled` layer-1 outputs named in the command above.
 
 ## Generate one layer
 
@@ -207,13 +214,15 @@ python scripts/generate_perturbations.py \
 ```
 
 `target_layer` defaults to `source_layer + 1`. A perturbed source requires
-both `source_method` and `source_run_id`. Existing outputs are protected; use
-`--overwrite` only when replacement is intentional. A reusable method config
-can be passed with `--method-config`; explicit CLI values take precedence.
+both `source_method` and `source_run_id`. LLM outputs are checkpointed after
+each batch, and the same command resumes unattempted inputs automatically. Use
+`--overwrite` only when replacement from the beginning is intentional. A
+reusable method config can be passed with `--method-config`; explicit CLI
+values take precedence.
 
 ### Recover failed inputs without regenerating successful ones
 
-If a completed layer contains skipped inputs, rerun the original command with
+If a partial or completed layer contains failed inputs, rerun the original command with
 the same dataset, source, method, run ID, frozen assignment file, and
 generation configuration, adding `--retry-failed`:
 
@@ -225,12 +234,34 @@ python scripts/generate_perturbations.py \
   --retry-failed
 ```
 
-This retries only source candidates that still lack an output, preserves all
-existing candidate rows, and atomically replaces the same layer file and its
-manifest entry with the merged result. It does not create another run. Each
+This retries only source candidates explicitly recorded as failed; unattempted
+inputs are not selected in this mode. It preserves all successful candidate
+rows and updates the same layer. It does not create another run. Each
 retry records its effective seed, attempted and recovered counts, and any
-remaining failures in that layer's manifest. `--retry-failed` cannot be used
-with `--overwrite`.
+remaining failures in that layer's manifest. For both LLM and traditional
+methods, retry rounds use a distinct effective generation seed while retaining
+the original `seed` as the immutable request seed. `--retry-failed` cannot be
+used with `--overwrite`.
+
+Without `--retry-failed`, re-submitting an interrupted LLM job continues only
+inputs that have never been attempted. Within each context bucket, results are
+committed in chunks of at most `--batch-size` items (default 512); a smaller
+bucket is committed as one batch. Every selected input gets exactly one model
+generation chance per submission. The adjacent `.progress.json` file records
+attempted and failed parent identities, while the canonical layer and manifest
+are updated at every batch boundary.
+
+The derived output-length ceiling includes a 256-character tolerance by
+default. This tolerance is included in the prompt and enforced by validation,
+so small 100--200 character overruns are accepted consistently. Set
+`--max-output-char-tolerance 0` for the former strict behavior or provide a
+different non-negative value.
+The tolerance may be increased when using `--retry-failed`, so failures from a
+previous strict run can be recovered without changing its run ID.
+
+`--n-jobs` controls only local parallelism and may be changed for a retry. All
+source, method, run, seed, and content-generation settings must still match
+the existing layer.
 
 ### Sampled LLM options
 
@@ -350,6 +381,11 @@ original or parent text to either judge, even when `--reference-policy` is
 used for score provenance. The reference policy controls stored candidate
 identity only.
 
+Scoring may occur before or after writing `split_assignments.jsonl` when all
+candidates are being scored. If `--source-partitions` is used, write the split
+manifest first. Regardless of scoring order, do not invoke the HF builder until
+the split manifest exists and covers every source selected for the build.
+
 ## Build a Hugging Face dataset
 
 The standalone builder accepts canonical CLI fields or an `HFBuildSpec` JSON
@@ -369,7 +405,31 @@ python scripts/build_hf_dataset.py \
 ```
 
 The builder reads `split_assignments.jsonl` automatically and requires it to
-cover every selected source.
+cover every selected source. Therefore the full order is: plan LLM assignments;
+generate all four independent layer-1 workflows; write the shared split
+manifest; score the candidates needed for supervision (unless already scored);
+then build the HF dataset. The builder does not read or derive splits from
+`perturbation_assignments.jsonl`.
+
+For a scored `trad_single` pair dataset, after the four-workflow split manifest
+exists, use one score run ID for each requested scoring method:
+
+```bash
+python scripts/build_hf_dataset.py \
+  --datasets nemotron-cc-high-propella-custom-eng \
+  --output-name en/trad_single_pairs_bertscore_bleurt \
+  --include-methods trad_single \
+  --include-runs trad-single-balanced-v2 \
+  --include-layers 1 \
+  --pair-policy original_only \
+  --score-names bertscore_f1 bleurt \
+  --score-run-ids bertscore-trad-v1 bleurt-trad-v1
+```
+
+This emits one row per original--perturbation pair. Each row has two aligned
+values in `texts`, `labels`, `bertscore_f1`, and `bleurt`; item order is
+intentionally shuffled, so use the aligned `labels` or candidate metadata
+rather than assuming a fixed left/right position.
 
 Equivalent config-based use:
 

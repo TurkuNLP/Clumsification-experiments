@@ -43,6 +43,12 @@ def parse_score_args():
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
+        "--scoring-chunk-size",
+        type=int,
+        default=1000,
+        help="Number of candidates scored and checkpointed at a time.",
+    )
+    parser.add_argument(
         "--base-model",
         type=str,
         default=DEFAULT_PPL_MODEL,
@@ -127,6 +133,8 @@ def parse_score_args():
         parser.error("--sample-limit must be positive when supplied.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.scoring_chunk_size <= 0:
+        parser.error("--scoring-chunk-size must be positive.")
     if args.max_tokens < 2:
         parser.error("--max-tokens must be at least 2.")
     if args.metricx_max_input_length < 2:

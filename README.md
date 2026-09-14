@@ -16,7 +16,8 @@ The perturbation workflow supports:
 
 The fixed English source corpus, `nemotron-cc-high-propella-custom-eng`, has
 84,554 custom-vLLM-filtered documents. Its shared source-level split manifest
-is created only after the four layer-1 perturbation workflows finish.
+is created only after the four layer-1 perturbation workflows finish, with
+74,554 train, 5,000 development, and 5,000 test sources by default.
 
 ## Canonical commands
 
@@ -33,7 +34,10 @@ python scripts/generate_perturbations.py \
   --assignment-file data/custom_datasets/<dataset>/perturbation_assignments.jsonl
 ```
 
-After all four runs complete, generate and review the shared split manifest:
+This is a required workflow boundary: do not build an HF dataset after only a
+subset of the four workflows (for example, after `trad_single` alone). After
+all four layer-1 runs complete successfully, generate and review the shared
+split manifest:
 
 ```bash
 python scripts/assign_workflow_splits.py \
@@ -44,17 +48,27 @@ python scripts/assign_workflow_splits.py \
   --trad-sampled-run-id <run-id>
 ```
 
-Then build a Hugging Face dataset if needed:
+`perturbation_assignments.jsonl` and `split_assignments.jsonl` have different
+roles. The former freezes only LLM edit requests; the latter assigns every
+source to `train`, `dev`, or `test` and is required by the HF builder.
+
+Score candidates whenever the desired supervision is available, then build a
+Hugging Face dataset. For example, this creates original--`trad_single` pairs
+with both BERTScore F1 and BLEURT arrays:
 
 ```bash
 python scripts/build_hf_dataset.py \
   --datasets <dataset> --output-name <name> \
-  --include-methods llm_sampled trad_sampled \
-  --include-layers 1 2
+  --include-methods trad_single --include-runs <trad-single-run-id> \
+  --include-layers 1 --pair-policy original_only \
+  --score-names bertscore_f1 bleurt \
+  --score-run-ids <bertscore-run-id> <bleurt-run-id>
 ```
 
 LLM generation derives context and output limits automatically from source
-length.
+length. Each context bucket is committed in batches of at most 512 items by
+default (`--batch-size` changes this). Re-submitting the same command resumes
+unattempted batches; `--retry-failed` attempts only recorded failures.
 
 Score selected candidates for regression supervision:
 
@@ -117,9 +131,67 @@ python -m clumsification_code.evals.run_benchmark \
   --skip-multilingual
 ```
 
-The benchmark command writes results to `data/evals/`. Use
+The final benchmark command writes results to `data/evals/final/`. Use
 `--max-records-per-dimension` for a pilot and omit `--skip-preferences` if the
 JFLEG, MultiBLiMP, and Story Cloze diagnostics are desired.
+
+### Evaluate checkpoints on the external development panel
+
+Checkpoint and hyperparameter decisions use a separate human-labeled panel:
+ELLIPSE train, JFLEG validation, and CoheSentia train. The command below never
+scores the final English suite and writes under `data/evals/external_dev/`:
+
+```bash
+python -m clumsification_code.evals.run_benchmark \
+  --evaluation-role external-dev \
+  --scorer fe \
+  --model-name <unique-checkpoint-and-seed-name> \
+  --model-dir <checkpoint-directory> \
+  --batch-size 32 \
+  --max-length 32768
+```
+
+Add `--include-dev-story-cloze-diagnostic` only for the secondary narrative
+diagnostic; it has zero checkpoint-selection weight. After all checkpoints
+have been evaluated, rank them with equal dataset weight:
+
+```bash
+python scripts/rank_external_dev_checkpoints.py \
+  data/evals/external_dev/*.jsonl \
+  --output data/evals/external_dev/checkpoint_ranking.csv
+```
+
+On the cluster, evaluate every `checkpoint-*` directory plus `final/` with a
+four-GPU worker queue:
+
+```bash
+sbatch updated_sbatch_jobs/evaluate_all_fe_checkpoints.sh \
+  <training-output-directory> \
+  <MODEL_LANGUAGE_TRAINING_DATASET run name> \
+  dev
+```
+
+Each GPU takes one FE checkpoint and then the next until the folder is
+exhausted. Each log is written directly into the training output directory.
+Submitting the same command again skips completed checkpoints and retries the
+rest. Use `full` instead of `dev` for the final suite. The existing
+`evaluate.sh` remains the single-model launcher for FE and baseline scorers.
+
+The job requests four LUMI GPU devices by default. For a full eight-device
+LUMI-G node, override the embedded allocation at submission time:
+
+```bash
+sbatch --gpus-per-node=8 --cpus-per-task=32 \
+  updated_sbatch_jobs/evaluate_all_fe_checkpoints.sh \
+  <training-output-directory> \
+  <MODEL_LANGUAGE_TRAINING_DATASET run name> \
+  dev
+```
+
+The audited split identities, revisions, checksums, and selection rule are
+frozen in `configs/english_external_dev.json`. Final evaluation writes under
+`data/evals/final/` and should be run only after the chosen configuration is
+frozen.
 
 Generated datasets, results, tests, notebooks, figures, local archives, and
 cluster batch jobs are intentionally not repository sources.

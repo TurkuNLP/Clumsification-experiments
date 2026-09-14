@@ -393,7 +393,11 @@ class TraditionalMethodAdapter:
     def _generate_item(
         self, item: PerturbationInput, *, index: int
     ) -> PerturbationResult:
-        base_seed = _input_seed(int(self.config.get("seed", 42)), item, index)
+        # A resumed layer supplies ``sampling_seed`` so that only its missing
+        # candidates explore a new deterministic trajectory.  The original
+        # request seed remains in the layer manifest for reproducibility.
+        generation_seed = int(self.config.get("sampling_seed", self.config.get("seed", 42)))
+        base_seed = _input_seed(generation_seed, item, index)
         try:
             output, edits, audit = self._apply(item.text, seed=base_seed)
         except TraditionalNoChangeError as exc:

@@ -38,14 +38,6 @@ class SplitAssignment:
         return cls(base_text_id=base_text_id, split=split)
 
 
-def _split_capacities(total: int, *, dev_size: int, test_size: int) -> dict[str, int]:
-    if dev_size < 1 or test_size < 1:
-        raise ValueError("dev_size and test_size must be positive")
-    if dev_size + test_size >= total:
-        raise ValueError("dev_size plus test_size must leave training sources")
-    return {"train": total - dev_size - test_size, "dev": dev_size, "test": test_size}
-
-
 def _length_buckets(records: list[OriginalRecord], *, buckets: int = 10) -> dict[str, int]:
     ordered = sorted(records, key=lambda record: (len(record.text), record.base_text_id))
     return {
@@ -61,12 +53,11 @@ def _workflow_records(
     by_id = {record.base_text_id: record for record in values}
     if len(by_id) != len(values):
         raise ValueError(f"{method} output contains duplicate base_text_id values")
-    if set(by_id) != source_ids:
-        missing = sorted(source_ids - set(by_id))
-        unexpected = sorted(set(by_id) - source_ids)
+    unexpected = sorted(set(by_id) - source_ids)
+    if unexpected:
         raise ValueError(
-            f"{method} output does not match originals; "
-            f"missing={len(missing)}, unexpected={len(unexpected)}"
+            f"{method} output contains sources not present in originals; "
+            f"unexpected={len(unexpected)}"
         )
     return by_id
 
@@ -97,11 +88,12 @@ def make_workflow_split_plan(
     originals: Iterable[OriginalRecord],
     workflow_outputs: Mapping[str, Iterable[CandidateRecord]],
     *,
-    dev_size: int = 15000,
-    test_size: int = 15000,
+    train_size: int = 50_000,
+    dev_size: int = 5_000,
+    test_size: int = 5_000,
     seed: int = 42,
 ) -> tuple[SplitAssignment, ...]:
-    """Assign sources to exact-size splits with lightweight workflow balancing."""
+    """Assign fully generated sources to exact-size splits with lightweight balancing."""
     records = list(originals)
     if not records:
         raise ValueError("Cannot split an empty source collection")
@@ -114,11 +106,27 @@ def make_workflow_split_plan(
         method: _workflow_records(values, method=method, source_ids=source_ids)
         for method, values in workflow_outputs.items()
     }
-    capacities = _split_capacities(
-        len(records),
-        dev_size=dev_size,
-        test_size=test_size,
-    )
+    eligible_ids = set.intersection(*(set(method_rows) for method_rows in rows.values()))
+    if any(
+        isinstance(size, bool) or not isinstance(size, int) or size < 1
+        for size in (train_size, dev_size, test_size)
+    ):
+        raise ValueError("train_size, dev_size, and test_size must be positive integers")
+    requested_total = train_size + dev_size + test_size
+    if len(eligible_ids) < requested_total:
+        raise ValueError(
+            "Not enough sources have outputs from every workflow: "
+            f"eligible={len(eligible_ids)}, requested={requested_total}"
+        )
+    records = [record for record in records if record.base_text_id in eligible_ids]
+    # Allocate surplus eligible sources to an internal bucket so the retained
+    # splits remain representative without writing assignments for unused IDs.
+    capacities = {
+        "train": train_size,
+        "dev": dev_size,
+        "test": test_size,
+        "excluded": len(records) - requested_total,
+    }
     buckets = _length_buckets(records)
     features = {
         record.base_text_id: _features_for_source(record, rows, buckets[record.base_text_id])
@@ -173,8 +181,9 @@ def make_workflow_split_plan(
         split = min(cost(candidate) for candidate in candidates)[1]
         assigned[split] += 1
         observed[split].update(features[record.base_text_id])
-        result.append(SplitAssignment(record.base_text_id, split))
-    if dict(assigned) != capacities:
+        if split != "excluded":
+            result.append(SplitAssignment(record.base_text_id, split))
+    if dict(assigned) != {name: size for name, size in capacities.items() if size}:
         raise AssertionError("Split allocator did not satisfy its requested capacities")
     return tuple(sorted(result, key=lambda item: item.base_text_id))
 

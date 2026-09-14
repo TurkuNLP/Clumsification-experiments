@@ -28,8 +28,9 @@ def parse_args() -> argparse.Namespace:
             required=True,
             help=f"Completed target-layer-one run ID for {method}.",
         )
-    parser.add_argument("--dev-size", type=int, default=15_000)
-    parser.add_argument("--test-size", type=int, default=15_000)
+    parser.add_argument("--train-size", type=int, default=50_000)
+    parser.add_argument("--dev-size", type=int, default=5_000)
+    parser.add_argument("--test-size", type=int, default=5_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -46,6 +47,7 @@ def main() -> None:
     assignments = make_workflow_split_plan(
         repository.read_originals(),
         outputs,
+        train_size=args.train_size,
         dev_size=args.dev_size,
         test_size=args.test_size,
         seed=args.seed,

@@ -8,6 +8,13 @@ from pathlib import Path
 import pandas as pd
 import csv
 
+
+JFLEG_DATASET = "jhu-clsp/jfleg"
+# Pin the maintained Parquet conversion whose metadata records 755 validation
+# sources and 748 test sources.  Mutable Hub ``main`` revisions must not decide
+# which examples enter development or final evaluation.
+JFLEG_REVISION = "9b11261ccea2a5b33619af75f11d1607081c21e2"
+
 def _clean_text(x) -> str:
     if x is None:
         return ""
@@ -33,28 +40,54 @@ def join_context_and_continuation(context: str, continuation: str) -> str:
 
 # Loaders
 
-def load_jfleg_preference_pairs(split: str = "test"):
-    ds = datasets.load_dataset("jhu-clsp/jfleg", split=split, download_mode="force_redownload",)
+def load_jfleg_preference_records(
+    split: str = "test",
+    *,
+    revision: str = JFLEG_REVISION,
+):
+    ds = datasets.load_dataset(
+        JFLEG_DATASET,
+        split=split,
+        revision=revision,
+    )
 
-    preferred = []
-    dispreferred = []
-
-    for ex in ds:
+    records = []
+    for source_index, ex in enumerate(ds):
         src = _clean_text(ex["sentence"])
         corrections = ex["corrections"]
 
         if not src or corrections is None:
             continue
 
-        for corr in corrections:
+        for correction_index, corr in enumerate(corrections):
             corr = _clean_text(corr)
             if not corr or corr == src:
                 continue
+            records.append(
+                {
+                    "source_id": f"{split}:{source_index}",
+                    "source_text": src,
+                    "correction_index": correction_index,
+                    "preferred_text": corr,
+                    "dispreferred_text": src,
+                    "split": split,
+                    "revision": revision,
+                }
+            )
+    return records
 
-            preferred.append(corr)
-            dispreferred.append(src)
 
-    return preferred, dispreferred
+def load_jfleg_preference_pairs(
+    split: str = "test",
+    *,
+    revision: str = JFLEG_REVISION,
+):
+    records = load_jfleg_preference_records(split=split, revision=revision)
+
+    return (
+        [record["preferred_text"] for record in records],
+        [record["dispreferred_text"] for record in records],
+    )
 
 def load_multiblimp_english_preference_pairs():
     ds = datasets.load_dataset("jumelet/multiblimp", "eng", split="train")

@@ -77,14 +77,32 @@ def parse_args() -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=None,
-        help="Additional per-entry retries for invalid LLM outputs (default: 3).",
+        help="Deprecated compatibility option; must be 0. Use --retry-failed on a later submission.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of source items committed after each generation batch "
+            "within each context bucket (default: 512 for LLM methods)."
+        ),
+    )
+    parser.add_argument(
+        "--max-output-char-tolerance",
+        type=int,
+        default=None,
+        help=(
+            "Additional characters allowed above the derived LLM output limit "
+            "(default: 256)."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--retry-failed",
         action="store_true",
         help=(
-            "Retry only sources still missing a candidate in the existing layer, "
+            "Retry only sources explicitly recorded as failed in the existing layer, "
             "then merge recovered candidates into that layer."
         ),
     )
@@ -112,6 +130,8 @@ def main() -> None:
                 "n_jobs": args.n_jobs,
                 "allow_unchanged": args.allow_unchanged,
                 "max_retries": args.max_retries,
+                "batch_size": args.batch_size,
+                "max_output_char_tolerance": args.max_output_char_tolerance,
                 "assignment_file": (
                     str(args.assignment_file) if args.assignment_file is not None else None
                 ),

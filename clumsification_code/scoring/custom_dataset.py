@@ -11,13 +11,21 @@ from __future__ import annotations
 import math
 import random
 import sys
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from clumsification_code.data.candidate_identity import make_original_candidate_id
-from clumsification_code.data.io import write_json_atomic, write_jsonl_atomic
+from clumsification_code.data.io import (
+    append_jsonl_durable,
+    read_json,
+    read_jsonl,
+    write_json_atomic,
+    write_jsonl_atomic,
+)
 from clumsification_code.data.repository import DatasetRepository
 from clumsification_code.data.schemas import ScoreRecord
 
@@ -63,6 +71,44 @@ class ScoreFailure:
     task: ScoreTask
     error_type: str
     error_message: str
+
+
+def _task_fingerprint(tasks: Sequence[ScoreTask]) -> str:
+    """Return a stable identity for an ordered score run."""
+    identities = [
+        (task.candidate_id, task.reference_candidate_id, task.source_layer, task.target_layer)
+        for task in tasks
+    ]
+    payload = json.dumps(identities, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_progress(
+    *,
+    score_path: Path,
+    error_path: Path,
+    metadata_path: Path,
+    tasks: Sequence[ScoreTask],
+) -> tuple[list[ScoreRecord], list[dict], int]:
+    """Load a durable prefix of a matching interrupted run."""
+    metadata = read_json(metadata_path)
+    fingerprint = _task_fingerprint(tasks)
+    if metadata.get("task_fingerprint") != fingerprint:
+        raise ValueError(
+            "Incomplete score run does not match this request; rerun with --overwrite "
+            "to discard its partial results."
+        )
+    records = [ScoreRecord.from_row(row) for row in read_jsonl(score_path)]
+    errors = read_jsonl(error_path)
+    completed_ids = [record.candidate_id for record in records] + [
+        str(row["candidate_id"]) for row in errors
+    ]
+    if len(completed_ids) != len(set(completed_ids)):
+        raise ValueError("Incomplete score run contains duplicate candidate results")
+    expected_ids = [task.candidate_id for task in tasks[: len(completed_ids)]]
+    if set(completed_ids) != set(expected_ids):
+        raise ValueError("Incomplete score run is not a complete prefix of this request")
+    return records, errors, len(completed_ids)
 
 
 def select_original_ids(
@@ -224,18 +270,42 @@ class BLEURTScorer:
     """Thin wrapper around Hugging Face Evaluate's BLEURT metric."""
 
     def __init__(self, *, checkpoint: str) -> None:
+        print(
+            f"[score_custom_dataset] Loading BLEURT checkpoint {checkpoint!r}...",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             import evaluate
+            import tensorflow as tf
         except ImportError as exc:
             raise ImportError(
                 "BLEURT requires the Hugging Face 'evaluate' package, BLEURT, "
                 "and TensorFlow."
             ) from exc
 
+        gpu_devices = tf.config.list_physical_devices("GPU")
+        print(
+            f"[score_custom_dataset] TensorFlow {tf.__version__}; visible GPUs: "
+            f"{[device.name for device in gpu_devices] or 'none'}.",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not gpu_devices:
+            raise RuntimeError(
+                "BLEURT cannot see a GPU. Load CSC's python-tensorflow module "
+                "and ensure the job requests a GPU before scoring."
+            )
+
         # BLEURT-20 is the checkpoint recommended by the BLEURT authors.  Pass
         # it as Evaluate's configuration name so the selected model is explicit
         # and recorded alongside the generated supervision.
         self.metric = evaluate.load("bleurt", checkpoint)
+        print(
+            "[score_custom_dataset] BLEURT checkpoint loaded.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def score(self, tasks: Sequence[ScoreTask]) -> list[float]:
         result = self.metric.compute(
@@ -369,6 +439,7 @@ def score_custom_dataset(
     seed: int,
     language: str,
     batch_size: int,
+    scoring_chunk_size: int = 1000,
     model_name: str | None,
     bleurt_checkpoint: str = DEFAULT_BLEURT_CHECKPOINT,
     metricx_model_name: str = DEFAULT_METRICX_MODEL,
@@ -405,6 +476,8 @@ def score_custom_dataset(
         raise ValueError(f"Unsupported scoring_type: {scoring_type!r}")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+    if scoring_chunk_size <= 0:
+        raise ValueError("scoring_chunk_size must be positive.")
     if max_tokens < 2:
         raise ValueError("max_tokens must be at least 2.")
     if metricx_max_input_length < 2:
@@ -424,6 +497,11 @@ def score_custom_dataset(
     if not overwrite and any(path.exists() for path in score_destinations):
         existing = next(path for path in score_destinations if path.exists())
         raise FileExistsError(f"Score run output already exists: {existing}")
+    progress_root = repository.score_method_root(scoring_type) / ".in_progress"
+    progress_score_path = progress_root / f"{scoring_run_id}.jsonl"
+    progress_error_path = progress_root / f"{scoring_run_id}.errors.jsonl"
+    progress_metadata_path = progress_root / f"{scoring_run_id}.metadata.json"
+    progress_paths = (progress_score_path, progress_error_path, progress_metadata_path)
     tasks, selected_ids = load_score_tasks(
         repository=repository,
         methods=methods,
@@ -435,6 +513,31 @@ def score_custom_dataset(
         reference_policy=reference_policy,
         source_partitions=source_partitions,
     )
+    print(
+        f"[score_custom_dataset] Loaded {len(tasks):,} scoring tasks; "
+        f"chunk size is {scoring_chunk_size:,}.",
+        file=sys.stderr,
+        flush=True,
+    )
+    resumed_records: list[ScoreRecord] = []
+    resumed_errors: list[dict] = []
+    resume_offset = 0
+    if any(path.exists() for path in progress_paths):
+        if overwrite:
+            for path in progress_paths:
+                path.unlink(missing_ok=True)
+        elif not all(path.exists() for path in progress_paths):
+            raise FileExistsError(
+                "Incomplete score-run checkpoint is missing one or more required files; "
+                "rerun with --overwrite to discard it."
+            )
+        else:
+            resumed_records, resumed_errors, resume_offset = _load_progress(
+                score_path=progress_score_path,
+                error_path=progress_error_path,
+                metadata_path=progress_metadata_path,
+                tasks=tasks,
+            )
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
         scorer_config = {
@@ -614,42 +717,83 @@ def score_custom_dataset(
             "-log(perplexity), equivalently negative mean token NLL, so higher is better."
         )
 
-    scores, failures = score_with_failure_isolation(tasks, scorer)
-    score_records = [
-        ScoreRecord(
-            dataset_name=task.dataset_name,
-            base_text_id=task.base_text_id,
-            candidate_id=task.candidate_id,
-            perturbation_method=task.perturbation_method,
-            scoring_method=scoring_type,
-            scoring_run_id=scoring_run_id,
-            score_value=score,
-            source_layer=task.source_layer,
-            target_layer=task.target_layer,
-            reference_candidate_id=task.reference_candidate_id,
-            metadata={"perturbation_run_id": task.perturbation_run_id},
-        )
-        for task, score in zip(tasks, scores)
-        if score is not None
-    ]
-    error_rows = [
-        {
-            "schema_version": 1,
-            "base_text_id": failure.task.base_text_id,
-            "dataset_name": failure.task.dataset_name,
-            "candidate_id": failure.task.candidate_id,
-            "perturbation_method": failure.task.perturbation_method,
-            "perturbation_run_id": failure.task.perturbation_run_id,
-            "source_layer": failure.task.source_layer,
-            "target_layer": failure.task.target_layer,
-            "reference_candidate_id": failure.task.reference_candidate_id,
-            "scoring_method": scoring_type,
-            "scoring_run_id": scoring_run_id,
-            "error_type": failure.error_type,
-            "error_message": failure.error_message,
-        }
-        for failure in failures
-    ]
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as exc:
+        raise ImportError("Chunked scoring requires the 'tqdm' package.") from exc
+
+    print(
+        f"[score_custom_dataset] Starting {scoring_type} scoring.",
+        file=sys.stderr,
+        flush=True,
+    )
+    score_records: list[ScoreRecord] = resumed_records
+    error_rows: list[dict] = resumed_errors
+    task_fingerprint = _task_fingerprint(tasks)
+    with tqdm(
+        total=len(tasks), initial=resume_offset, desc=f"{scoring_type} scoring", unit="pair"
+    ) as progress:
+        for offset in range(resume_offset, len(tasks), scoring_chunk_size):
+            task_chunk = tasks[offset : offset + scoring_chunk_size]
+            scores, failures = score_with_failure_isolation(task_chunk, scorer)
+            record_chunk = [
+                ScoreRecord(
+                    dataset_name=task.dataset_name,
+                    base_text_id=task.base_text_id,
+                    candidate_id=task.candidate_id,
+                    perturbation_method=task.perturbation_method,
+                    scoring_method=scoring_type,
+                    scoring_run_id=scoring_run_id,
+                    score_value=score,
+                    source_layer=task.source_layer,
+                    target_layer=task.target_layer,
+                    reference_candidate_id=task.reference_candidate_id,
+                    metadata={"perturbation_run_id": task.perturbation_run_id},
+                )
+                for task, score in zip(task_chunk, scores)
+                if score is not None
+            ]
+            error_chunk = [
+                {
+                    "schema_version": 1,
+                    "base_text_id": failure.task.base_text_id,
+                    "dataset_name": failure.task.dataset_name,
+                    "candidate_id": failure.task.candidate_id,
+                    "perturbation_method": failure.task.perturbation_method,
+                    "perturbation_run_id": failure.task.perturbation_run_id,
+                    "source_layer": failure.task.source_layer,
+                    "target_layer": failure.task.target_layer,
+                    "reference_candidate_id": failure.task.reference_candidate_id,
+                    "scoring_method": scoring_type,
+                    "scoring_run_id": scoring_run_id,
+                    "error_type": failure.error_type,
+                    "error_message": failure.error_message,
+                }
+                for failure in failures
+            ]
+            append_jsonl_durable(
+                progress_score_path, [record.to_row() for record in record_chunk]
+            )
+            append_jsonl_durable(progress_error_path, error_chunk)
+            score_records.extend(record_chunk)
+            error_rows.extend(error_chunk)
+            progress.update(len(task_chunk))
+            write_json_atomic(
+                progress_metadata_path,
+                {
+                    "status": "in_progress",
+                    "dataset_name": dataset_name,
+                    "scoring_method": scoring_type,
+                    "scoring_run_id": scoring_run_id,
+                    "scoring_chunk_size": scoring_chunk_size,
+                    "task_fingerprint": task_fingerprint,
+                    "num_candidate_tasks": len(tasks),
+                    "num_completed_tasks": min(offset + len(task_chunk), len(tasks)),
+                    "num_successful_scores": len(score_records),
+                    "num_failures": len(error_rows),
+                },
+                overwrite=True,
+            )
     metadata = {
         "schema_version": 3,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -681,6 +825,8 @@ def score_custom_dataset(
         "teacher_input_mode": scorer_config.get("input_mode", "candidate_only"),
         "uses_reference": scorer_config.get("uses_reference", False),
         "batch_size": batch_size,
+        "scoring_chunk_size": scoring_chunk_size,
+        "task_fingerprint": task_fingerprint,
         "max_tokens": max_tokens,
         "device": device,
         "scorer_config": scorer_config,
@@ -703,6 +849,8 @@ def score_custom_dataset(
         metadata=metadata,
         overwrite=overwrite,
     )
+    for path in progress_paths:
+        path.unlink(missing_ok=True)
     return {
         "score_path": str(score_path),
         "error_path": str(error_path),
