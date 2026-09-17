@@ -13,7 +13,7 @@ from clumsification_code.data.candidate_identity import (
     make_candidate_id,
     make_original_candidate_id,
 )
-from clumsification_code.data.io import write_json_atomic
+from clumsification_code.data.io import read_json, write_json_atomic
 from clumsification_code.data.repository import DatasetRepository
 from clumsification_code.data.schemas import PerturbationManifest
 from clumsification_code.data.workflow_splitting import (
@@ -34,9 +34,9 @@ def parse_args() -> argparse.Namespace:
             required=True,
             help=f"Layer-one run ID to export for {method}.",
         )
-    parser.add_argument("--train-size", type=int, default=50_000)
     parser.add_argument("--dev-size", type=int, default=5_000)
     parser.add_argument("--test-size", type=int, default=5_000)
+    parser.add_argument("--round-to", type=int, default=5_000)
     parser.add_argument(
         "--copy-scores",
         action="store_true",
@@ -47,15 +47,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def _validate_assignments(
-    assignments: dict[str, str], *, train_size: int, dev_size: int, test_size: int
+    assignments: dict[str, str], *, dev_size: int, test_size: int, round_to: int
 ) -> set[str]:
-    expected = {"train": train_size, "dev": dev_size, "test": test_size}
-    if any(isinstance(size, bool) or not isinstance(size, int) or size < 1 for size in expected.values()):
+    expected = {"dev": dev_size, "test": test_size}
+    if any(
+        isinstance(size, bool) or not isinstance(size, int) or size < 1
+        for size in (*expected.values(), round_to)
+    ):
         raise ValueError("Split sizes must be positive integers")
-    counts = {split: sum(value == split for value in assignments.values()) for split in expected}
-    if counts != expected:
+    counts = {
+        split: sum(value == split for value in assignments.values())
+        for split in ("train", "dev", "test")
+    }
+    if counts["dev"] != dev_size or counts["test"] != test_size or counts["train"] < 1:
         raise ValueError(f"Split assignments do not have the requested sizes: {counts}")
-    unknown = set(assignments.values()) - set(expected)
+    if len(assignments) % round_to:
+        raise ValueError(
+            f"Split assignment total {len(assignments)} is not divisible by {round_to}"
+        )
+    unknown = set(assignments.values()) - set(counts)
     if unknown:
         raise ValueError(f"Split assignments contain unsupported splits: {sorted(unknown)}")
     return set(assignments)
@@ -66,9 +76,9 @@ def export_final_dataset(
     destination: DatasetRepository,
     *,
     run_ids: dict[str, str],
-    train_size: int = 50_000,
     dev_size: int = 5_000,
     test_size: int = 5_000,
+    round_to: int = 5_000,
     copy_scores: bool = False,
     overwrite: bool = False,
 ) -> None:
@@ -78,7 +88,7 @@ def export_final_dataset(
     if assignments is None:
         raise FileNotFoundError("Source dataset requires split_assignments.jsonl")
     selected_ids = _validate_assignments(
-        assignments, train_size=train_size, dev_size=dev_size, test_size=test_size
+        assignments, dev_size=dev_size, test_size=test_size, round_to=round_to
     )
     originals = [record for record in source.read_originals() if record.base_text_id in selected_ids]
     if len(originals) != len(selected_ids):
@@ -113,6 +123,18 @@ def export_final_dataset(
         (SplitAssignment(base_text_id, assignments[base_text_id]) for base_text_id in selected_ids),
         overwrite=overwrite,
     )
+    source_split_metadata = source.split_assignments_path.with_name(
+        f"{source.split_assignments_path.stem}.metadata.json"
+    )
+    if source_split_metadata.is_file():
+        destination_split_metadata = destination.split_assignments_path.with_name(
+            f"{destination.split_assignments_path.stem}.metadata.json"
+        )
+        write_json_atomic(
+            destination_split_metadata,
+            read_json(source_split_metadata),
+            overwrite=overwrite,
+        )
 
     # Start a fresh canonical manifest. Existing unreferenced files, if any,
     # are harmless; only files registered here are visible to workflows.
@@ -221,13 +243,13 @@ def main() -> None:
         source,
         destination,
         run_ids=run_ids,
-        train_size=args.train_size,
         dev_size=args.dev_size,
         test_size=args.test_size,
+        round_to=args.round_to,
         copy_scores=args.copy_scores,
         overwrite=args.overwrite,
     )
-    print(f"Exported {args.train_size + args.dev_size + args.test_size} sources to {destination.dataset_dir}")
+    print(f"Exported {len(destination.read_originals())} sources to {destination.dataset_dir}")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,14 @@ from datasets import Dataset, DatasetDict, load_from_disk
 
 from clumsification_code.data.candidate_identity import make_original_candidate_id
 from clumsification_code.data.repository import DatasetRepository
-from clumsification_code.data.schemas import COMPOSITION_POLICIES, HFBuildSpec, PAIR_POLICIES
+from clumsification_code.data.flattening import flatten_binary_dataset
+from clumsification_code.data.schemas import (
+    COMPOSITION_POLICIES, HFBuildSpec, PAIR_POLICIES, TRAINING_METHODS,
+)
+from clumsification_code.data.text_preprocessing import (
+    TEXT_PREPROCESSING_NAME,
+    normalize_model_text,
+)
 
 
 def _stable_seed(seed: int, *parts: object) -> int:
@@ -49,7 +56,7 @@ def _split_ids_to_metadata(
 
 def _original_item(repository: DatasetRepository, original: Any) -> dict[str, Any]:
     return {
-        "text": original.text,
+        "text": normalize_model_text(original.text),
         "label": 0,
         "candidate_id": make_original_candidate_id(
             dataset_name=repository.dataset_name, base_text_id=original.base_text_id
@@ -67,7 +74,7 @@ def _original_item(repository: DatasetRepository, original: Any) -> dict[str, An
 
 def _candidate_item(candidate: Any) -> dict[str, Any]:
     return {
-        "text": candidate.text,
+        "text": normalize_model_text(candidate.text),
         "label": candidate.target_layer,
         "candidate_id": candidate.candidate_id,
         "perturbation_source": candidate.perturbation_source,
@@ -119,6 +126,33 @@ def _load_repository_groups(
     score_run_ids: list[str] | None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     repository.validate_lineage()
+    all_entries = repository.list_layers()
+    if methods is not None:
+        available_methods = {entry.method for entry in all_entries}
+        unknown_methods = sorted(set(methods) - available_methods)
+        if unknown_methods:
+            raise ValueError(
+                f"Unknown perturbation method(s) for dataset "
+                f"{repository.dataset_name!r}: {unknown_methods}; "
+                f"available methods: {sorted(available_methods)}"
+            )
+    if run_ids is not None:
+        available_runs = {entry.run_id for entry in all_entries}
+        unknown_runs = sorted(set(run_ids) - available_runs)
+        if unknown_runs:
+            raise ValueError(
+                f"Unknown perturbation run ID(s) for dataset "
+                f"{repository.dataset_name!r}: {unknown_runs}; "
+                f"available run IDs: {sorted(available_runs)}"
+            )
+    if layers is not None:
+        available_layers = {entry.target_layer for entry in all_entries}
+        unknown_layers = sorted(set(layers) - available_layers)
+        if unknown_layers:
+            raise ValueError(
+                f"Unknown target layer(s) for dataset {repository.dataset_name!r}: "
+                f"{unknown_layers}; available target layers: {sorted(available_layers)}"
+            )
     groups = {
         original.base_text_id: [_original_item(repository, original)]
         for original in repository.read_originals()
@@ -411,16 +445,21 @@ def create_formatted_dataset_dict(
     include_layers: Optional[list[int]] = None,
     pair_policy: str = "none",
     score_run_ids: Optional[list[str]] = None,
+    training_method: str = "grouped",
 ):
     """Build source-isolated HF splits from manifests and parent links."""
     if not dataset_names:
         raise ValueError("At least one dataset name must be supplied")
+    if training_method not in TRAINING_METHODS:
+        raise ValueError(f"Unknown HF training method: {training_method!r}")
     if include_layers is None and max_layers is not None:
         include_layers = list(range(1, max_layers + 1))
     if methods is None and layer_type == "trad":
         methods = ["trad_single", "trad_sampled"]
     if random_pairs:
         pair_policy = "cross_source_unmatched"
+    if training_method == "binary" and pair_policy != "none":
+        raise ValueError("Binary flattening requires pair_policy='none' and random_pairs=False")
     repositories = {
         name: DatasetRepository.from_root(dataset_root, name) for name in dataset_names
     }
@@ -472,6 +511,11 @@ def create_formatted_dataset_dict(
         split: _rows_from_chains(chains, sorted(discovered_scores), seed).shuffle(seed=seed)
         for split, chains in records.items()
     })
+    if training_method == "binary":
+        final = DatasetDict({
+            split: flatten_binary_dataset(final[split]).shuffle(seed=seed)
+            for split in final
+        })
     if any(len(final[split]) == 0 for split in final):
         sizes = {split: len(final[split]) for split in final}
         raise ValueError(f"At least one split has no usable examples: {sizes}")
@@ -479,6 +523,7 @@ def create_formatted_dataset_dict(
         final = _downsample_dataset_dict(final, downsample_size, seed)
     metadata = {
         "split_strategy": split_strategy,
+        "text_preprocessing": TEXT_PREPROCESSING_NAME,
         "split_original_ids": _split_ids_to_metadata(split_ids),
         "score_fields": sorted(discovered_scores),
         "score_run_ids": score_run_ids,
@@ -489,6 +534,11 @@ def create_formatted_dataset_dict(
         "method_weights": method_weights,
         "samples_per_source": samples_per_source,
         "pair_policy": pair_policy,
+        "training_method": training_method,
+        "binary_label_policy": (
+            "original=1, selected_perturbation=0"
+            if training_method == "binary" else None
+        ),
         "num_examples": {split: len(final[split]) for split in final},
     }
     return (final, metadata) if return_metadata else final
@@ -537,6 +587,7 @@ def build_hf_dataset(
         score_names=list(spec.score_names) or None,
         score_run_ids=list(spec.score_run_ids) or None,
         seed=spec.seed,
+        training_method=spec.training_method,
         return_metadata=True,
     )
     metadata["hf_build_spec"] = asdict(spec)

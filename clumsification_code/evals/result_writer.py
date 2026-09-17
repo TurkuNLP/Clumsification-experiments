@@ -25,6 +25,12 @@ class EvalMetadata:
     rubric: str = ""
     evaluation_tracks: str = "english,multilingual"
     evaluation_role: str = "final"
+    formatted_dataset_path: str = ""
+    formatted_dataset_split: str = ""
+    training_method: str = ""
+    score_name: str = ""
+    vllm_data_parallel_size: int = 0
+    vllm_tensor_parallel_size: int = 0
 
 
 def json_sanitize(x: Any) -> Any:

@@ -103,7 +103,11 @@ def generate_gemini(model: str, documents: list[dict[str, Any]], language: str) 
 
 def generate_qwen(model: str, documents: list[dict[str, Any]], language: str) -> list[str]:
     from vllm import LLM, SamplingParams
-    llm = LLM(model=model)
+    import torch
+    tensor_parallel_size = torch.cuda.device_count()
+    llm = LLM(model=model, max_model_len=1024,
+            tensor_parallel_size=tensor_parallel_size,
+            language_model_only=True)
     sampling_params = SamplingParams(max_tokens=256, temperature=0.7)
     messages = [[{"role": "user", "content": make_prompt(document, language)}] for document in documents]
     try:

@@ -37,17 +37,29 @@ class SkippedPerturbation:
     attempts: int
 
 
+@dataclass
+class ChatCompletion:
+    """Final text and compact diagnostics, without retaining model reasoning."""
+
+    text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    failure_reason: str | None = None
+
+
 @dataclass(frozen=True)
 class GenerationRuntime:
     """Optional execution dependencies supplied by the generation service."""
 
     chat_runner: ChatRunner | None = None
+    attempts: dict[str, int] = field(default_factory=dict)
 
     def run_chat(
         self,
         config: dict[str, Any],
         prompts: list[list[dict[str, str]]],
-    ) -> tuple[str, list[str]]:
+        *, source_texts: list[str] | None = None, request_ids: list[str] | None = None,
+        requested_edits: list[list[str]] | None = None,
+    ) -> tuple[str, list[Any]]:
         if self.chat_runner is None:
             raise RuntimeError("This perturbation method requires a chat-model runner")
         model = config.get("model") or config.get("model_path")
@@ -62,7 +74,14 @@ class GenerationRuntime:
         # The built-in vLLM runner additionally receives the configured
         # context limit so it can execute automatic length buckets. Keep the
         # four-argument call for injected runners used by tests and callers.
-        if getattr(self.chat_runner, "supports_context_buckets", False):
+        if getattr(self.chat_runner, "supports_generation_config", False):
+            outputs = list(self.chat_runner(
+                str(model), prompts, temperature, max_tokens, config=config,
+                source_texts=source_texts, request_ids=request_ids,
+                requested_edits=requested_edits,
+                attempts=[self.attempts.get(identity, 0) for identity in (request_ids or [])],
+            ))
+        elif getattr(self.chat_runner, "supports_context_buckets", False):
             outputs = list(
                     self.chat_runner(
                         str(model), prompts, temperature, max_tokens,
@@ -76,7 +95,7 @@ class GenerationRuntime:
             raise ValueError(
                 f"Chat runner returned {len(outputs)} outputs for {len(prompts)} prompts"
             )
-        if any(not isinstance(output, (str, SkippedGeneration)) for output in outputs):
+        if any(not isinstance(output, (str, SkippedGeneration, ChatCompletion)) for output in outputs):
             raise ValueError("Chat runner outputs must all be strings")
         return str(model), outputs
 

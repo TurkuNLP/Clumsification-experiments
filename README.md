@@ -102,6 +102,27 @@ Both methods score candidates only and write canonical score, error, and
 metadata files under the dataset's `scores/` directory. The G-Eval cache keeps
 raw API responses; set `OPENAI_API_KEY` before running it.
 
+### Evaluate a formatted dataset split
+
+The same scorer can evaluate a saved formatted Hugging Face dataset directly.
+The `test` split is selected by default; use `--formatted-dataset-split` to
+evaluate another split. Regression datasets require the score field used to
+construct them:
+
+```bash
+python -m clumsification_code.evals.run_benchmark \
+  --evaluation-role formatted-dataset \
+  --formatted-dataset-path data/hf_datasets/<name> \
+  --training-method regression \
+  --score-name <score-name> \
+  --scorer fe \
+  --model-name <model-name> \
+  --model-dir <model-dir>
+```
+
+Pairwise and binary formatted datasets are also supported with
+`--training-method pairwise` or `--training-method binary`.
+
 ### Evaluate the English benchmark suite
 
 Use the shared benchmark runner for direct evaluation of the audited English
@@ -134,6 +155,27 @@ python -m clumsification_code.evals.run_benchmark \
 The final benchmark command writes results to `data/evals/final/`. Use
 `--max-records-per-dimension` for a pilot and omit `--skip-preferences` if the
 JFLEG, MultiBLiMP, and Story Cloze diagnostics are desired.
+
+For a full LUMI-G node, vLLM can run independent scoring replicas. The total
+device count is `--vllm-data-parallel-size` multiplied by
+`--vllm-tensor-parallel-size`; each replica receives its own share of candidates,
+and `--batch-size` applies within each replica. For example, four replicas with
+two devices each:
+
+```bash
+sbatch --gpus-per-node=8 --cpus-per-task=32 --time=03:00:00 \
+  updated_sbatch_jobs/evaluate.sh vllm Qwen3.5-9B-geval \
+  --vllm-model-name-or-path Qwen/Qwen3.5-9B \
+  --vllm-protocol geval_json.json \
+  --vllm-rubric geval_no_reference.json \
+  --vllm-data-parallel-size 4 --vllm-tensor-parallel-size 2 \
+  --vllm-max-model-len 32768 --batch-size 64
+```
+
+If the model fits on one device, `--vllm-data-parallel-size 8` with
+`--vllm-tensor-parallel-size 1` provides eight replicas. The default DP size is
+one, preserving previous single-engine behavior. Validate memory and throughput
+on LUMI before selecting a production layout.
 
 ### Evaluate checkpoints on the external development panel
 

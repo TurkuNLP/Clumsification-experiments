@@ -1,6 +1,8 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
+import json
+import os
 from typing import List, Optional
 
 import numpy as np
@@ -36,12 +38,27 @@ class FEInferenceModel:
             attn_implementation=attn_implementation,
             param_dtype=dtype,
         )
+        self.training_objective = self._read_training_objective(model_dir)
 
         if getattr(self.model.encoder.config, "pad_token_id", None) is None:
             self.model.encoder.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model.to(device)
         self.model.eval()
+
+    @staticmethod
+    def _read_training_objective(model_dir: str) -> str | None:
+        """Read objective metadata without changing legacy checkpoint loading."""
+        for filename in ("fe_model_config.json", "fe_trainer_checkpoint.json"):
+            path = os.path.join(model_dir, filename)
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                config = json.load(handle)
+            value = config.get("training", {}).get("objective") if filename == "fe_model_config.json" else config.get("objective")
+            if isinstance(value, str):
+                return value
+        return None
 
     @torch.no_grad()
     def score_texts(
@@ -73,6 +90,9 @@ class FEInferenceModel:
                 input_ids=tok["input_ids"],
                 attention_mask=tok["attention_mask"],
             )
+
+            if self.training_objective == "binary":
+                batch_scores = torch.sigmoid(batch_scores)
 
             if not torch.isfinite(batch_scores).all():
                 raise RuntimeError(

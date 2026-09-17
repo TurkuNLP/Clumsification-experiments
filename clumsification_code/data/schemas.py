@@ -25,6 +25,7 @@ COMPOSITION_POLICIES = frozenset(
 PAIR_POLICIES = frozenset(
     {"none", "parent_child", "original_only", "all_unequal_layers", "cross_source_unmatched"}
 )
+TRAINING_METHODS = frozenset({"grouped", "binary"})
 
 
 def _nonempty(value: object, field_name: str) -> str:
@@ -540,6 +541,7 @@ class HFBuildSpec:
     score_names: tuple[str, ...] = ()
     score_run_ids: tuple[str, ...] = ()
     seed: int = 42
+    training_method: str = "grouped"
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "HFBuildSpec":
@@ -547,7 +549,7 @@ class HFBuildSpec:
             "output_name", "datasets", "include_methods", "include_runs",
             "include_layers", "composition", "method_weights", "samples_per_source",
             "pair_policy", "reuse_limit", "downsample_size", "score_names", "seed",
-            "score_run_ids",
+            "score_run_ids", "training_method",
         }
         _reject_unknown(value, allowed, "hf")
         if "output_name" not in value:
@@ -571,6 +573,7 @@ class HFBuildSpec:
             score_names=_string_tuple(value.get("score_names"), "hf.score_names"),
             score_run_ids=_string_tuple(value.get("score_run_ids"), "hf.score_run_ids"),
             seed=value.get("seed", 42),
+            training_method=value.get("training_method", "grouped"),
         )
         result.validate()
         return result
@@ -581,6 +584,10 @@ class HFBuildSpec:
             raise ValueError(f"Unknown composition policy: {self.composition!r}")
         if self.pair_policy not in PAIR_POLICIES:
             raise ValueError(f"Unknown pair policy: {self.pair_policy!r}")
+        if self.training_method not in TRAINING_METHODS:
+            raise ValueError(f"Unknown HF training method: {self.training_method!r}")
+        if self.training_method == "binary" and self.pair_policy != "none":
+            raise ValueError("Binary flattening requires pair_policy='none'")
         for layer in self.include_layers:
             _integer(layer, "hf.include_layers", minimum=1)
         if len(self.include_layers) != len(set(self.include_layers)):
@@ -607,6 +614,7 @@ __all__ = [
     "ORIGINAL_SCHEMA_VERSION",
     "OriginalRecord",
     "PAIR_POLICIES",
+    "TRAINING_METHODS",
     "PERTURBATION_SOURCES",
     "PerturbationManifest",
     "SCORE_SCHEMA_VERSION",

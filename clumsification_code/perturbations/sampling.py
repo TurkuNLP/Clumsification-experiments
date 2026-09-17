@@ -83,6 +83,10 @@ def load_edit_catalog(path: str | Path) -> tuple[EditCatalogEntry, ...]:
                 raise ValueError(f"Catalog line {line_no} is not valid JSON") from exc
             if not isinstance(value, dict):
                 raise ValueError(f"Catalog line {line_no} must be a JSON object")
+            # The revised catalog calls the source illustration example_source.
+            # Normalize it to the existing internal name for both catalog formats.
+            if "example_source" in value:
+                value["example_clean"] = value["example_source"]
             missing = sorted(_REQUIRED_FIELDS - set(value))
             if missing:
                 raise ValueError(f"Catalog line {line_no} is missing fields: {missing}")

@@ -40,12 +40,12 @@ def flatten_regression_split(dataset: Dataset, score_name: str, split_name: str,
     return Dataset.from_list(rows), stats
 
 
-def build_regression_dataset_dict(grouped_dataset_dict: DatasetDict, score_name: str, *, exclude_layer_zero: bool = False) -> tuple[DatasetDict, dict[str, Any]]:
+def build_regression_dataset_dict(grouped_dataset_dict: DatasetDict, score_name: str, *, exclude_layer_zero: bool = False, exclude_layer_zero_training: bool = False) -> tuple[DatasetDict, dict[str, Any]]:
     flattened, statistics = {}, {}
     for split in ("train", "dev", "test"):
         flattened[split], statistics[split] = flatten_regression_split(
             grouped_dataset_dict[split], score_name, split,
-            exclude_layer_zero=exclude_layer_zero,
+            exclude_layer_zero=exclude_layer_zero or (exclude_layer_zero_training and split == "train"),
         )
     values = [float(value) for value in flattened["train"]["raw_target"]]
     train_min, train_max = min(values), max(values)
@@ -55,6 +55,7 @@ def build_regression_dataset_dict(grouped_dataset_dict: DatasetDict, score_name:
     scaled = DatasetDict({split: data.map(lambda row: {"target": (float(row["raw_target"]) - train_min) / denominator}) for split, data in flattened.items()})
     return scaled, {"training_method": "regression", "score_name": score_name,
                     "exclude_layer_zero": exclude_layer_zero,
+                    "exclude_layer_zero_training": exclude_layer_zero_training,
                     "target_scaling": {"method": "minmax", "fit_split": "train", "train_min": train_min, "train_max": train_max, "clip": False},
                     "split_statistics": statistics}
 

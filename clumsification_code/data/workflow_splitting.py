@@ -7,10 +7,11 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import random
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from .io import read_jsonl, write_jsonl_atomic
 from .schemas import CandidateRecord, OriginalRecord
+from .text_preprocessing import TEXT_PREPROCESSING_NAME, normalize_model_text
 
 
 WORKFLOW_METHODS = ("llm_single", "llm_sampled", "trad_single", "trad_sampled")
@@ -88,12 +89,13 @@ def make_workflow_split_plan(
     originals: Iterable[OriginalRecord],
     workflow_outputs: Mapping[str, Iterable[CandidateRecord]],
     *,
-    train_size: int = 50_000,
     dev_size: int = 5_000,
     test_size: int = 5_000,
+    round_to: int = 5_000,
     seed: int = 42,
-) -> tuple[SplitAssignment, ...]:
-    """Assign fully generated sources to exact-size splits with lightweight balancing."""
+    return_metadata: bool = False,
+) -> tuple[SplitAssignment, ...] | tuple[tuple[SplitAssignment, ...], dict[str, Any]]:
+    """Filter normalized no-op pairs, round down, and assign source-level splits."""
     records = list(originals)
     if not records:
         raise ValueError("Cannot split an empty source collection")
@@ -106,17 +108,46 @@ def make_workflow_split_plan(
         method: _workflow_records(values, method=method, source_ids=source_ids)
         for method, values in workflow_outputs.items()
     }
-    eligible_ids = set.intersection(*(set(method_rows) for method_rows in rows.values()))
+    complete_ids = set.intersection(*(set(method_rows) for method_rows in rows.values()))
     if any(
         isinstance(size, bool) or not isinstance(size, int) or size < 1
-        for size in (train_size, dev_size, test_size)
+        for size in (dev_size, test_size, round_to)
     ):
-        raise ValueError("train_size, dev_size, and test_size must be positive integers")
-    requested_total = train_size + dev_size + test_size
-    if len(eligible_ids) < requested_total:
+        raise ValueError("dev_size, test_size, and round_to must be positive integers")
+
+    originals_by_id = {record.base_text_id: record for record in records}
+    identical_by_method = {
+        method: {
+            base_text_id
+            for base_text_id in complete_ids
+            if normalize_model_text(originals_by_id[base_text_id].text)
+            == normalize_model_text(method_rows[base_text_id].text)
+        }
+        for method, method_rows in rows.items()
+    }
+    identical_ids = set().union(*identical_by_method.values())
+    eligible_ids = complete_ids - identical_ids
+
+    # Equal normalized originals must not land in different splits. Retain the
+    # lexicographically first source ID from each duplicate group.
+    by_normalized_original: dict[str, list[str]] = {}
+    for base_text_id in eligible_ids:
+        key = normalize_model_text(originals_by_id[base_text_id].text)
+        by_normalized_original.setdefault(key, []).append(base_text_id)
+    duplicate_original_ids = {
+        base_text_id
+        for ids in by_normalized_original.values()
+        for base_text_id in sorted(ids)[1:]
+    }
+    eligible_ids -= duplicate_original_ids
+
+    retained_total = len(eligible_ids) // round_to * round_to
+    train_size = retained_total - dev_size - test_size
+    if train_size < 1:
         raise ValueError(
-            "Not enough sources have outputs from every workflow: "
-            f"eligible={len(eligible_ids)}, requested={requested_total}"
+            "Not enough usable sources remain after normalized no-op filtering and "
+            f"rounding: usable={len(eligible_ids)}, rounded={retained_total}, "
+            f"dev={dev_size}, test={test_size}"
         )
     records = [record for record in records if record.base_text_id in eligible_ids]
     # Allocate surplus eligible sources to an internal bucket so the retained
@@ -125,7 +156,7 @@ def make_workflow_split_plan(
         "train": train_size,
         "dev": dev_size,
         "test": test_size,
-        "excluded": len(records) - requested_total,
+        "excluded": len(records) - retained_total,
     }
     buckets = _length_buckets(records)
     features = {
@@ -185,7 +216,25 @@ def make_workflow_split_plan(
             result.append(SplitAssignment(record.base_text_id, split))
     if dict(assigned) != {name: size for name, size in capacities.items() if size}:
         raise AssertionError("Split allocator did not satisfy its requested capacities")
-    return tuple(sorted(result, key=lambda item: item.base_text_id))
+    assignments = tuple(sorted(result, key=lambda item: item.base_text_id))
+    metadata = {
+        "text_preprocessing": TEXT_PREPROCESSING_NAME,
+        "seed": seed,
+        "round_to": round_to,
+        "original_sources": len(source_ids),
+        "complete_workflow_sources": len(complete_ids),
+        "excluded_missing_workflow": len(source_ids - complete_ids),
+        "excluded_identical_after_normalization": len(identical_ids),
+        "excluded_identical_by_method": {
+            method: len(values) for method, values in identical_by_method.items()
+        },
+        "excluded_duplicate_normalized_originals": len(duplicate_original_ids),
+        "usable_before_rounding": len(eligible_ids),
+        "excluded_by_rounding": len(eligible_ids) - retained_total,
+        "retained_sources": retained_total,
+        "split_sizes": {"train": train_size, "dev": dev_size, "test": test_size},
+    }
+    return (assignments, metadata) if return_metadata else assignments
 
 
 def load_split_assignments(path: str | Path) -> tuple[SplitAssignment, ...]:

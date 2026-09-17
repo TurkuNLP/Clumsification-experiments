@@ -102,9 +102,12 @@ python scripts/generate_perturbations.py \
 ```
 
 Create one source-level split file after the four independent workflows have
-written their outputs. It keeps only sources present in every workflow and
-defaults to 50,000 training, 5,000 development, and 5,000 test sources. It
-balances source length and realized LLM characteristics while treating
+written their outputs. It keeps only sources present in every workflow, removes
+any source whose candidate from any workflow is identical to its original after
+whitespace normalization, and removes duplicate normalized originals. The
+remaining source count is rounded down to the nearest 5,000; 5,000 sources go
+to development, 5,000 to test, and all other retained sources go to training.
+It balances source length and realized LLM characteristics while treating
 traditional edit types as a lighter signal.
 
 ```bash
@@ -119,7 +122,9 @@ python scripts/assign_workflow_splits.py \
 The result is `split_assignments.jsonl`, with one `base_text_id` and one of
 `train`, `dev`, or `test` per row. It is the only supported source of split
 membership. It applies to the original and to all workflow outputs for that
-source. It is also a hard prerequisite for `scripts/build_hf_dataset.py`.
+source. `split_assignments.metadata.json` records all exclusion counts, the
+rounding loss, final split sizes, preprocessing policy, and seed. The split file
+is also a hard prerequisite for `scripts/build_hf_dataset.py`.
 
 `perturbation_assignments.jsonl` is not a split file: it records only the
 preplanned LLM edit requests. In particular, having completed and scored
@@ -237,29 +242,30 @@ python scripts/generate_perturbations.py \
 This retries only source candidates explicitly recorded as failed; unattempted
 inputs are not selected in this mode. It preserves all successful candidate
 rows and updates the same layer. It does not create another run. Each
-retry records its effective seed, attempted and recovered counts, and any
-remaining failures in that layer's manifest. For both LLM and traditional
-methods, retry rounds use a distinct effective generation seed while retaining
-the original `seed` as the immutable request seed. `--retry-failed` cannot be
+LLM retry records per-item attempt numbers and compact failures in the batch
+journal; the manifest contains aggregate counts. Seeds depend on the request
+identity and attempt, while the original `seed` remains immutable. Traditional
+methods retain their existing retry bookkeeping. `--retry-failed` cannot be
 used with `--overwrite`.
 
 Without `--retry-failed`, re-submitting an interrupted LLM job continues only
-inputs that have never been attempted. Within each context bucket, results are
-committed in chunks of at most `--batch-size` items (default 512); a smaller
-bucket is committed as one batch. Every selected input gets exactly one model
-generation chance per submission. The adjacent `.progress.json` file records
-attempted and failed parent identities, while the canonical layer and manifest
-are updated at every batch boundary.
+inputs that have never been attempted. Inputs are grouped by measured source
+bucket, shortest first, and committed in chunks of at most `--batch-size` items (default 512,
+128 in the Qwen3.8 configuration). Replicas refill independently within each bucket;
+all chunks in that bucket are committed before the next bucket starts. Every selected input gets one model
+generation chance per submission. The adjacent `<layer>.batches/` journal
+holds atomic batch commits and a compact summary. At submission completion,
+an immutable candidate snapshot is published through the canonical manifest.
+Committed batches survive interruptions before that publication.
 
-The derived output-length ceiling includes a 256-character tolerance by
-default. This tolerance is included in the prompt and enforced by validation,
-so small 100--200 character overruns are accepted consistently. Set
-`--max-output-char-tolerance 0` for the former strict behavior or provide a
-different non-negative value.
-The tolerance may be increased when using `--retry-failed`, so failures from a
-previous strict run can be recovered without changing its run ID.
+Complete LLM outputs are accepted regardless of character overruns. The old
+`--max-output-char-tolerance` flag remains for compatibility and no longer
+enforces a rejection threshold. Token budgets reserve the complete prompt,
+capped thinking, edited text, statistics, and extra answer space within the
+model context ceiling. The exact rendered prompt is tokenized before inference.
 
-`--n-jobs` controls only local parallelism and may be changed for a retry. All
+`--n-jobs` controls only local traditional-method parallelism. LLM batch size and
+device layout can change on resume. All
 source, method, run, seed, and content-generation settings must still match
 the existing layer.
 
@@ -283,11 +289,17 @@ severity are balanced over the full corpus, and dimensions are derived from
 the assigned operations. The stable `seed` records the assignment identity;
 retries change only the generation seed.
 
-LLM outputs that are empty, unchanged, or longer than their requested
-character limit are retried up to three times. If the final output is otherwise
-valid but still over the length limit, it is retained and marked with
-`length_limit_exceeded`, `output_chars`, `max_output_chars`, and
-`retry_attempts` in its candidate metadata.
+Empty, unchanged, reasoning-only, and truncated edited text are recorded as
+retryable failures. Complete text can be recovered when only trailing statistics
+are malformed or truncated. Missing counts are marked unavailable. Counts in
+`reported_applied_edits` are model self-reports; canonical `edit_count` continues
+to describe the requested operations. Use `--retry-failed` for another attempt,
+with more answer space where the context ceiling permits it.
+
+See [the revised FE pilot launch guide](PERTURBATION_PILOT_HPC.md) for the
+Qwen3.8 configuration, all-operation pilot, thinking-cap check, LUMI replica
+comparison, and production commands. Revised prompts require new run IDs;
+pre-journal LLM runs are not silently migrated.
 
 ### Edit-count provenance
 
@@ -381,6 +393,11 @@ original or parent text to either judge, even when `--reference-policy` is
 used for score provenance. The reference policy controls stored candidate
 identity only.
 
+For Themis, checkpoint files are updated after each `--batch-size` inference
+batch (bounded by `--scoring-chunk-size`). vLLM's own request progress display
+is disabled, so the outer scorer progress bar remains readable under Slurm and
+an interrupted run can resume from the last completed batch.
+
 Scoring may occur before or after writing `split_assignments.jsonl` when all
 candidates are being scored. If `--source-partitions` is used, write the split
 manifest first. Regardless of scoring order, do not invoke the HF builder until
@@ -411,6 +428,11 @@ manifest; score the candidates needed for supervision (unless already scored);
 then build the HF dataset. The builder does not read or derive splits from
 `perturbation_assignments.jsonl`.
 
+Every original and perturbed text written to the Hugging Face dataset is
+preprocessed with `collapse_whitespace_v1`: all Unicode whitespace runs,
+including newlines and tabs, become one ASCII space. Canonical JSONL artifacts
+remain unchanged so their audit offsets and provenance stay valid.
+
 For a scored `trad_single` pair dataset, after the four-workflow split manifest
 exists, use one score run ID for each requested scoring method:
 
@@ -430,6 +452,25 @@ This emits one row per original--perturbation pair. Each row has two aligned
 values in `texts`, `labels`, `bertscore_f1`, and `bleurt`; item order is
 intentionally shuffled, so use the aligned `labels` or candidate metadata
 rather than assuming a fixed left/right position.
+
+For the FE binary objective, build the same selected data after composition as
+flat rows:
+
+```bash
+python scripts/build_hf_dataset.py \
+  --datasets fe-dataset-final \
+  --output-name fe-dataset-final_binary \
+  --include-methods trad_sampled \
+  --include-runs <trad-sampled-run-id> \
+  --include-layers 1 \
+  --training-method binary
+```
+
+This retains every original as a positive row (`label=1.0`) and every
+selected perturbation as a negative row (`label=0.0`). Train it with
+`scripts/train_fe_model.py --training-method binary`; binary checkpoint
+inference returns `sigmoid(logit)` in `[0, 1]`, while regression and pairwise
+checkpoints retain their existing raw-score behavior.
 
 Equivalent config-based use:
 

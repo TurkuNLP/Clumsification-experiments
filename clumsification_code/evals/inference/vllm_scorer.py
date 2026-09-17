@@ -55,6 +55,15 @@ class VLLMTextScorer:
         self.output_parser = self.protocol_spec.metadata.get(
             "output_parser", "prometheus_result"
         )
+        # Themis ships without a tokenizer chat template.  Its official
+        # evaluator sends the evaluation prompt as a plain completion, so do
+        # not route this protocol through LLM.chat(), which requires a chat
+        # template in recent Transformers/vLLM versions.
+        self.input_mode = (
+            "raw_completion"
+            if self.protocol_spec.metadata.get("method") == "themis"
+            else "chat"
+        )
         self.enable_thinking = enable_thinking
         self.sampling_params = SamplingParams(
             temperature=temperature,
@@ -147,11 +156,24 @@ class VLLMTextScorer:
     ) -> Tuple[List[float], List[Optional[BaseException]]]:
         """Score one request batch without allowing one output to abort it."""
         try:
-            outputs = self.llm.chat(
-                prompts,
-                sampling_params=self.sampling_params,
-                chat_template_kwargs={"enable_thinking": self.enable_thinking},
-            )
+            if self.input_mode == "raw_completion":
+                outputs = self.llm.generate(
+                    ["\n\n".join(message["content"] for message in prompt) for prompt in prompts],
+                    sampling_params=self.sampling_params,
+                    # The caller owns progress reporting.  vLLM's tqdm output
+                    # is especially noisy with TP.
+                    use_tqdm=False,
+                )
+            else:
+                outputs = self.llm.chat(
+                    prompts,
+                    sampling_params=self.sampling_params,
+                    chat_template_kwargs={"enable_thinking": self.enable_thinking},
+                    # The caller owns progress reporting.  vLLM's tqdm output
+                    # is especially noisy with TP, where it is emitted while
+                    # the engine is rendering each conversation batch.
+                    use_tqdm=False,
+                )
         except Exception as exc:
             return [float("nan")] * len(prompts), [exc] * len(prompts)
 

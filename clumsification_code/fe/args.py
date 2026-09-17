@@ -79,8 +79,11 @@ def parse_train_args():
     )
     parser.add_argument("--score-name", type=str, default=None,
                         help="Aligned score field in the formatted dataset; required for regression.")
-    parser.add_argument("--exclude-layer-zero", action="store_true",
-                        help="Exclude original (layer 0) candidates from regression training/evaluation.")
+    layer_zero_group = parser.add_mutually_exclusive_group()
+    layer_zero_group.add_argument("--exclude-layer-zero", action="store_true",
+                                  help="Exclude original (layer 0) candidates from all regression splits.")
+    layer_zero_group.add_argument("--exclude-layer-zero-training", action="store_true",
+                                  help="Exclude original (layer 0) candidates from regression training only.")
     parser.add_argument("--text-prefix", type=str, default="",
                         help="Prefix prepended to every text before tokenization.")
     parser.add_argument("--pooling", choices=["auto", "mean", "last_token"],
@@ -90,21 +93,23 @@ def parse_train_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--num_train_epochs", type=float, default=3)
     parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=1)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--train-sample-budget", type=int, default=None,
+                        help="Train once on exactly this many seeded training rows; overrides steps/epochs.")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4) #Global batch size of 16/32 seems optimal
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=5e-5) #Changed after doing HPO runs on 5k training samples, same for pairwise and regression
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--epsilon", type=float, default=0.2)
-    parser.add_argument("--scale", type=float, default=5.0)
+    parser.add_argument("--epsilon", type=float, default=0.05) #Epsilon to use in hinge
+    parser.add_argument("--scale", type=float, default=50.0) #Scale to use in logistic loss
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--loss", type=str, default=None,
                         choices=["binary", "logistic", "pairwise_logistic", "hinge", "margin",
                                  "weighted_logistic", "logistic_weighted", "weighted-logistic",
                                  "huber", "smooth_l1", "smoothl1", "mse", "mae", "l1"],
                         help="Objective loss: ranking loss for pairwise, regression loss for regression.")
-    parser.add_argument("--huber_delta", type=float, default=1.0)
+    parser.add_argument("--huber_delta", type=float, default=0.2) #Huber delta
     parser.add_argument("--attn_implementation", type=str, default="sdpa",
                         choices=["auto", "flash_attention_2", "sdpa", "eager"])
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -210,10 +215,13 @@ def parse_train_args():
     if args.training_method == "regression":
         if not args.score_name:
             parser.error("--score-name is required when --training-method regression.")
-        if args.eval_strategy == "no":
-            parser.error("Regression requires development evaluation for Spearman checkpoint selection.")
-        if args.save_strategy != args.eval_strategy:
-            parser.error("Regression requires matching --save_strategy and --eval_strategy.")
+        # Budgeted trials select the final model using a post-training dev
+        # evaluation (in-process HPO or the external human-dev runner).
+        if args.train_sample_budget is None and not args.hpo_mode:
+            if args.eval_strategy == "no":
+                parser.error("Regression requires development evaluation for Spearman checkpoint selection.")
+            if args.save_strategy != args.eval_strategy:
+                parser.error("Regression requires matching --save_strategy and --eval_strategy.")
     return args
 
 

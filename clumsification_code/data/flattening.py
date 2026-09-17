@@ -168,6 +168,63 @@ def flatten_regression_dataset(dataset: Dataset, score_name: str) -> Dataset:
     return Dataset.from_list(rows)
 
 
+def _binary_dataset_from_rows(rows: list[dict[str, Any]]) -> Dataset:
+    """Build flat binary rows with 64-bit offsets for large text datasets."""
+    schema = pa.schema([
+        pa.field("input_id", pa.large_string()),
+        pa.field("source_id", pa.large_string()),
+        pa.field("dataset_name", pa.large_string()),
+        pa.field("source_original_ids", _LARGE_STRING_LIST),
+        pa.field("text", pa.large_string()),
+        pa.field("label", pa.float64()),
+        pa.field("layer", pa.int64()),
+        pa.field("perturbation_source", pa.large_string()),
+        pa.field("perturbation_method", pa.large_string()),
+        pa.field("perturbation_run_id", pa.large_string()),
+        pa.field("parent_candidate_id", pa.large_string()),
+        pa.field("source_layer", pa.int64()),
+        pa.field("source_method", pa.large_string()),
+        pa.field("source_run_id", pa.large_string()),
+    ])
+    return Dataset(pa.Table.from_pylist(rows, schema=schema))
+
+
+def flatten_binary_dataset(dataset: Dataset) -> Dataset:
+    """Flatten grouped chains into one row per text for BCE binary training."""
+    rows: list[dict[str, Any]] = []
+    for chain in dataset:
+        items = _aligned_items(chain)
+        originals = [
+            item for item in items
+            if item["layer"] == 0 and item["perturbation_method"] == "original"
+        ]
+        if len(originals) != 1:
+            raise ValueError(
+                f"Chain {chain['id']!r} must contain exactly one original candidate "
+                f"for binary flattening; found {len(originals)}"
+            )
+        for item in items:
+            rows.append({
+                "input_id": item["candidate_id"],
+                "source_id": item["source_id"],
+                "dataset_name": item["dataset_name"],
+                "source_original_ids": item["source_original_ids"],
+                "text": item["text"],
+                "label": 1.0 if item is originals[0] else 0.0,
+                "layer": item["layer"],
+                "perturbation_source": item["perturbation_source"],
+                "perturbation_method": item["perturbation_method"],
+                "perturbation_run_id": item["perturbation_run_id"],
+                "parent_candidate_id": item["parent_candidate_id"],
+                "source_layer": item["source_layer"],
+                "source_method": item["source_method"],
+                "source_run_id": item["source_run_id"],
+            })
+    if not rows:
+        raise ValueError("No binary rows could be constructed")
+    return _binary_dataset_from_rows(rows)
+
+
 def flatten_pairwise_dataset(
     dataset: Dataset,
     *,
@@ -240,7 +297,7 @@ def flatten_pairwise_dataset(
 def flatten_dataset_dict(
     dataset_dict: DatasetDict,
     *,
-    training_method: Literal["regression", "pairwise"],
+    training_method: Literal["regression", "pairwise", "binary"],
     score_name: str | None = None,
     pair_policy: Literal["original_only", "all_unequal_layers"] = "all_unequal_layers",
 ) -> DatasetDict:
@@ -248,14 +305,17 @@ def flatten_dataset_dict(
     assert_source_split_isolation(dataset_dict)
     if training_method == "regression" and not score_name:
         raise ValueError("score_name is required for regression flattening")
-    if training_method not in {"regression", "pairwise"}:
+    if training_method not in {"regression", "pairwise", "binary"}:
         raise ValueError(f"Unknown training method: {training_method!r}")
 
     if training_method == "regression":
         def builder(split: Dataset) -> Dataset:
             return flatten_regression_dataset(split, score_name)  # type: ignore[arg-type]
-    else:
+    elif training_method == "pairwise":
         def builder(split: Dataset) -> Dataset:
             return flatten_pairwise_dataset(split, policy=pair_policy)
+    else:
+        def builder(split: Dataset) -> Dataset:
+            return flatten_binary_dataset(split)
 
     return DatasetDict({name: builder(dataset_dict[name]) for name in ("train", "dev", "test")})

@@ -1,6 +1,7 @@
 # This script has been co-created, refactored, and cleaned using GPT 5.6.
 from __future__ import annotations
 
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,11 +30,17 @@ from clumsification_code.evals.multilingual_benchmarks import (
     iter_basse_records,
     iter_norwegian_preference_records,
 )
+from clumsification_code.data.flattening import (
+    flatten_pairwise_dataset,
+    flatten_regression_dataset,
+)
+from clumsification_code.data.hf_dataset import load_formatted_dataset_dict
 from clumsification_code.evals.metrics import (
     correlation_bundle,
     flatten_preference_metrics,
     preference_metrics,
 )
+from clumsification_code.fe.metrics import binary_metrics
 
 
 def maybe_set_prompt_context(model: TextScorer, task_name: str, aspect: str) -> None:
@@ -150,6 +157,95 @@ def eval_pairwise_preference_dataset(
     )
 
     return metrics
+
+
+def run_formatted_dataset_suite(
+    *,
+    model: TextScorer,
+    device,
+    dataset_path: str,
+    split: str = "test",
+    training_method: str = "regression",
+    score_name: Optional[str] = None,
+    pair_policy: str = "all_unequal_layers",
+    batch_size: int,
+    max_length: int,
+    max_records: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Evaluate one split of a saved formatted HF dataset."""
+    if split not in {"train", "dev", "test"}:
+        raise ValueError("formatted dataset split must be one of: train, dev, test")
+    if training_method not in {"regression", "pairwise", "binary"}:
+        raise ValueError(
+            "formatted dataset training method must be regression, pairwise, or binary"
+        )
+    if max_records is not None and max_records < 1:
+        raise ValueError("max_records must be positive when provided")
+
+    dataset_dict = load_formatted_dataset_dict(dataset_path)
+    dataset = dataset_dict[split]
+    if max_records is not None:
+        dataset = dataset.select(range(min(max_records, len(dataset))))
+
+    result_prefix = f"formatted__{Path(dataset_path).name}__{split}"
+
+    if training_method == "regression":
+        if not score_name:
+            raise ValueError("score_name is required for formatted regression evaluation")
+        flat = flatten_regression_dataset(dataset, score_name)
+        result = score_scalar_aspect(
+            model=model,
+            device=device,
+            texts=[str(text) for text in flat["text"]],
+            labels=[float(label) for label in flat["label"]],
+            task_name="formatted_dataset",
+            aspect="regression",
+            result_name=result_prefix,
+            batch_size=batch_size,
+            max_length=max_length,
+            group_ids=[str(source_id) for source_id in flat["source_id"]],
+        )
+        result[f"{result_prefix}__n"] = len(flat)
+        result[f"{result_prefix}__score_name"] = score_name
+        return result
+
+    if training_method == "pairwise":
+        flat = flatten_pairwise_dataset(dataset, policy=pair_policy)
+        metrics = eval_pairwise_preference_dataset(
+            name=result_prefix,
+            model=model,
+            device=device,
+            preferred_texts=[str(text) for text in flat["chosen_text"]],
+            dispreferred_texts=[str(text) for text in flat["rejected_text"]],
+            task_name="formatted_dataset",
+            aspect="pairwise_quality",
+            batch_size=batch_size,
+            max_length=max_length,
+            group_ids=[str(source_id) for source_id in flat["source_id"]],
+        )
+        result = flatten_preference_metrics(result_prefix, metrics)
+        result[f"{result_prefix}__n"] = len(flat)
+        result[f"{result_prefix}__pair_policy"] = pair_policy
+        return result
+
+    missing = {"text"} - set(dataset.column_names)
+    if "label" not in dataset.column_names and "target" not in dataset.column_names:
+        missing.add("label or target")
+    if missing:
+        raise ValueError(f"Binary formatted split is missing column(s): {sorted(missing)}")
+    label_column = "label" if "label" in dataset.column_names else "target"
+    predictions = model.score_texts(
+        texts=[str(text) for text in dataset["text"]],
+        device=device,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+    metrics = binary_metrics(
+        SimpleNamespace(predictions=predictions, label_ids=dataset[label_column])
+    )
+    result = {f"{result_prefix}_{key}": value for key, value in metrics.items()}
+    result[f"{result_prefix}__n"] = len(dataset)
+    return result
 
 
 def run_external_dev_suite(

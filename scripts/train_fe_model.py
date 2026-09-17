@@ -214,6 +214,17 @@ def main():
     set_seed(args.seed)
 
     eval_only = getattr(args, "eval_only", False)
+    if args.train_sample_budget is not None:
+        batch = (world_size * args.per_device_train_batch_size
+                 * args.gradient_accumulation_steps)
+        if args.train_sample_budget <= 0 or batch <= 0 or args.train_sample_budget % batch:
+            raise ValueError("--train-sample-budget must be positive and divisible by global batch size")
+        args.max_steps = args.train_sample_budget // batch
+        args.num_train_epochs = 1
+        # A fixed-budget trial always evaluates the endpoint, without early stopping.
+        args.save_every_examples = args.eval_every_examples = None
+        args.early_stopping_checkpoints = None
+        args.save_strategy = args.eval_strategy = "no"
     example_schedule = resolve_example_schedule(
         save_every_examples=args.save_every_examples,
         eval_every_examples=args.eval_every_examples,
@@ -269,6 +280,7 @@ def main():
             grouped_dataset_dict=dataset_dict,
             score_name=args.score_name,
             exclude_layer_zero=args.exclude_layer_zero,
+            exclude_layer_zero_training=args.exclude_layer_zero_training,
         )
     elif args.training_method == "pairwise":
         # Factorial pairwise datasets are already flat. Historical FE inputs
@@ -286,6 +298,12 @@ def main():
             raise ValueError(f"Binary datasets require columns {sorted(required)}; missing {sorted(missing)}")
 
     train_dataset = dataset_dict["train"]
+    if args.train_sample_budget is not None and not eval_only:
+        if len(train_dataset) < args.train_sample_budget:
+            raise ValueError(f"Need {args.train_sample_budget} training rows; got {len(train_dataset)}")
+        train_dataset = train_dataset.shuffle(seed=args.seed).select(range(args.train_sample_budget))
+        logger.info("Training budget: %d rows, global batch %d, %d optimizer steps",
+                    args.train_sample_budget, batch, args.max_steps)
     dev_dataset = dataset_dict["dev"]
     test_dataset = dataset_dict["test"]
 

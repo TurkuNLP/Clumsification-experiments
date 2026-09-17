@@ -9,6 +9,7 @@ import torch
 
 from clumsification_code.evals.benchmark_runner import (
     run_external_dev_suite,
+    run_formatted_dataset_suite,
     run_standard_benchmark_suite,
 )
 from clumsification_code.evals.inference.fe import load_fe_inference_model
@@ -56,10 +57,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--evaluation-role",
         default="final",
-        choices=["final", "external-dev"],
+        choices=["final", "external-dev", "formatted-dataset"],
         help=(
             "Run the untouched final suite or the separate human-labeled "
-            "non-test checkpoint-selection panel."
+            "non-test checkpoint-selection panel, or a selected split from a saved formatted dataset."
         ),
     )
     parser.add_argument(
@@ -132,6 +133,34 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Limit each filtered scalar dimension for a quick local test.",
     )
+    parser.add_argument(
+        "--formatted-dataset-path",
+        default="",
+        help="Path to a saved formatted Hugging Face DatasetDict.",
+    )
+    parser.add_argument(
+        "--formatted-dataset-split",
+        default="test",
+        choices=["train", "dev", "test"],
+        help="Split to evaluate for formatted-dataset evaluation.",
+    )
+    parser.add_argument(
+        "--training-method",
+        default="regression",
+        choices=["regression", "pairwise", "binary"],
+        help="Objective used to interpret the formatted dataset split.",
+    )
+    parser.add_argument(
+        "--score-name",
+        default="",
+        help="Score field for formatted regression evaluation.",
+    )
+    parser.add_argument(
+        "--pair-policy",
+        default="all_unequal_layers",
+        choices=["original_only", "all_unequal_layers"],
+        help="Pair construction policy for formatted pairwise evaluation.",
+    )
 
 
 def add_gptscore_args(parser: argparse.ArgumentParser) -> None:
@@ -167,6 +196,10 @@ def add_unieval_args(parser: argparse.ArgumentParser) -> None:
 def add_prometheus_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vllm-model-name-or-path", default=None)
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--vllm-data-parallel-size", type=int, default=1,
+        help="Independent vLLM model replicas; total GPUs used is DP × TP.",
+    )
     parser.add_argument("--vllm-max-model-len", type=int, default=None)
     parser.add_argument("--vllm-max-tokens", type=int, default=512)
     parser.add_argument("--vllm-temperature", type=float, default=0.0)
@@ -236,12 +269,22 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
         return GEvalScorer.from_args(args)
 
     if args.scorer == "vllm":
-        from clumsification_code.evals.inference.vllm_scorer import VLLMTextScorer
-
         model_path = args.vllm_model_name_or_path or args.model_dir
         if not model_path:
             raise ValueError("--vllm-model-name-or-path or --model-dir is required with --scorer vllm")
-        return VLLMTextScorer(
+        if args.vllm_data_parallel_size < 1 or args.vllm_tensor_parallel_size < 1:
+            raise ValueError("vLLM data and tensor parallel sizes must be positive")
+        if args.vllm_data_parallel_size > 1:
+            from clumsification_code.evals.inference.vllm_parallel import ParallelVLLMTextScorer
+
+            scorer_type = ParallelVLLMTextScorer
+            parallel_kwargs = {"data_parallel_size": args.vllm_data_parallel_size}
+        else:
+            from clumsification_code.evals.inference.vllm_scorer import VLLMTextScorer
+
+            scorer_type = VLLMTextScorer
+            parallel_kwargs = {}
+        return scorer_type(
             model_path,
             tensor_parallel_size=args.vllm_tensor_parallel_size,
             max_model_len=args.vllm_max_model_len,
@@ -254,6 +297,7 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
             rubric=args.vllm_rubric,
             task="fluency",
             aspect="fluency",
+            **parallel_kwargs,
         )
 
     if args.scorer == "unieval":
@@ -328,6 +372,28 @@ def main(argv: Optional[list[str]] = None) -> None:
             include_story_cloze_diagnostic=args.include_dev_story_cloze_diagnostic,
             max_records_per_dimension=args.max_records_per_dimension,
         )
+    elif args.evaluation_role == "formatted-dataset":
+        if not args.formatted_dataset_path:
+            raise ValueError(
+                "--formatted-dataset-path is required with "
+                "--evaluation-role formatted-dataset"
+            )
+        if args.training_method == "regression" and not args.score_name:
+            raise ValueError(
+                "--score-name is required for formatted regression evaluation"
+            )
+        results = run_formatted_dataset_suite(
+            model=model,
+            device=device,
+            dataset_path=args.formatted_dataset_path,
+            split=args.formatted_dataset_split,
+            training_method=args.training_method,
+            score_name=args.score_name or None,
+            pair_policy=args.pair_policy,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            max_records=args.max_records_per_dimension,
+        )
     else:
         results = run_standard_benchmark_suite(
             model=model,
@@ -352,9 +418,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
 
     if args.scorer == "fe":
-        if args.evaluation_role == "external-dev":
+        if args.evaluation_role in {"external-dev", "formatted-dataset"}:
             model_name = args.model_name
-            training_dataset = args.training_dataset
+            training_dataset = (
+                args.formatted_dataset_path
+                if args.evaluation_role == "formatted-dataset"
+                else args.training_dataset
+            )
             pert_type = args.perturbation_type
             num_layers = args.num_layers
         else:
@@ -370,11 +440,27 @@ def main(argv: Optional[list[str]] = None) -> None:
             num_layers=num_layers,
             context_length=args.context_length,
             evaluation_tracks=(
-                "external-dev"
-                if args.evaluation_role == "external-dev"
+                args.evaluation_role
+                if args.evaluation_role != "final"
                 else ("english" if args.skip_multilingual else "english,multilingual")
             ),
             evaluation_role=args.evaluation_role,
+            formatted_dataset_path=(
+                args.formatted_dataset_path
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            formatted_dataset_split=(
+                args.formatted_dataset_split
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            training_method=(
+                args.training_method
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            score_name=(
+                args.score_name
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
         )
 
     else:
@@ -391,19 +477,48 @@ def main(argv: Optional[list[str]] = None) -> None:
             protocol=protocol,
             rubric=rubric,
             evaluation_tracks=(
-                "external-dev"
-                if args.evaluation_role == "external-dev"
+                args.evaluation_role
+                if args.evaluation_role != "final"
                 else ("english" if args.skip_multilingual else "english,multilingual")
             ),
             evaluation_role=args.evaluation_role,
+            formatted_dataset_path=(
+                args.formatted_dataset_path
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            formatted_dataset_split=(
+                args.formatted_dataset_split
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            training_method=(
+                args.training_method
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            score_name=(
+                args.score_name
+                if args.evaluation_role == "formatted-dataset" else ""
+            ),
+            vllm_data_parallel_size=(
+                args.vllm_data_parallel_size if args.scorer == "vllm" else 0
+            ),
+            vllm_tensor_parallel_size=(
+                args.vllm_tensor_parallel_size if args.scorer == "vllm" else 0
+            ),
         )
 
     eval_dir = (
         "data/evals/external_dev"
         if args.evaluation_role == "external-dev"
-        else "data/evals/final"
+        else (
+            "data/evals/formatted"
+            if args.evaluation_role == "formatted-dataset"
+            else "data/evals/final"
+        )
     )
     write_results_jsonl(metadata=metadata, results=results, eval_dir=Path(eval_dir))
+    close_model = getattr(model, "close", None)
+    if callable(close_model):
+        close_model()
 
 
 if __name__ == "__main__":

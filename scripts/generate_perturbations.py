@@ -42,12 +42,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-id", default="default")
     parser.add_argument("--target-layer", type=int, default=None)
-    parser.add_argument("--language", default="english")
+    parser.add_argument("--language", default=None)
     parser.add_argument("--model-path", default=None)
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=32768,
+        default=None,
         help=(
             "Absolute context ceiling. Text bucketing and generation limits "
             "are derived automatically by the LLM runner."
@@ -60,10 +60,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Frozen LLM assignment JSONL created by plan_llm_assignments.py. "
-            "When supplied, its matching method rows replace runtime sampling."
+            "Required for LLM methods; its matching method rows define the edits."
         ),
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -93,10 +93,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Additional characters allowed above the derived LLM output limit "
+            "Deprecated compatibility setting; LLM character overruns are accepted. "
             "(default: 256)."
         ),
     )
+    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--structured-output", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--thinking-token-cap", type=int, default=None)
+    parser.add_argument("--answer-reserve-tokens", type=int, default=None)
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--source-buckets", type=int, nargs="+", default=None)
+    parser.add_argument("--tokenizer", default=None)
+    parser.add_argument("--revision", default=None)
+    parser.add_argument("--device-groups", help="Disjoint device groups, e.g. '0,1;2,3;4,5;6,7'")
+    parser.add_argument("--accelerator", choices=["cuda", "rocm"], default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--retry-failed",
@@ -117,12 +130,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = _load_json(args.method_config)
-    if args.max_model_len < 1:
+    if args.max_model_len is not None and args.max_model_len < 1:
         raise ValueError("--max-model-len must be a positive integer")
     config.update(
         {
             key: value
             for key, value in {
+                "device_groups": args.device_groups,
+                "accelerator": args.accelerator,
+                "enable_thinking": args.thinking,
+                "structured_output": args.structured_output,
+                "thinking_token_cap": args.thinking_token_cap,
+                "answer_reserve_tokens": args.answer_reserve_tokens,
+                "tensor_parallel_size": args.tensor_parallel_size,
+                "max_num_seqs": args.max_num_seqs,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "gpu_memory_utilization": args.gpu_memory_utilization,
+                "source_buckets": args.source_buckets,
+                "tokenizer": args.tokenizer,
+                "revision": args.revision,
                 "language": args.language,
                 "model": args.model_path,
                 "max_model_len": args.max_model_len,
@@ -139,23 +165,37 @@ def main() -> None:
             if value is not None
         }
     )
-    output = generate_layer(
-        args.dataset,
-        dataset_root=args.dataset_root,
-        source_layer=args.source_layer,
-        source_method=args.source_method,
-        source_run_id=args.source_run_id,
-        method=args.method,
-        run_id=args.run_id,
-        target_layer=args.target_layer,
-        config=config,
-        source_partitions=(
-            tuple(args.source_partitions) if args.source_partitions is not None else None
-        ),
-        limit=args.limit,
-        overwrite=args.overwrite,
-        retry_failed=args.retry_failed,
+    from clumsification_code.perturbations.vllm_runner import VLLMRunner
+    from clumsification_code.perturbations.parallel_runner import ParallelLLMRunner
+    groups = config.get("device_groups")
+    runner = (
+        ParallelLLMRunner(groups, accelerator=config.get("accelerator", "cuda"))
+        if groups else VLLMRunner()
     )
+    if groups:
+        config["tensor_parallel_size"] = len(runner.groups[0].split(","))
+        config["replicas"] = len(runner.groups)
+    try:
+        output = generate_layer(
+            args.dataset,
+            llm_runner=runner,
+            dataset_root=args.dataset_root,
+            source_layer=args.source_layer,
+            source_method=args.source_method,
+            source_run_id=args.source_run_id,
+            method=args.method,
+            run_id=args.run_id,
+            target_layer=args.target_layer,
+            config=config,
+            source_partitions=(
+                tuple(args.source_partitions) if args.source_partitions is not None else None
+            ),
+            limit=args.limit,
+            overwrite=args.overwrite,
+            retry_failed=args.retry_failed,
+        )
+    finally:
+        runner.close()
     print(f"Wrote perturbation layer: {output}")
 
 

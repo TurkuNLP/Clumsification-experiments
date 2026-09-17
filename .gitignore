@@ -29,6 +29,11 @@ vllm_cache
 quick*
 TQ_ranker*
 *.ipynb
+notebooks
+analysis_outputs/
+docs/PERTURBATION_*
+!docs/PERTURBATION_CONFIGS*
+configs/perturbations
 # Local exploratory notebook for custom-dataset perturbation statistics.
 notebooks/perturbation_statistics.ipynb
 factorial_evals_visualizer.ipynb

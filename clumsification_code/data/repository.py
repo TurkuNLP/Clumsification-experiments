@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
+import re
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -300,7 +302,10 @@ class DatasetRepository:
             raise ValueError(f"Manifest layer path must be repository-relative: {entry.path}")
         path = self.dataset_dir / relative
         expected = self.layer_path(entry.method, entry.run_id, entry.target_layer)
-        if path != expected:
+        is_snapshot = path.parent == expected.parent and re.fullmatch(
+            rf"{entry.target_layer}\.snapshot-[0-9a-f]{{32}}\.jsonl", path.name
+        )
+        if path != expected and not is_snapshot:
             raise ValueError(
                 f"Manifest path {entry.path!r} does not match its method/run/layer identity"
             )
@@ -411,6 +416,7 @@ class DatasetRepository:
         config: dict[str, Any],
         input_count: int,
         overwrite: bool = False,
+        snapshot: bool = False,
     ) -> LayerManifestEntry:
         values = list(records)
         if input_count < 0:
@@ -438,6 +444,8 @@ class DatasetRepository:
             json.dumps(row, ensure_ascii=False, allow_nan=False, sort_keys=True)
 
         destination = self.layer_path(method, run_id, target_layer)
+        if snapshot:
+            destination = destination.with_name(f"{target_layer}.snapshot-{uuid.uuid4().hex}.jsonl")
         relative_path = destination.relative_to(self.dataset_dir).as_posix()
         with self._manifest_lock():
             manifest = self.read_manifest()

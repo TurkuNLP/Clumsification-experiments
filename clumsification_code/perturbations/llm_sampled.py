@@ -13,20 +13,20 @@ from .sampling import (
     SampledEditAssignment,
     load_edit_catalog,
 )
-from .schemas import GenerationRuntime, PerturbationInput, PerturbationResult
+from .schemas import ChatCompletion, GenerationRuntime, PerturbationInput, PerturbationResult
 
 
 SAMPLED_METHOD = "llm_sampled"
 SINGLE_METHOD = "llm_single"
-PROMPT_VERSION = "llm-sampled-v1"
-SINGLE_PROMPT_VERSION = "llm-single-v1"
+PROMPT_VERSION = "llm-sampled-v3-json1"
+SINGLE_PROMPT_VERSION = "llm-single-v3-json1"
 
-_SYSTEM_PROMPT = """You are a controlled fluency-perturbation editor. Rewrite the source so it is substantially less fluent while preserving its propositional content. Fluency concerns grammaticality, coherence, clarity, and naturalness. Preserve every claim, entity, number, polarity, temporal relation, causal relation, degree of certainty, and speaker attitude. Preserve existing source errors unless a requested operation directly targets that span. Return only the edited text."""
+_SYSTEM_PROMPT = """You are a controlled fluency-degrading editor. Rewrite the source so it is substantially less fluent while preserving its propositional content. Fluency concerns grammaticality, coherence, clarity, and naturalness. Perturbation edits come in three different severities. Weak means that the awkwardness is noticeable to a proficient reader but remains easy to follow. Medium means that the awkwardness is noticeable to an ordinary reader and at least some passages require rereading. Strong means that the he awkwardness is noticeable even to a beginner and multiple passages require rereading. The edited text's meaning and facts must be recoverable from the edited text, but doing so requires extra effort. Preserve existing source errors unless a requested operation directly targets that span. Return only the edited text followed by the necessary statistics."""
 
 _SEVERITY_GUIDANCE = {
     "weak": "The awkwardness is noticeable to a proficient reader but remains easy to follow.",
-    "medium": "The awkwardness is conspicuous to an ordinary reader and at least some passages require extra processing, while the original propositions remain recoverable.",
-    "strong": "The awkwardness is unmistakable even to a beginner and multiple passages require rereading, while the original propositions remain recoverable.",
+    "medium": "The awkwardness is noticeable to an ordinary reader and at least some passages require rereading.",
+    "strong": "The awkwardness is noticeable even to a beginner and multiple passages require rereading",
 }
 
 
@@ -48,6 +48,8 @@ def _render_operation(entry: EditCatalogEntry, index: int) -> str:
         f"Apply the edit type '{entry.edit_type}' while preserving the source meaning."
     )
     extra = ""
+    if entry.applicability:
+        extra += " Suitable context: " + "; ".join(entry.applicability) + "."
     if entry.minimum_realization:
         extra += f" Minimum realization: {entry.minimum_realization}"
     if entry.non_examples:
@@ -55,8 +57,8 @@ def _render_operation(entry: EditCatalogEntry, index: int) -> str:
     return (
         f"{index}. {entry.edit_type} ({entry.edit_id})\n"
         f"Instruction: {instruction}{extra}\n"
-        f"Illustration — edited: {entry.example_edited}\n"
-        f"Illustration — clean: {entry.example_clean}"
+        f"Illustration — source: {entry.example_clean}\n"
+        f"Illustration — edited: {entry.example_edited}"
     )
 
 
@@ -76,18 +78,22 @@ def render_sampled_messages(
     )
     dimensions = ", ".join(assignment.target_dimensions)
     task = f"""Target dimensions: {dimensions}
-Target severity: {assignment.severity}. {_SEVERITY_GUIDANCE[assignment.severity]}
+Target severity: {assignment.severity}.
 
 Required operations:
 {operations}
 
 Requirements:
-- Apply every required operation at least once. If an operation is not possible given the source text, then use another operation an additional time.
-- Use at least one qualifying change in each of {max(2, math.floor(len(assignment.edits)/2))} distinct sentences when the source contains that many sentences.
-- Clause-level or discourse-level changes are required; isolated neutral synonym substitutions do not count.
+- Apply exactly {len(assignment.edits)} edits.
+- Apply every required operation at least once.
+- Use at least one qualifying change in {max(1, math.floor(len(assignment.edits)/2))} distinct sentences.
+- Edits must correspond to severity and also be genuine changes; isolated neutral synonym substitutions do not count.
 - Do not add facts, omit propositions, change timeline or polarity, translate, or repair unrelated source errors.
 - Do not copy the illustration text or its entities into the source.
-- The maximum output length is {max_length} characters.
+- The edited text must not be more than 100 characters longer.
+- Return JSON with "text" first and "applied_edits" second. The character preference applies only to "text".
+- In "applied_edits", include every requested edit_id with an integer count of qualifying changes actually made. Use 0 when not realized; do not claim an edit just because it was requested.
+- Count realized instances, not the number of requested operation types. Escape quotes and newlines in the JSON text string. Do not include explanations.
 
 Source text:
 {text}"""
@@ -111,6 +117,7 @@ class SampledLLMMethod:
         )
         self.catalog = load_edit_catalog(catalog_path)
         self.seed = int(self.config.get("seed", 42))
+        self._request_cache = {}
         self._planned_assignments = self._load_planned_assignments()
 
     def _load_planned_assignments(self) -> dict[str, LLMAssignment]:
@@ -180,6 +187,10 @@ class SampledLLMMethod:
         requests = []
         tolerance = int(self.config.get("max_output_char_tolerance", 256))
         for index, item in enumerate(items):
+            key = (item.get("candidate_id"), item.get("base_text_id"), str(item.get("text", "")), item.get("max_length"))
+            if key in self._request_cache:
+                requests.append(self._request_cache[key])
+                continue
             assignment = self.assignment_for_item(item, index=index)
             text = str(item.get("text", "")).replace("\n", " ")
             base_limit = int(
@@ -195,6 +206,7 @@ class SampledLLMMethod:
                     prompt_version=self.prompt_version,
                 )
             )
+            self._request_cache[key] = requests[-1]
         return requests
 
     def build_prompts(self, items: Sequence[Mapping[str, Any]]) -> list[list[dict[str, str]]]:
@@ -217,13 +229,16 @@ class SampledLLMMethod:
             ]
         )
         model, outputs = runtime.run_chat(
-            self.config, [request.messages for request in requests]
+            self.config, [request.messages for request in requests],
+            source_texts=[str(item.text).replace("\n", " ") for item in items],
+            request_ids=[str(item.candidate_id) for item in items],
+            requested_edits=[[edit.edit_id for edit in request.assignment.edits] for request in requests],
         )
         return [
             PerturbationResult(
                 dataset_name=item.dataset_name,
                 base_text_id=item.base_text_id,
-                text=output,
+                text=output.text if isinstance(output, ChatCompletion) else output,
                 source_layer=item.source_layer,
                 source_method=item.source_method,
                 source_run_id=item.source_run_id,
@@ -241,18 +256,12 @@ class SampledLLMMethod:
                 prompt_version=request.prompt_version,
                 method_config=dict(self.config),
                 metadata={
-                    "base_max_output_chars": int(
-                        item.metadata.get("max_length")
-                        or min(int(len(item.text.replace("\n", " ")) * 1.1), len(item.text.replace("\n", " ")) + 500)
-                    ),
-                    "max_output_char_tolerance": int(
-                        self.config.get("max_output_char_tolerance", 256)
-                    ),
-                    "max_output_chars": int(
-                        item.metadata.get("max_length")
-                        or min(int(len(item.text.replace("\n", " ")) * 1.1), len(item.text.replace("\n", " ")) + 500)
-                    )
-                    + int(self.config.get("max_output_char_tolerance", 256)),
+                    **{k: v for k, v in item.metadata.items() if k.startswith("pilot_")},
+                    "length_delta_chars": len(output.text if isinstance(output, ChatCompletion) else output) - len(item.text)
+                        if isinstance(output, (str, ChatCompletion)) else None,
+                    **(output.metadata if isinstance(output, ChatCompletion) else {}),
+                    **({"generation_failure": output.failure_reason}
+                       if isinstance(output, ChatCompletion) and output.failure_reason else {}),
                 },
             )
             for item, output, request in zip(items, outputs, requests)

@@ -15,6 +15,7 @@ from clumsification_code.data.schemas import (
     COMPOSITION_POLICIES,
     HFBuildSpec,
     PAIR_POLICIES,
+    TRAINING_METHODS,
 )
 
 
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method-weights", nargs="+", metavar="METHOD=WEIGHT")
     parser.add_argument("--samples-per-source", type=int, default=1)
     parser.add_argument("--pair-policy", choices=sorted(PAIR_POLICIES), default="none")
+    parser.add_argument("--training-method", choices=sorted(TRAINING_METHODS), default="grouped")
     parser.add_argument("--reuse-limit", type=int, default=5)
     parser.add_argument("--score-names", nargs="+")
     parser.add_argument("--score-run-ids", nargs="+")
@@ -84,6 +86,7 @@ def _spec_from_args(args: argparse.Namespace) -> HFBuildSpec:
         "method_weights": _parse_weights(args.method_weights) or {},
         "samples_per_source": args.samples_per_source,
         "pair_policy": args.pair_policy,
+        "training_method": args.training_method,
         "reuse_limit": args.reuse_limit,
         "downsample_size": args.downsample_size,
         "score_names": args.score_names or [],

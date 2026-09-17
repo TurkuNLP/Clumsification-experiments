@@ -85,17 +85,41 @@ client. `scripts/plan_llm_assignments.py` freezes the LLM assignments before
 generation, and `scripts/assign_workflow_splits.py` creates the shared split
 manifest afterward.
 
+The generation service delegates to focused components:
+
+| Module | Responsibility |
+| --- | --- |
+| `generation.py` | Load parents and coordinate selection, execution, validation, and checkpoints |
+| `generation_config.py` | Resolve defaults and distinguish request settings from attempt statistics |
+| `length_planning.py` | Measured source buckets, thinking/answer budgets, and checkpoint batches |
+| `vllm_runner.py` | Persistent model engine, capped thinking, structured output, and per-item seeds |
+| `parallel_runner.py` | Independent GPU replicas, replenished as chunks finish, with results streamed to one writer |
+| `output_parsing.py` | Decode outputs, validate provenance, and construct candidate records |
+| `batch_store.py` | LLM batch journal, resume/retry selection, and canonical snapshot publication |
+| `generation_store.py` | Existing traditional-method checkpoints |
+
+Public generation entry points and the injected four-argument chat-runner
+contract remain available. LLM results are committed in immutable batches and
+published as canonical snapshots through the repository manifest. Model-reported
+edit counts are separate from the frozen assignment's requested edit count.
+Complete LLM outputs are not rejected for character overruns. The prompt's
+editing instructions remain intact, with an added JSON/statistics output contract.
+
 Canonical LLM method names are `llm_single`, `llm_sampled`; the only active
 traditional names are `trad_single` and `trad_sampled`. Both sample from the
 same five-operation mix: UniEval-style repetition, deletion, and shuffle;
 agreement corruption; and random same-lemma morphology. LLM implementations share a
 runner boundary and load vLLM only when needed. Context buckets are split into
-checkpoint batches (512 items by default); the engine is retained across
-batches in the same bucket, and successful candidates plus failure identities
-are persisted after every batch. A normal resubmission continues unattempted
+checkpoint batches (512 items by default, 128 in the Qwen3.8 pilot configuration);
+the engine is retained within each bucket and reinitialized with a measured context limit at bucket transitions, and successful
+candidates plus concise failures are persisted after every batch. A normal resubmission continues unattempted
 inputs, while `--retry-failed` selects only recorded failures. LLM edit count, operations,
 severity, and derived dimensions are selected in the frozen assignment file;
 retries retain those assignments and only change model-generation randomness.
+
+The prepared pilot covers all 36 current operations at all three severities,
+plus combinations and stress cases. See [the HPC launch guide](docs/PERTURBATION_PILOT_HPC.md)
+for the environment check, review page, replica benchmarks, and full-run commands.
 
 Traditional perturbation is multilingual: English morphology uses
 Lemminflect and other supported languages use UniMorph. The registry exposes
@@ -153,6 +177,13 @@ grouped HF rows into explicit training rows:
 - regression: one candidate and one finite scalar target;
 - pairwise: one chosen/rejected pair, with lower perturbation layer treated as
   the preferred candidate for layer-based supervision.
+- binary: one candidate per row, with the original labeled `1.0` and every
+  selected perturbation labeled `0.0` for BCE-with-logits supervision.
+
+Binary flattening is selected with `training_method: "binary"` in an
+`HFBuildSpec` (or `--training-method binary` on the builder CLI). It runs
+after source splitting and composition, preserves the split isolation, and
+requires `pair_policy: "none"`. Grouped output remains the default.
 
 The FE model is candidate-only at inference. Both objectives use the same
 encoder, resolved pooling rule, and scalar linear head. Teacher scores,

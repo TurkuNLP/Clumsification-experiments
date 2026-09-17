@@ -478,6 +478,8 @@ def score_custom_dataset(
         raise ValueError("batch_size must be positive.")
     if scoring_chunk_size <= 0:
         raise ValueError("scoring_chunk_size must be positive.")
+    if themis_tensor_parallel_size <= 0:
+        raise ValueError("themis_tensor_parallel_size must be positive.")
     if max_tokens < 2:
         raise ValueError("max_tokens must be at least 2.")
     if metricx_max_input_length < 2:
@@ -730,11 +732,28 @@ def score_custom_dataset(
     score_records: list[ScoreRecord] = resumed_records
     error_rows: list[dict] = resumed_errors
     task_fingerprint = _task_fingerprint(tasks)
+    # VLLMTextScorer performs inference in ``batch_size`` groups.  Persisting
+    # only after scoring_chunk_size tasks made a large Themis run appear
+    # stalled and lost all completed work if the job was pre-empted while the
+    # chunk was still running.  Keep the larger chunk for other scorers, but
+    # checkpoint Themis at the same granularity as its actual vLLM calls.
+    checkpoint_chunk_size = (
+        min(scoring_chunk_size, batch_size)
+        if scoring_type == "menlo_themis_fluency"
+        else scoring_chunk_size
+    )
+    if checkpoint_chunk_size != scoring_chunk_size:
+        print(
+            "[score_custom_dataset] Themis checkpointing after each inference "
+            f"batch ({checkpoint_chunk_size} tasks).",
+            file=sys.stderr,
+            flush=True,
+        )
     with tqdm(
         total=len(tasks), initial=resume_offset, desc=f"{scoring_type} scoring", unit="pair"
     ) as progress:
-        for offset in range(resume_offset, len(tasks), scoring_chunk_size):
-            task_chunk = tasks[offset : offset + scoring_chunk_size]
+        for offset in range(resume_offset, len(tasks), checkpoint_chunk_size):
+            task_chunk = tasks[offset : offset + checkpoint_chunk_size]
             scores, failures = score_with_failure_isolation(task_chunk, scorer)
             record_chunk = [
                 ScoreRecord(
@@ -786,6 +805,7 @@ def score_custom_dataset(
                     "scoring_method": scoring_type,
                     "scoring_run_id": scoring_run_id,
                     "scoring_chunk_size": scoring_chunk_size,
+                    "checkpoint_chunk_size": checkpoint_chunk_size,
                     "task_fingerprint": task_fingerprint,
                     "num_candidate_tasks": len(tasks),
                     "num_completed_tasks": min(offset + len(task_chunk), len(tasks)),
@@ -826,6 +846,7 @@ def score_custom_dataset(
         "uses_reference": scorer_config.get("uses_reference", False),
         "batch_size": batch_size,
         "scoring_chunk_size": scoring_chunk_size,
+        "checkpoint_chunk_size": checkpoint_chunk_size,
         "task_fingerprint": task_fingerprint,
         "max_tokens": max_tokens,
         "device": device,
