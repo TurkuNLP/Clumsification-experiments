@@ -11,12 +11,13 @@ from __future__ import annotations
 import math
 import random
 import sys
+import time
 import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from clumsification_code.data.candidate_identity import make_original_candidate_id
 from clumsification_code.data.io import (
@@ -109,6 +110,25 @@ def _load_progress(
     if set(completed_ids) != set(expected_ids):
         raise ValueError("Incomplete score run is not a complete prefix of this request")
     return records, errors, len(completed_ids)
+
+
+def _load_failed_run(
+    *, score_path: Path, error_path: Path, metadata_path: Path, tasks: Sequence[ScoreTask]
+) -> tuple[list[ScoreRecord], list[ScoreTask], dict]:
+    """Validate a completed run and select exactly its failed candidates."""
+    metadata = read_json(metadata_path)
+    if metadata.get("task_fingerprint") != _task_fingerprint(tasks):
+        raise ValueError("Completed score run does not match this request")
+    records = [ScoreRecord.from_row(row) for row in read_jsonl(score_path)]
+    errors = read_jsonl(error_path)
+    task_ids = {task.candidate_id for task in tasks}
+    scored_ids = [record.candidate_id for record in records]
+    failed_ids = [str(row["candidate_id"]) for row in errors]
+    all_ids = scored_ids + failed_ids
+    if len(all_ids) != len(set(all_ids)) or set(all_ids) != task_ids:
+        raise ValueError("Completed score run does not cover these tasks exactly once")
+    failed = set(failed_ids)
+    return records, [task for task in tasks if task.candidate_id in failed], metadata
 
 
 def select_original_ids(
@@ -421,6 +441,56 @@ def score_with_failure_isolation(
     return scores, failures
 
 
+def score_failed_until_success(
+    tasks: Sequence[ScoreTask],
+    scorer: BatchScorer,
+    *,
+    max_retries: int,
+    score_once: Callable[
+        [Sequence[ScoreTask]], tuple[list[float | None], list[ScoreFailure]]
+    ] | None = None,
+) -> tuple[list[float | None], list[ScoreFailure]]:
+    """Retry only unresolved tasks, retaining every successful score."""
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+    scores: list[float | None] = [None] * len(tasks)
+    pending = list(range(len(tasks)))
+    failures_by_index: dict[int, ScoreFailure] = {}
+    for attempt in range(max_retries + 1):
+        if not pending:
+            break
+        print(
+            f"[score_custom_dataset] Retry round {attempt + 1}/{max_retries + 1}: "
+            f"submitting {len(pending)} task(s).",
+            file=sys.stderr,
+            flush=True,
+        )
+        started = time.monotonic()
+        attempt_tasks = [tasks[index] for index in pending]
+        attempt_scores, attempt_failures = (
+            score_once(attempt_tasks)
+            if score_once is not None
+            else score_with_failure_isolation(attempt_tasks, scorer)
+        )
+        failed_by_id = {failure.task.candidate_id: failure for failure in attempt_failures}
+        next_pending = []
+        for index, value in zip(pending, attempt_scores):
+            if value is not None:
+                scores[index] = value
+                failures_by_index.pop(index, None)
+            else:
+                next_pending.append(index)
+                failures_by_index[index] = failed_by_id[tasks[index].candidate_id]
+        pending = next_pending
+        print(
+            f"[score_custom_dataset] Retry round {attempt + 1}/{max_retries + 1}: "
+            f"{len(pending)} task(s) still failed after {time.monotonic() - started:.1f}s.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return scores, [failures_by_index[index] for index in pending]
+
+
 def _package_version(package_name: str) -> str | None:
     try:
         from importlib.metadata import version
@@ -454,6 +524,9 @@ def score_custom_dataset(
     gptscore_dtype: str = "auto",
     gptscore_tp_plan: str | None = "auto",
     geval_cache_path: str | None = None,
+    geval_batch_size: int = 10000,
+    geval_batch_action: str = "prepare",
+    geval_client: Any | None = None,
     themis_model_name: str = DEFAULT_THEMIS_MODEL,
     themis_tensor_parallel_size: int = 1,
     themis_max_model_len: int | None = None,
@@ -469,6 +542,8 @@ def score_custom_dataset(
     reference_policy: str = "original",
     source_partitions: Iterable[str] | None = None,
     overwrite: bool = False,
+    retry_failed: bool = False,
+    retry_failed_max_retries: int = 100,
     dataset_root: Path = Path("data/custom_datasets"),
 ) -> dict:
     """Score originals and perturbations and write reproducibility records."""
@@ -484,6 +559,10 @@ def score_custom_dataset(
         raise ValueError("max_tokens must be at least 2.")
     if metricx_max_input_length < 2:
         raise ValueError("metricx_max_input_length must be at least 2.")
+    if overwrite and retry_failed:
+        raise ValueError("--overwrite and --retry-failed cannot be used together")
+    if retry_failed_max_retries < 0:
+        raise ValueError("retry_failed_max_retries must be non-negative")
 
     methods = tuple(methods) if methods is not None else None
     perturbation_run_ids = (
@@ -491,12 +570,34 @@ def score_custom_dataset(
     )
     target_layers = tuple(target_layers) if target_layers is not None else None
     repository = DatasetRepository.from_root(dataset_root, dataset_name)
+    if scoring_type == "geval_gpt54mini_fluency":
+        from clumsification_code.scoring.geval_batch import score_geval_batch
+
+        return score_geval_batch(
+            repository=repository,
+            scoring_run_id=scoring_run_id,
+            methods=methods,
+            perturbation_run_ids=perturbation_run_ids,
+            target_layers=target_layers,
+            sample_limit=sample_limit,
+            seed=seed,
+            include_originals=include_originals,
+            reference_policy=reference_policy,
+            source_partitions=source_partitions,
+            batch_size=geval_batch_size,
+            action=geval_batch_action,
+            client=geval_client,
+            retry_failed=retry_failed,
+            overwrite_prepared=overwrite,
+        )
     score_destinations = (
         repository.score_path(scoring_type, scoring_run_id),
         repository.score_error_path(scoring_type, scoring_run_id),
         repository.score_metadata_path(scoring_type, scoring_run_id),
     )
-    if not overwrite and any(path.exists() for path in score_destinations):
+    if retry_failed and not all(path.exists() for path in score_destinations):
+        raise FileNotFoundError("--retry-failed requires a completed score run")
+    if not overwrite and not retry_failed and any(path.exists() for path in score_destinations):
         existing = next(path for path in score_destinations if path.exists())
         raise FileExistsError(f"Score run output already exists: {existing}")
     progress_root = repository.score_method_root(scoring_type) / ".in_progress"
@@ -515,6 +616,24 @@ def score_custom_dataset(
         reference_policy=reference_policy,
         source_partitions=source_partitions,
     )
+    full_tasks = tasks
+    previous_records: list[ScoreRecord] = []
+    previous_metadata: dict = {}
+    if retry_failed:
+        previous_records, tasks, previous_metadata = _load_failed_run(
+            score_path=score_destinations[0],
+            error_path=score_destinations[1],
+            metadata_path=score_destinations[2],
+            tasks=full_tasks,
+        )
+        if not tasks:
+            return {
+                "score_path": str(score_destinations[0]),
+                "error_path": str(score_destinations[1]),
+                "metadata_path": str(score_destinations[2]),
+                "num_successful_scores": len(previous_records),
+                "num_failures": 0,
+            }
     print(
         f"[score_custom_dataset] Loaded {len(tasks):,} scoring tasks; "
         f"chunk size is {scoring_chunk_size:,}.",
@@ -540,6 +659,7 @@ def score_custom_dataset(
                 metadata_path=progress_metadata_path,
                 tasks=tasks,
             )
+    retry_score_once = None
     if scoring_type == "bertscore_f1":
         scorer = BERTScoreScorer(language=language, batch_size=batch_size).score
         scorer_config = {
@@ -608,6 +728,30 @@ def score_custom_dataset(
                 batch_size=batch_size,
             ).tolist()
 
+        def retry_score_once(
+            task_batch: Sequence[ScoreTask],
+        ) -> tuple[list[float | None], list[ScoreFailure]]:
+            values, errors = teacher.score_texts_once(
+                [task.target_text for task in task_batch]
+            )
+            if len(values) != len(task_batch) or len(errors) != len(task_batch):
+                raise RuntimeError("vLLM returned a different number of results than tasks")
+            scores = []
+            failures = []
+            for task, value, error in zip(task_batch, values, errors):
+                if error is None and not math.isfinite(value):
+                    error = ValueError(f"Scorer returned a non-finite score: {value!r}")
+                if error is None:
+                    scores.append(float(value))
+                else:
+                    scores.append(None)
+                    failures.append(ScoreFailure(
+                        task=task,
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                    ))
+            return scores, failures
+
         scorer_config = {
             "model_name": themis_model_name,
             "input_mode": "candidate_only",
@@ -623,37 +767,6 @@ def score_custom_dataset(
             "max_tokens": themis_max_tokens,
         }
         direction_description = "Themis 1-5 score with MENLO fluency rubric; higher is better."
-    elif scoring_type == "geval_gpt54mini_fluency":
-        from clumsification_code.evals.geval.scorer import GEvalScorer
-
-        teacher = GEvalScorer(
-            model_name=DEFAULT_GEVAL_MODEL,
-            cache_path=geval_cache_path,
-            task="custom_dataset",
-            aspect="fluency",
-            temperature=0.0,
-            n_samples=1,
-        )
-
-        def scorer(task_batch: Sequence[ScoreTask]) -> list[float]:
-            return teacher.score_texts(
-                [task.target_text for task in task_batch],
-                batch_size=batch_size,
-            ).tolist()
-
-        scorer_config = {
-            "model_name": DEFAULT_GEVAL_MODEL,
-            "input_mode": "candidate_only",
-            "uses_reference": False,
-            "protocol": "geval_json.json",
-            "protocol_id": "geval.no_reference",
-            "prompt_version": "geval_qe_no_reference_v2",
-            "parser": "json_score",
-            "cache_path": geval_cache_path,
-            "temperature": 0.0,
-            "n_samples": 1,
-        }
-        direction_description = "G-Eval 1-5 fluency score; higher is better."
     elif scoring_type == "gptscore_source_fluency":
         from clumsification_code.evals.inference.gptscore import (
             DEFAULT_SOURCE_AWARE_FLUENCY_PROMPT,
@@ -754,7 +867,13 @@ def score_custom_dataset(
     ) as progress:
         for offset in range(resume_offset, len(tasks), checkpoint_chunk_size):
             task_chunk = tasks[offset : offset + checkpoint_chunk_size]
-            scores, failures = score_with_failure_isolation(task_chunk, scorer)
+            if retry_failed:
+                scores, failures = score_failed_until_success(
+                    task_chunk, scorer, max_retries=retry_failed_max_retries,
+                    score_once=retry_score_once,
+                )
+            else:
+                scores, failures = score_with_failure_isolation(task_chunk, scorer)
             record_chunk = [
                 ScoreRecord(
                     dataset_name=task.dataset_name,
@@ -814,6 +933,8 @@ def score_custom_dataset(
                 },
                 overwrite=True,
             )
+    if retry_failed:
+        score_records = previous_records + score_records
     metadata = {
         "schema_version": 3,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -831,14 +952,14 @@ def score_custom_dataset(
         "score_direction": "higher_is_better",
         "score_transform": direction_description,
         "include_originals": include_originals,
-        "num_original_tasks": sum(task.target_layer == 0 for task in tasks),
-        "num_perturbation_tasks": sum(task.target_layer > 0 for task in tasks),
+        "num_original_tasks": sum(task.target_layer == 0 for task in full_tasks),
+        "num_perturbation_tasks": sum(task.target_layer > 0 for task in full_tasks),
         "failures": "written_to_errors_jsonl; no null or NaN score values are written",
         "sample_limit": sample_limit,
         "seed": seed,
         "selected_original_ids": selected_ids,
         "num_selected_originals": len(selected_ids),
-        "num_candidate_tasks": len(tasks),
+        "num_candidate_tasks": len(full_tasks),
         "num_successful_scores": len(score_records),
         "num_failures": len(error_rows),
         "language": language,
@@ -847,7 +968,7 @@ def score_custom_dataset(
         "batch_size": batch_size,
         "scoring_chunk_size": scoring_chunk_size,
         "checkpoint_chunk_size": checkpoint_chunk_size,
-        "task_fingerprint": task_fingerprint,
+        "task_fingerprint": _task_fingerprint(full_tasks),
         "max_tokens": max_tokens,
         "device": device,
         "scorer_config": scorer_config,
@@ -862,13 +983,17 @@ def score_custom_dataset(
             "openai": _package_version("openai"),
         },
     }
+    if retry_failed:
+        metadata["retry_attempts"] = previous_metadata.get("retry_attempts", 0) + 1
+        metadata["retried_failed_tasks"] = len(tasks)
+        metadata["retry_failed_max_retries"] = retry_failed_max_retries
     score_path, error_path, metadata_path = repository.write_scores(
         score_records,
         scoring_method=scoring_type,
         scoring_run_id=scoring_run_id,
         errors=error_rows,
         metadata=metadata,
-        overwrite=overwrite,
+        overwrite=overwrite or retry_failed,
     )
     for path in progress_paths:
         path.unlink(missing_ok=True)

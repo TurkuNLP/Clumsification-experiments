@@ -31,6 +31,7 @@ class EvalMetadata:
     score_name: str = ""
     vllm_data_parallel_size: int = 0
     vllm_tensor_parallel_size: int = 0
+    ppl_data_parallel_size: int = 0
 
 
 def json_sanitize(x: Any) -> Any:
@@ -69,5 +70,5 @@ def write_results_jsonl(
     with out_path.open("a", encoding="utf-8") as writer:
         writer.write(json.dumps(json_sanitize(record), ensure_ascii=False) + "\n")
 
-    print(f"\n✓ Results appended to {out_path}")
+    print(f"\n✓ Results appended to {out_path}", flush=True)
     return out_path

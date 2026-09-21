@@ -13,7 +13,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from clumsification_code.evals.inference.base import TextScorer
 
@@ -30,8 +30,10 @@ class HFCausalLMPerplexityInferenceModel(TextScorer):
         dtype: torch.dtype,
         trust_remote_code: bool = False,
         device_map: Optional[str] = None,
+        show_progress: bool = True,
     ) -> None:
         self.device = device
+        self.show_progress = show_progress
         tokenizer_path = tokenizer_name_or_path or model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
@@ -46,7 +48,19 @@ class HFCausalLMPerplexityInferenceModel(TextScorer):
         else:
             model_kwargs["torch_dtype"] = dtype
 
-        self.model = AutoModelForCausalLM.from_pretrained(
+        config = AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
+        if config.model_type == "qwen3_5":
+            # Qwen3.5's text logits come from a conditional-generation model,
+            # even when the input contains only text.
+            from transformers import AutoModelForMultimodalLM
+
+            model_loader = AutoModelForMultimodalLM
+        else:
+            model_loader = AutoModelForCausalLM
+
+        self.model = model_loader.from_pretrained(
             model_name_or_path,
             **model_kwargs,
         )
@@ -67,7 +81,10 @@ class HFCausalLMPerplexityInferenceModel(TextScorer):
         run_device = device or self.device
         scores = []
 
-        for start in tqdm(range(0, len(texts), batch_size), desc="Scoring HF PPL"):
+        for start in tqdm(
+            range(0, len(texts), batch_size), desc="Scoring HF PPL",
+            disable=not self.show_progress,
+        ):
             batch = texts[start : start + batch_size]
             tokens = self.tokenizer(
                 batch,

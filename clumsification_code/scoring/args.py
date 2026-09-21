@@ -12,7 +12,7 @@ from clumsification_code.scoring.custom_dataset import (
     DEFAULT_GEVAL_MODEL,
     SUPPORTED_SCORING_TYPES,
 )
-from clumsification_code.perturbations.registry import list_method_specs
+from clumsification_code.data.workflow_splitting import WORKFLOW_METHODS
 
 
 def parse_score_args():
@@ -86,7 +86,19 @@ def parse_score_args():
     parser.add_argument(
         "--geval-cache-path",
         default=None,
-        help="Optional JSON cache path for GPT-5.4-mini G-Eval responses.",
+        help="Legacy direct-request cache; unused by GPT-5.4-mini Batch scoring.",
+    )
+    parser.add_argument(
+        "--geval-batch-size",
+        type=int,
+        default=10000,
+        help="GPT-5.4-mini Batch requests per input file (default: 10000).",
+    )
+    parser.add_argument(
+        "--geval-batch-action",
+        choices=("prepare", "submit", "collect"),
+        default="prepare",
+        help="Prepare local Batch files, submit them, or collect finished results.",
     )
     parser.add_argument("--themis-model-name", default="PKU-ONELab/Themis")
     parser.add_argument("--themis-tensor-parallel-size", type=int, default=1)
@@ -104,7 +116,7 @@ def parse_score_args():
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=[spec.name for spec in list_method_specs()],
+        choices=WORKFLOW_METHODS,
         default=None,
     )
     parser.add_argument("--perturbation-run-ids", nargs="+", default=None)
@@ -126,7 +138,19 @@ def parse_score_args():
         type=Path,
         default=Path("data/custom_datasets"),
     )
-    parser.add_argument("--overwrite", action="store_true")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument("--overwrite", action="store_true")
+    output_group.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry only errors from a completed score run, preserving its successful scores.",
+    )
+    parser.add_argument(
+        "--retry-failed-max-retries",
+        type=int,
+        default=100,
+        help="Additional retry rounds for unresolved entries in this job (default: 100).",
+    )
 
     args = parser.parse_args()
     if args.sample_limit is not None and args.sample_limit <= 0:
@@ -135,6 +159,10 @@ def parse_score_args():
         parser.error("--batch-size must be positive.")
     if args.scoring_chunk_size <= 0:
         parser.error("--scoring-chunk-size must be positive.")
+    if not 1 <= args.geval_batch_size <= 50000:
+        parser.error("--geval-batch-size must be between 1 and 50000.")
+    if args.retry_failed_max_retries < 0:
+        parser.error("--retry-failed-max-retries must be non-negative.")
     if args.max_tokens < 2:
         parser.error("--max-tokens must be at least 2.")
     if args.metricx_max_input_length < 2:

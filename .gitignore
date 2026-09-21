@@ -19,6 +19,7 @@ data/*
 # Internal utilities and all local/HPC batch jobs stay untracked. Reproduction
 # commands belong in the stable documentation instead.
 scripts/others*
+scripts/audit*
 *.sh
 !scripts/experiments/
 scripts/experiments/*.sh

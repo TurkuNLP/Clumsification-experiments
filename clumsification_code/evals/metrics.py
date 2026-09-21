@@ -19,11 +19,11 @@ def safe_spearman(labels, preds, name: str = "metric"):
     labels, preds = _finite_pair_mask(labels, preds)
 
     if len(labels) < 2:
-        print(f"{name}: not enough valid points for Spearman.")
+        print(f"{name}: not enough valid points for Spearman.", flush=True)
         return float("nan"), float("nan")
 
     if np.all(preds == preds[0]):
-        print(f"{name}: predictions are constant; Spearman undefined.")
+        print(f"{name}: predictions are constant; Spearman undefined.", flush=True)
         return float("nan"), float("nan")
 
     rho, p = spearmanr(labels, preds)
@@ -34,11 +34,11 @@ def safe_kendall(labels, preds, name: str = "metric"):
     labels, preds = _finite_pair_mask(labels, preds)
 
     if len(labels) < 2:
-        print(f"{name}: not enough valid points for Kendall tau.")
+        print(f"{name}: not enough valid points for Kendall tau.", flush=True)
         return float("nan"), float("nan")
 
     if np.all(preds == preds[0]):
-        print(f"{name}: predictions are constant; Kendall tau undefined.")
+        print(f"{name}: predictions are constant; Kendall tau undefined.", flush=True)
         return float("nan"), float("nan")
 
     tau, p = kendalltau(labels, preds)
@@ -94,8 +94,8 @@ def correlation_bundle(
     rho, rho_p = safe_spearman(labels, preds, name=name)
     tau, tau_p = safe_kendall(labels, preds, name=name)
 
-    print(f"  Spearman rho ({name}): {rho:.4f} (p={rho_p:.2e})")
-    print(f"  Kendall tau ({name}): {tau:.4f} (p={tau_p:.2e})")
+    print(f"  Spearman rho ({name}): {rho:.4f} (p={rho_p:.2e})", flush=True)
+    print(f"  Kendall tau ({name}): {tau:.4f} (p={tau_p:.2e})", flush=True)
 
     result = {
         f"{name}_spearman_rho": rho,

@@ -20,6 +20,11 @@ _RESULT_RE = re.compile(
 _RATING_RE = re.compile(r"\bRating\s*:\s*([1-5])\b", flags=re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
 _MAX_RETRIES = 5
+_THEMIS_RATING_REPAIR = (
+    "\n\nUsing the target text and criterion above, answer with exactly one line: "
+    "Rating: N (replace N with one integer from 1 to 5). "
+    "Do not include analysis or repeat the rubric."
+)
 
 
 class VLLMTextScorer:
@@ -69,9 +74,18 @@ class VLLMTextScorer:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        self.rating_repair_sampling_params = (
+            SamplingParams(
+                temperature=0.2,
+                repetition_penalty=1.15,
+                max_tokens=min(max_tokens, 128),
+            )
+            if self.output_parser == "themis_rating" else None
+        )
         llm_kwargs: Dict[str, Any] = {
             "model": model_name_or_path,
             "tensor_parallel_size": tensor_parallel_size,
+            "language_model_only": True,
             "gpu_memory_utilization": gpu_memory_utilization,
             "trust_remote_code": trust_remote_code,
         }
@@ -82,6 +96,10 @@ class VLLMTextScorer:
     def set_prompt_context(self, task_name: str, aspect: str) -> None:
         self.task = task_name
         self.aspect = aspect
+
+    def score_cache_context(self) -> str:
+        """Identify the rendered prompt apart from the candidate text."""
+        return repr(self._messages(""))
 
     def _messages(self, text: str) -> List[Dict[str, str]]:
         if "rubric" in self.rubric_data:
@@ -104,7 +122,7 @@ class VLLMTextScorer:
         visible_text = _THINK_BLOCK_RE.sub("", text or "")
         match = _RESULT_RE.search(visible_text)
         if match is None:
-            raise ValueError(f"Could not find [RESULT] score in vLLM output: {text[:300]!r}")
+            raise ValueError(f"Could not find [RESULT] score in vLLM output: {text}")
         return float(match.group(1))
 
     def score_texts(
@@ -128,10 +146,23 @@ class VLLMTextScorer:
                 break
 
             next_pending: List[int] = []
-            for start in range(0, len(pending), batch_size):
-                indices = pending[start : start + batch_size]
+            # vLLM schedules a submitted request list against its own KV-cache
+            # capacity. A small outer loop would cap the scheduler at 32
+            # requests even when hundreds are waiting on this replica.
+            submission_size = len(pending) if attempt == 0 else batch_size
+            starts = range(0, len(pending), submission_size)
+            for start in starts:
+                indices = pending[start : start + submission_size]
+                retry_rating = attempt > 0 and self.output_parser == "themis_rating"
+                batch_prompts = [prompts[index] for index in indices]
+                if retry_rating:
+                    batch_prompts = [self._rating_repair_prompt(prompt) for prompt in batch_prompts]
                 batch_scores, batch_errors = self._score_batch(
-                    [prompts[index] for index in indices]
+                    batch_prompts,
+                    sampling_params=(
+                        self.rating_repair_sampling_params
+                        if retry_rating else None
+                    ),
                 )
                 for index, score, error in zip(indices, batch_scores, batch_errors):
                     if error is None:
@@ -151,27 +182,39 @@ class VLLMTextScorer:
             )
         return scores
 
+    def score_texts_once(
+        self, texts: List[str]
+    ) -> Tuple[List[float], List[Optional[BaseException]]]:
+        """Submit one batch once and retain each text's parse or request error."""
+        if not texts:
+            return [], []
+        return self._score_batch([self._messages(text) for text in texts])
+
+    @staticmethod
+    def _rating_repair_prompt(prompt: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        repaired = [dict(message) for message in prompt]
+        repaired[-1]["content"] += _THEMIS_RATING_REPAIR
+        return repaired
+
     def _score_batch(
-        self, prompts: List[List[Dict[str, str]]]
+        self, prompts: List[List[Dict[str, str]]], *, sampling_params=None,
     ) -> Tuple[List[float], List[Optional[BaseException]]]:
         """Score one request batch without allowing one output to abort it."""
+        sampling_params = sampling_params or self.sampling_params
         try:
             if self.input_mode == "raw_completion":
                 outputs = self.llm.generate(
                     ["\n\n".join(message["content"] for message in prompt) for prompt in prompts],
-                    sampling_params=self.sampling_params,
-                    # The caller owns progress reporting.  vLLM's tqdm output
-                    # is especially noisy with TP.
+                    sampling_params=sampling_params,
+                    # Benchmark results provide the useful progress signal.
                     use_tqdm=False,
                 )
             else:
                 outputs = self.llm.chat(
                     prompts,
-                    sampling_params=self.sampling_params,
+                    sampling_params=sampling_params,
                     chat_template_kwargs={"enable_thinking": self.enable_thinking},
-                    # The caller owns progress reporting.  vLLM's tqdm output
-                    # is especially noisy with TP, where it is emitted while
-                    # the engine is rendering each conversation batch.
+                    # Avoid per-request progress output in batch logs.
                     use_tqdm=False,
                 )
         except Exception as exc:
@@ -202,7 +245,7 @@ class VLLMTextScorer:
             match = _RATING_RE.search(visible_text)
             if match is None:
                 raise ValueError(
-                    f"Could not find Rating score in Themis output: {text[:300]!r}"
+                    f"Could not find Rating score in Themis output: {text!r}"
                 )
             return float(match.group(1))
         return self._parse_score(text)

@@ -1,3 +1,4 @@
+# This script has been co-created, refactored, and cleaned using GPT 5.6.
 """Independent vLLM replicas for candidate-only benchmark inference."""
 
 from __future__ import annotations
@@ -6,6 +7,8 @@ import atexit
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 import os
+import tempfile
+import uuid
 from typing import Any, List
 
 import numpy as np
@@ -43,7 +46,10 @@ def _device_groups(device_ids: list[str], data_parallel_size: int, tensor_parall
     ]
 
 
-def _initialize_worker(device_group: str, accelerator: str, scorer_kwargs: dict[str, Any]) -> None:
+def _initialize_worker(
+    device_group: str, accelerator: str, scorer_kwargs: dict[str, Any],
+    cache_root: str,
+) -> None:
     global _worker_scorer
     if accelerator == "rocm":
         os.environ["ROCR_VISIBLE_DEVICES"] = device_group
@@ -52,6 +58,12 @@ def _initialize_worker(device_group: str, accelerator: str, scorer_kwargs: dict[
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = device_group
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # Independent replicas otherwise compile the same model into one vLLM/
+    # Inductor cache concurrently, which can leave truncated cache entries.
+    os.makedirs(cache_root, exist_ok=True)
+    os.environ["VLLM_CACHE_ROOT"] = cache_root
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_root, "inductor")
+    os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_root, "triton")
 
     # Import vLLM only after narrowing the worker's visible devices.
     from .vllm_scorer import VLLMTextScorer
@@ -92,6 +104,7 @@ class ParallelVLLMTextScorer:
             **scorer_kwargs,
         }
         self._executors: list[ProcessPoolExecutor] = []
+        self._cache_run_id = uuid.uuid4().hex
         atexit.register(self.close)
 
     def _start_workers(self) -> None:
@@ -108,6 +121,14 @@ class ParallelVLLMTextScorer:
             self.tensor_parallel_size,
         )
         print(f"Starting {len(groups)} vLLM replicas (TP={self.tensor_parallel_size}) on {groups}", flush=True)
+        base_cache_root = os.environ.get("VLLM_CACHE_ROOT")
+        if not base_cache_root:
+            base_cache_root = os.path.join(
+                os.environ.get("SLURM_TMPDIR")
+                or os.environ.get("TMPDIR")
+                or tempfile.gettempdir(),
+                "vllm",
+            )
         context = multiprocessing.get_context("spawn")
         self._executors = [
             ProcessPoolExecutor(max_workers=1, mp_context=context)
@@ -115,8 +136,15 @@ class ParallelVLLMTextScorer:
         ]
         try:
             ready = [
-                executor.submit(_initialize_worker, group, accelerator, self._scorer_kwargs)
-                for executor, group in zip(self._executors, groups)
+                executor.submit(
+                    _initialize_worker, group, accelerator,
+                    self._scorer_kwargs,
+                    os.path.join(
+                        base_cache_root, "eval_replicas", self._cache_run_id,
+                        f"replica_{index}",
+                    ),
+                )
+                for index, (executor, group) in enumerate(zip(self._executors, groups))
             ]
             for future in ready:
                 future.result()
@@ -127,6 +155,19 @@ class ParallelVLLMTextScorer:
     def set_prompt_context(self, task_name: str, aspect: str) -> None:
         self.task = task_name
         self.aspect = aspect
+
+    def score_cache_context(self) -> tuple[str, str, str]:
+        """Match the single-process scorer's prompt identity across dimensions."""
+        from clumsification_code.evals.geval.prompts import render_rubric, rubric_for
+        from clumsification_code.prompts import load_prompt_data
+
+        rubric_data = load_prompt_data(f"evaluation/rubrics/{self.rubric}")
+        rubric = (
+            rubric_data["rubric"]
+            if "rubric" in rubric_data
+            else render_rubric(rubric_for(task=self.task, aspect=self.aspect))
+        )
+        return (self.protocol, self.rubric, rubric)
 
     def score_texts(
         self, texts: List[str], device=None, batch_size: int = 32,

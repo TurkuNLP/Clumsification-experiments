@@ -19,6 +19,7 @@ MAX_SEQ_LEN = 512
 DEFAULT_OBJECTIVE_KEYS = {
     "pairwise": "hpo_dev_pairwise_accuracy",
     "regression": "hpo_dev_spearman",
+    "binary": "hpo_dev_binary_accuracy",
 }
 
 
@@ -36,6 +37,7 @@ HUBER_LOSSES = {"huber", "smooth_l1", "smoothl1"}
 DEFAULT_TRIAL_FILES = {
     "pairwise": "configs/hpo/fe_external_dev_initial.json",
     "regression": "configs/hpo/fe_regression_pilot.json",
+    "binary": "configs/hpo/fe_binary_pilot.json",
 }
 
 
@@ -83,6 +85,7 @@ def pick_objective(
     keys_to_try.extend(
         [
             DEFAULT_OBJECTIVE_KEYS.get("pairwise", "hpo_dev_pairwise_accuracy"),
+            "hpo_dev_binary_accuracy",
             "hpo_dev_accuracy",
             "hpo_dev_pairwise_accuracy",
             "hpo_dev_spearman",
@@ -124,12 +127,16 @@ def normalize_trial(
     """
     t = dict(trial)
 
-    loss = str(t.get("loss", "logistic"))
+    loss = str(t.get("loss", "binary" if training_method == "binary" else "logistic"))
     if loss == "margin_ranking":
         loss = "hinge"
     t["loss"] = loss
 
-    valid_losses = REGRESSION_LOSSES if training_method == "regression" else PAIRWISE_LOSSES
+    valid_losses = (
+        REGRESSION_LOSSES if training_method == "regression"
+        else {"binary"} if training_method == "binary"
+        else PAIRWISE_LOSSES
+    )
     if t["loss"] not in valid_losses:
         raise ValueError(
             f"Invalid loss in trial {t.get('trial_id')}: {t['loss']!r}. "
@@ -268,7 +275,7 @@ def build_trial_command(
         cmd.extend(["--score-name", args.score_name])
         if trial["loss"] in HUBER_LOSSES:
             cmd.extend(["--huber_delta", str(trial.get("huber_delta", 1.0))])
-    else:
+    elif args.training_method == "pairwise":
         cmd.extend(["--epsilon", str(trial["epsilon"]), "--scale", str(trial["scale"])])
 
     cmd.extend(["--parallelism", args.parallelism])
@@ -308,7 +315,7 @@ def expand_trial_grid(
             trial["trial_id"] = len(trials) + 1
             if loss in HUBER_LOSSES:
                 shape = f"delta{trial.get('huber_delta', 1.0):g}_"
-            elif loss in REGRESSION_LOSSES:
+            elif loss in REGRESSION_LOSSES or loss == "binary":
                 shape = ""
             elif loss in {"hinge", "margin", "margin_ranking"}:
                 shape = f"margin{trial['epsilon']:g}_"
@@ -546,7 +553,7 @@ def main() -> None:
     parser.add_argument("--train_sample_budget", type=int, default=4992,
                         help="Training examples per trial, independent of batch size (default: 4992).")
     parser.add_argument("--external_dev_batch_size", type=int, default=32)
-    parser.add_argument("--training_method", choices=["pairwise", "regression"], default="pairwise")
+    parser.add_argument("--training_method", choices=["pairwise", "regression", "binary"], default="pairwise")
     parser.add_argument("--score_name", type=str, default=None,
                         help="Score field required for regression HPO.")
 

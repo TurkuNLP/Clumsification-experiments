@@ -6,6 +6,43 @@ import argparse
 
 def add_geval_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--geval-processing",
+        choices=["batch", "direct"],
+        default="batch",
+        help=(
+            "Use resumable OpenAI Batch processing or the legacy direct "
+            "Chat Completions request path."
+        ),
+    )
+    parser.add_argument(
+        "--geval-batch-action",
+        choices=["prepare", "submit", "collect", "retry"],
+        default="prepare",
+        help=(
+            "Batch workflow stage. Prepare is local-only; retry resubmits only "
+            "failed or missing requests after all current jobs finish."
+        ),
+    )
+    parser.add_argument(
+        "--geval-batch-run-id",
+        default=None,
+        help="Stable Batch run ID. Defaults to --model-name.",
+    )
+    parser.add_argument(
+        "--geval-batch-state-root",
+        default="data/evals/geval_batches",
+        help="Directory containing resumable benchmark Batch manifests and files.",
+    )
+    parser.add_argument(
+        "--geval-batch-size",
+        type=int,
+        default=5000,
+        help=(
+            "Requests per uploaded Batch file. Smaller chunks are easier to fit "
+            "within account Batch queue limits."
+        ),
+    )
+    parser.add_argument(
         "--geval-model",
         type=str,
         default="gpt-4o-mini",
@@ -15,13 +52,16 @@ def add_geval_args(parser: argparse.ArgumentParser) -> None:
         "--api-key",
         type=str,
         default=None,
-        help="OpenAI API key. If omitted, the OpenAI client uses OPENAI_API_KEY.",
+        help=(
+            "OpenAI API key for legacy direct mode only. Batch mode uses "
+            "OpenAI_lib.get_client_local()."
+        ),
     )
     parser.add_argument(
         "--base-url",
         type=str,
         default=None,
-        help="Optional OpenAI-compatible base URL.",
+        help="Optional OpenAI-compatible base URL for legacy direct mode only.",
     )
     parser.add_argument(
         "--temperature",
@@ -63,7 +103,10 @@ def add_geval_args(parser: argparse.ArgumentParser) -> None:
         "--cache-path",
         type=str,
         default="data/evals/geval_cache.json",
-        help="JSON cache path. Set to an empty string to disable cache.",
+        help=(
+            "Legacy direct-request JSON cache path. Batch mode instead uses "
+            "--geval-batch-state-root."
+        ),
     )
     parser.add_argument(
         "--geval-score-min",

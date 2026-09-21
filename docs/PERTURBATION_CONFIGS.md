@@ -398,6 +398,14 @@ batch (bounded by `--scoring-chunk-size`). vLLM's own request progress display
 is disabled, so the outer scorer progress bar remains readable under Slurm and
 an interrupted run can resume from the last completed batch.
 
+For a completed scoring run with errors, pass `--retry-failed` with the same
+selection and run ID. The scorer loads once, then retries only unresolved
+entries for up to 100 additional rounds in that job. Set
+`--retry-failed-max-retries N` to change the limit. Successful scores are
+preserved; any entries still failing remain in the error file. Themis makes
+one vLLM submission per retry round and prints the pending count before and
+after it, so a slow submission is visible in the job log.
+
 Scoring may occur before or after writing `split_assignments.jsonl` when all
 candidates are being scored. If `--source-partitions` is used, write the split
 manifest first. Regardless of scoring order, do not invoke the HF builder until

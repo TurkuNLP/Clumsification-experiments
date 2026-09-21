@@ -479,6 +479,10 @@ class LocalHFGPTScoreInferenceModel:
         self.task_name = task_name
         self.aspect = aspect
 
+    def score_cache_context(self) -> str:
+        """Identify the prompt used to score candidate text."""
+        return self._render_prompt()
+
     def _get_prompt_spec(self) -> Dict[str, str]:
         if self.prompt_template is not None:
             rendered = self.prompt_template.format(

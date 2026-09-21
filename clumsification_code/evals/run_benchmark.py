@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 from typing import Optional
 
@@ -76,8 +78,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--perturbation-type", default="")
     parser.add_argument("--num-layers", type=int, default=-1)
     parser.add_argument("--context-length", type=int, default=-1)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Scorer batch size; for vLLM, only caps retry batches after the full initial submission.",
+    )
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument(
+        "--ppl-data-parallel-size", type=int, default=1,
+        help="Independent PPL model replicas; each uses one GPU.",
+    )
     parser.add_argument(
         "--dtype",
         default="bfloat16",
@@ -317,18 +326,26 @@ def build_scorer(args: argparse.Namespace, device: torch.device):
         return load_trained_unieval_model(args.model_dir, device=device, dtype=dtype)
 
     if args.scorer == "ppl":
-        from clumsification_code.evals.inference.hf_ppl import load_hf_ppl_model
-
         if not args.hf_model_name_or_path:
             raise ValueError("--hf-model-name-or-path is required with --scorer ppl")
-        return load_hf_ppl_model(
+        if args.ppl_data_parallel_size < 1:
+            raise ValueError("--ppl-data-parallel-size must be positive")
+        scorer_kwargs = dict(
             model_name_or_path=args.hf_model_name_or_path,
             tokenizer_name_or_path=args.tokenizer_name_or_path,
-            device=device,
             dtype=dtype,
             trust_remote_code=args.trust_remote_code,
             device_map=args.device_map,
         )
+        if args.ppl_data_parallel_size > 1:
+            from clumsification_code.evals.inference.hf_ppl_parallel import ParallelHFPPLScorer
+
+            return ParallelHFPPLScorer(
+                data_parallel_size=args.ppl_data_parallel_size, **scorer_kwargs
+            )
+        from clumsification_code.evals.inference.hf_ppl import load_hf_ppl_model
+
+        return load_hf_ppl_model(device=device, **scorer_kwargs)
 
     raise ValueError(f"Unsupported scorer: {args.scorer}")
 
@@ -355,14 +372,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    args = parse_args(argv)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = build_scorer(args, device)
-
+def run_selected_suite(
+    args: argparse.Namespace,
+    model,
+    device: torch.device,
+):
+    """Run the CLI-selected suite with an already constructed scorer."""
     if args.evaluation_role == "external-dev":
-        results = run_external_dev_suite(
+        return run_external_dev_suite(
             model=model,
             device=device,
             batch_size=args.batch_size,
@@ -382,7 +399,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             raise ValueError(
                 "--score-name is required for formatted regression evaluation"
             )
-        results = run_formatted_dataset_suite(
+        return run_formatted_dataset_suite(
             model=model,
             device=device,
             dataset_path=args.formatted_dataset_path,
@@ -394,20 +411,106 @@ def main(argv: Optional[list[str]] = None) -> None:
             max_length=args.max_length,
             max_records=args.max_records_per_dimension,
         )
-    else:
-        results = run_standard_benchmark_suite(
-            model=model,
-            device=device,
-            batch_size=args.batch_size,
-            max_length=args.max_length,
-            nlg_eval_path=args.nlg_eval_path,
-            ellipse_path=args.ellipse_path,
-            human_chatgpt_essays_path=args.human_chatgpt_essays_path,
-            cohesentia_path=args.cohesentia_path,
-            skip_preferences=args.skip_preferences,
-            max_records_per_dimension=args.max_records_per_dimension,
-            include_multilingual=not args.skip_multilingual,
+    return run_standard_benchmark_suite(
+        model=model,
+        device=device,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        nlg_eval_path=args.nlg_eval_path,
+        ellipse_path=args.ellipse_path,
+        human_chatgpt_essays_path=args.human_chatgpt_essays_path,
+        cohesentia_path=args.cohesentia_path,
+        skip_preferences=args.skip_preferences,
+        max_records_per_dimension=args.max_records_per_dimension,
+        include_multilingual=not args.skip_multilingual,
+    )
+
+
+def _run_geval_batch(
+    args: argparse.Namespace,
+    device: torch.device,
+):
+    from clumsification_code.evals.geval.benchmark_batch import (
+        BatchGEvalScorer,
+        run_benchmark_batch_action,
+    )
+    from clumsification_code.evals.geval.prompts import GEVAL_QE_PROMPT_VERSION
+
+    scorer = BatchGEvalScorer.from_args(args)
+    # Traversal calculates placeholder metrics while collecting requests. Hide
+    # those deliberately discarded values from the user-facing output.
+    with redirect_stdout(io.StringIO()):
+        run_selected_suite(args, scorer, device)
+    batch_result = run_benchmark_batch_action(
+        scorer=scorer,
+        state_root=Path(args.geval_batch_state_root),
+        run_id=args.geval_batch_run_id or args.model_name,
+        batch_size=args.geval_batch_size,
+        action=args.geval_batch_action,
+    )
+    status = batch_result["status"]
+    print(
+        f"G-Eval Batch {status}: {batch_result.get('state_path', '')}",
+        flush=True,
+    )
+    if status == "prepared":
+        print(
+            f"  {batch_result['num_logical_requests']} distinct judgments, "
+            f"{batch_result['num_requests']} API requests in "
+            f"{batch_result['num_batches']} files.",
+            flush=True,
         )
+        return scorer, None, batch_result
+    if status == "pending":
+        print(f"  Batch statuses: {batch_result['batch_statuses']}", flush=True)
+        if batch_result.get("queue_limited"):
+            print(
+                "  The active Batch queue is full. Completed chunks remain saved; "
+                "rerun submit after queued jobs finish.",
+                flush=True,
+            )
+        return scorer, None, batch_result
+    if status == "completed_with_errors":
+        print(
+            f"  {batch_result['num_failures']} requests need retry; details: "
+            f"{batch_result['failure_path']}",
+            flush=True,
+        )
+        return scorer, None, batch_result
+    if batch_result.get("results_written"):
+        print(
+            f"  Final metrics were already written to {batch_result['results_path']}",
+            flush=True,
+        )
+        return scorer, None, batch_result
+    scorer.set_collected_scores(batch_result["scores"])
+    results = run_selected_suite(args, scorer, device)
+    results.update(
+        {
+            "geval__processing": "openai_batch",
+            "geval__batch_run_id": args.geval_batch_run_id or args.model_name,
+            "geval__batch_ids": batch_result["batch_ids"],
+            "geval__model": args.geval_model,
+            "geval__prompt_version": GEVAL_QE_PROMPT_VERSION,
+            "geval__max_output_tokens": args.max_output_tokens,
+            "geval__n_samples": args.n_samples,
+        }
+    )
+    return scorer, results, batch_result
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    batch_result = None
+    if args.scorer == "geval" and args.geval_processing == "batch":
+        model, results, batch_result = _run_geval_batch(args, device)
+        if results is None:
+            return
+    else:
+        model = build_scorer(args, device)
+        results = run_selected_suite(args, model, device)
 
     model_dir = (
         args.model_dir
@@ -464,8 +567,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
 
     else:
-        protocol = getattr(model, "protocol", "") if args.scorer == "vllm" else ""
-        rubric = getattr(model, "rubric", "") if args.scorer == "vllm" else ""
+        protocol = getattr(model, "protocol", "") if args.scorer in {"vllm", "geval"} else ""
+        rubric = getattr(model, "rubric", "") if args.scorer in {"vllm", "geval"} else ""
         metadata = EvalMetadata(
             model_name=args.model_name,
             model_dir=model_dir,
@@ -504,6 +607,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             vllm_tensor_parallel_size=(
                 args.vllm_tensor_parallel_size if args.scorer == "vllm" else 0
             ),
+            ppl_data_parallel_size=(
+                args.ppl_data_parallel_size if args.scorer == "ppl" else 0
+            ),
         )
 
     eval_dir = (
@@ -515,7 +621,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             else "data/evals/final"
         )
     )
-    write_results_jsonl(metadata=metadata, results=results, eval_dir=Path(eval_dir))
+    results_path = write_results_jsonl(
+        metadata=metadata, results=results, eval_dir=Path(eval_dir)
+    )
+    if batch_result is not None:
+        from clumsification_code.evals.geval.benchmark_batch import (
+            mark_benchmark_batch_results_written,
+        )
+
+        mark_benchmark_batch_results_written(
+            Path(batch_result["state_path"]), results_path
+        )
     close_model = getattr(model, "close", None)
     if callable(close_model):
         close_model()

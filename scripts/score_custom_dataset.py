@@ -25,6 +25,14 @@ from clumsification_code.scoring.custom_dataset import score_custom_dataset
 
 def main():
     args = parse_score_args()
+    geval_client = None
+    if (
+        args.scoring_type == "geval_gpt54mini_fluency"
+        and args.geval_batch_action in {"submit", "collect"}
+    ):
+        from scripts.ud_ds_scripts import OpenAI_lib as ol
+
+        geval_client = ol.get_client_local()
 
     result = score_custom_dataset(
         dataset_name=args.dataset_name,
@@ -49,6 +57,9 @@ def main():
         gptscore_dtype=args.gptscore_dtype,
         gptscore_tp_plan=args.gptscore_tp_plan,
         geval_cache_path=args.geval_cache_path,
+        geval_batch_size=args.geval_batch_size,
+        geval_batch_action=args.geval_batch_action,
+        geval_client=geval_client,
         themis_model_name=args.themis_model_name,
         themis_tensor_parallel_size=args.themis_tensor_parallel_size,
         themis_max_model_len=args.themis_max_model_len,
@@ -64,14 +75,20 @@ def main():
         reference_policy=args.reference_policy,
         source_partitions=args.source_partitions,
         overwrite=args.overwrite,
+        retry_failed=args.retry_failed,
+        retry_failed_max_retries=args.retry_failed_max_retries,
         dataset_root=args.dataset_root,
     )
-    print(
-        "Wrote {num_successful_scores} scores and {num_failures} errors.\n"
-        "Scores: {score_path}\nErrors: {error_path}\nMetadata: {metadata_path}".format(
-            **result
+    if result.get("status") in {"prepared", "pending"}:
+        print(
+            "Batch {status}: {num_requests} requests in {num_batches} files/jobs.\n"
+            "Statuses: {batch_statuses}\nState: {state_path}".format(**result)
         )
-    )
+    else:
+        print(
+            "Wrote {num_successful_scores} scores and {num_failures} errors.\n"
+            "Scores: {score_path}\nErrors: {error_path}\nMetadata: {metadata_path}".format(**result)
+        )
 
 
 if __name__ == "__main__":

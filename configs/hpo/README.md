@@ -93,3 +93,23 @@ correlation with BLEURT instead. Neither route evaluates held-out test.
 Use `--trials_file` to override the default grid, and `--score_name` to reuse
 the regression search for a different score field. External-dev summaries
 include `huber_delta` and save separate winners for Huber, MSE, and MAE.
+
+## Binary pilot
+
+For a flat binary dataset with `text` and `label` columns, the default binary
+grid runs **9 trials**: learning rates `1e-5`, `5e-5`, `2e-4` crossed with
+per-device training batch sizes `4`, `8`, `16`. On eight GPUs with accumulation
+1, these are global batches `32`, `64`, `128`, respectively. Each trial sees the
+same seeded 4,992 training rows and makes `156`, `78`, or `39` optimizer updates.
+Warmup ratio is 0.03 and weight decay is 0.01. Start with `5e-5` and batch 4
+as the reference trial; the grid tests both lower and higher rates and batches.
+
+```bash
+sbatch updated_sbatch_jobs/run_hpo.sh \
+  /path/to/binary_formatted_dataset /path/to/new_binary_hpo_output binary
+```
+
+The default config is `fe_binary_pilot.json`. The runner selects by the same
+English external-dev panel as above. To select by formatted binary dev accuracy
+instead, run `python -m scripts.run_hpo --training_method binary` with the dataset
+path, eight GPU IDs, and a new output root, omitting `--external_dev_hpo`.

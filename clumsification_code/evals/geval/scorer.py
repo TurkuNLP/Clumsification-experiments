@@ -182,6 +182,10 @@ class GEvalScorer:
         self.task = task_name
         self.aspect = aspect
 
+    def score_cache_context(self) -> str:
+        """Identify the rendered grading prompt apart from candidate text."""
+        return repr(self._build_messages(""))
+
     async def _score_one_uncached_async(self, text: str) -> Dict[str, Any]:
         messages = self._build_messages(text)
         response_format = self._get_response_format()

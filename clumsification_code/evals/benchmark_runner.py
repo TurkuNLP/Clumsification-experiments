@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import datasets
+import numpy as np
 
 from clumsification_code.evals import benchmark_data as data
 from clumsification_code.evals.aggregation import aggregate_dimension_results
@@ -41,6 +42,48 @@ from clumsification_code.evals.metrics import (
     preference_metrics,
 )
 from clumsification_code.fe.metrics import binary_metrics
+
+
+class _SuiteScoreCache:
+    """Score each distinct text/request once across labels in a suite run."""
+
+    def __init__(self, model: TextScorer) -> None:
+        self.model = model
+        self._prompt_setter = getattr(model, "set_prompt_context", None)
+        self._context: Any = None
+        self._scores: Dict[tuple[Any, str], float] = {}
+
+    def set_prompt_context(self, task_name: str, aspect: str) -> None:
+        if callable(self._prompt_setter):
+            self._prompt_setter(task_name, aspect)
+            context_key = getattr(self.model, "score_cache_context", None)
+            # Scorers with a fixed prompt can share scores between aspects;
+            # otherwise the task/aspect pair conservatively identifies a request.
+            self._context = (
+                context_key() if callable(context_key) else (task_name, aspect)
+            )
+
+    def score_texts(
+        self, texts: List[str], device=None, batch_size: int = 32,
+        max_length: int = 512,
+    ) -> np.ndarray:
+        keys = [(self._context, str(candidate)) for candidate in texts]
+        missing = list(dict.fromkeys(key for key in keys if key not in self._scores))
+        if missing:
+            values = np.asarray(
+                self.model.score_texts(
+                    texts=[candidate for _, candidate in missing],
+                    device=device,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                )
+            )
+            if values.shape != (len(missing),):
+                raise ValueError("Scorer returned the wrong number of scores")
+            self._scores.update(
+                (key, float(value)) for key, value in zip(missing, values)
+            )
+        return np.asarray([self._scores[key] for key in keys])
 
 
 def maybe_set_prompt_context(model: TextScorer, task_name: str, aspect: str) -> None:
@@ -122,7 +165,7 @@ def eval_pairwise_preference_dataset(
             pairs.append((p, d, bool(tie), group_id))
 
     if not pairs:
-        print(f"{name}: no valid preference pairs.")
+        print(f"{name}: no valid preference pairs.", flush=True)
         return None
 
     preferred_texts = [p for p, _, _, _ in pairs]
@@ -153,7 +196,8 @@ def eval_pairwise_preference_dataset(
         f"  {name}: n={metrics['n']} | "
         f"tie-aware acc={metrics['tie_aware_acc']:.4f} | "
         f"strict acc={metrics['strict_acc']:.4f} | "
-        f"tie rate={metrics['tie_rate']:.4f}"
+        f"tie rate={metrics['tie_rate']:.4f}",
+        flush=True,
     )
 
     return metrics
@@ -241,7 +285,8 @@ def run_formatted_dataset_suite(
         max_length=max_length,
     )
     metrics = binary_metrics(
-        SimpleNamespace(predictions=predictions, label_ids=dataset[label_column])
+        SimpleNamespace(predictions=predictions, label_ids=dataset[label_column]),
+        predictions_are_logits=False,
     )
     result = {f"{result_prefix}_{key}": value for key, value in metrics.items()}
     result[f"{result_prefix}__n"] = len(dataset)
@@ -281,6 +326,7 @@ def run_external_dev_suite(
         )
 
     audit_report = audit_external_dev_splits()
+    model = _SuiteScoreCache(model)
     results: Dict[str, Any] = {
         "external_dev__provenance": audit_report,
         "external_dev__selection_datasets": ["ELLIPSE", "JFLEG", "CoheSentia"],
@@ -397,6 +443,7 @@ def run_standard_benchmark_suite(
     """
     if max_records_per_dimension is not None and max_records_per_dimension < 1:
         raise ValueError("max_records_per_dimension must be positive when provided")
+    model = _SuiteScoreCache(model)
     all_results: Dict[str, Any] = {}
     dimension_summaries: List[Dict[str, Any]] = []
     specs = get_nlg_eval_specs()
@@ -444,21 +491,21 @@ def run_standard_benchmark_suite(
 
         # Story Cloze is retained as a secondary coherence diagnostic because its
         # labels also depend on commonsense plausibility.
-        preferred, dispreferred = data.load_story_cloze_preference_pairs(split="eval")
-        add_preference_result(
-        "StoryCloze_eval_ending_preference",
-        eval_pairwise_preference_dataset(
-            name="StoryCloze_eval_ending_preference",
-            model=model,
-            device=device,
-            preferred_texts=preferred,
-            dispreferred_texts=dispreferred,
-            task_name="story_cloze",
-            aspect="coherence",
-            batch_size=batch_size,
-            max_length=max_length,
-        ),
-    )
+    #    preferred, dispreferred = data.load_story_cloze_preference_pairs(split="eval")
+    #    add_preference_result(
+    #    "StoryCloze_eval_ending_preference",
+    #    eval_pairwise_preference_dataset(
+    #        name="StoryCloze_eval_ending_preference",
+    #        model=model,
+    #        device=device,
+    #        preferred_texts=preferred,
+    #        dispreferred_texts=dispreferred,
+    #        task_name="story_cloze",
+    #        aspect="coherence",
+    #        batch_size=batch_size,
+    #        max_length=max_length,
+    #    ),
+    #)
 
     # One pass over NLG-eval is substantially cheaper than rescanning the large
     # JSONL file once for every benchmark/aspect specification.
@@ -470,7 +517,7 @@ def run_standard_benchmark_suite(
     for spec in specs:
         records = spec_records[spec.name]
         if not records:
-            print(f"{spec.name}: no valid records")
+            print(f"{spec.name}: no valid records", flush=True)
             continue
         labels = [float(record["human_score"]) for record in records]
         texts = [str(record["text"]) for record in records]

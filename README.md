@@ -83,12 +83,17 @@ Two candidate-only LLM-judge supervision conditions are available alongside
 the metric-based scorers:
 
 ```bash
-# G-Eval with the pinned GPT-5.4-mini judge
+# G-Eval with the pinned GPT-5.4-mini judge, using OpenAI Batch API
 python scripts/score_custom_dataset.py \
-  --dataset-name <dataset> \
+  --dataset-name fe-dataset-final \
   --scoring-type geval_gpt54mini_fluency \
-  --scoring-run-id geval-gpt54mini-v1 \
-  --geval-cache-path data/evals/<dataset>_geval_cache.json
+  --scoring-run-id geval-gpt54mini-trad-sampled-v1 \
+  --methods trad_sampled \
+  --perturbation-run-ids trad-sampled-balanced-v2 \
+  --target-layers 1 \
+  --exclude-originals \
+  --geval-batch-size 10000 \
+  --geval-batch-action prepare
 
 # Themis with the MENLO fluency rubric (requires vLLM/GPU)
 python scripts/score_custom_dataset.py \
@@ -98,9 +103,25 @@ python scripts/score_custom_dataset.py \
   --themis-tensor-parallel-size 1
 ```
 
-Both methods score candidates only and write canonical score, error, and
-metadata files under the dataset's `scores/` directory. The G-Eval cache keeps
-raw API responses; set `OPENAI_API_KEY` before running it.
+The G-Eval command prepares five 10,000-request JSONL files with full candidate
+texts. Review the files and repeat the command with `--geval-batch-action submit`
+to upload and submit them; the runner uses `OpenAI_lib.get_client_local()` to
+read the local OpenAI credential. Repeat with
+`--geval-batch-action collect` after the jobs finish. Submission and collection
+resume from saved Batch IDs. The final scores, errors, and metadata use the
+canonical `scores/` format. Batch queue limits may require submitting the
+remaining files later. If one 10,000-request file exceeds your account's queue
+limit, prepare smaller files with `--geval-batch-size` and `--overwrite` before
+uploading any file; use a new scoring run ID if an upload already happened.
+The Themis method writes canonical scores directly.
+
+For a completed scoring run with errors, repeat the original selection and run
+ID with `--retry-failed`. This selects only candidates in that run's error file
+and keeps existing successful scores. The Batch scorer creates a new request
+set for those failures; repeat the submit and collect actions for it. Other
+scorers retry unresolved candidates for up to 100 additional rounds within
+the same job; `--retry-failed-max-retries` changes that limit. An interrupted
+run resumes its saved progress without this flag.
 
 ### Evaluate a formatted dataset split
 
@@ -125,18 +146,42 @@ Pairwise and binary formatted datasets are also supported with
 
 ### Evaluate the English benchmark suite
 
-Use the shared benchmark runner for direct evaluation of the audited English
-suite. G-Eval uses the existing JSON protocol and can be run with GPT-5.4-mini:
+Use the shared benchmark runner for the audited English suite. G-Eval uses the
+OpenAI Batch API by default. Preparation is local-only: it materializes the
+deduplicated requests and a resumable manifest without making paid API calls.
 
 ```bash
 python -m clumsification_code.evals.run_benchmark \
   --scorer geval \
   --model-name gpt54mini-geval \
   --geval-model gpt-5.4-mini-2026-03-17 \
-  --geval-task fluency \
-  --geval-aspect fluency \
+  --geval-processing batch \
+  --geval-batch-run-id gpt54mini-geval-english-v1 \
+  --geval-batch-action prepare \
+  --geval-batch-size 5000 \
+  --max-output-tokens 64 \
   --skip-multilingual
 ```
+
+Inspect `data/evals/geval_batches/gpt54mini-geval-english-v1/`, then repeat the
+same command with `--geval-batch-action submit`. Submission saves every upload
+and Batch ID before continuing. Batch submission and collection obtain their
+client from `OpenAI_lib.get_client_local()`, matching the other project Batch
+workflow; no API-key argument or environment variable is needed. If the
+account's active Batch queue fills, wait
+for submitted chunks to finish and repeat `submit`; already submitted chunks
+are not duplicated. Run the same command with `--geval-batch-action collect`
+until all chunks finish. Collection downloads and preserves the raw output
+files, parses scores, computes the normal benchmark metrics, and writes the
+final result to `data/evals/final/gpt54mini-geval.jsonl` exactly once.
+
+If collection reports failed or missing requests, use
+`--geval-batch-action retry`. Only unresolved requests are submitted again;
+successful responses remain in the run directory and are reused. Keep the
+model, prompt, output-token limit, suite flags, and run ID identical at every
+stage. Story Cloze is not part of the final runner; leave `--skip-preferences`
+off to retain the JFLEG and English MultiBLiMP evaluations. The legacy direct
+request implementation remains available with `--geval-processing direct`.
 
 Themis uses the existing vLLM benchmark path with the Themis-native protocol
 and MENLO rubric:
@@ -153,8 +198,9 @@ python -m clumsification_code.evals.run_benchmark \
 ```
 
 The final benchmark command writes results to `data/evals/final/`. Use
-`--max-records-per-dimension` for a pilot and omit `--skip-preferences` if the
-JFLEG, MultiBLiMP, and Story Cloze diagnostics are desired.
+`--max-records-per-dimension` with `--skip-preferences` for a small pilot;
+the record limit applies to scalar dimensions, while `--skip-preferences`
+avoids running all JFLEG and MultiBLiMP pairs during that pilot.
 
 For a full LUMI-G node, vLLM can run independent scoring replicas. The total
 device count is `--vllm-data-parallel-size` multiplied by
@@ -218,6 +264,19 @@ exhausted. Each log is written directly into the training output directory.
 Submitting the same command again skips completed checkpoints and retries the
 rest. Use `full` instead of `dev` for the final suite. The existing
 `evaluate.sh` remains the single-model launcher for FE and baseline scorers.
+
+For Hugging Face PPL, allocate multiple GPUs and use independent model replicas
+to score text shards in parallel. `--batch-size` is per replica. For example:
+
+```bash
+sbatch --gpus-per-node=8 --cpus-per-task=32 --mem=400G --time=12:00:00 \
+  updated_sbatch_jobs/evaluate.sh ppl Qwen3.5-9B-Base-ppl \
+  --hf-model-name-or-path Qwen/Qwen3.5-9B-Base \
+  --ppl-data-parallel-size 8 --batch-size 1 --max-length 512
+```
+
+The PPL scorer also accepts Qwen3.5's multimodal model class for text-only
+likelihood evaluation. Leave `--ppl-data-parallel-size` at 1 for one GPU.
 
 The job requests four LUMI GPU devices by default. For a full eight-device
 LUMI-G node, override the embedded allocation at submission time:
